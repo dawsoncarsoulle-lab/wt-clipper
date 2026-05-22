@@ -7,7 +7,10 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info};
 
 use crate::{
-    capture::buffer::{ClipReason, ReplayBufferConfig, ReplayBufferHandle},
+    capture::{
+        buffer::{ClipReason, ReplayBufferConfig, ReplayBufferHandle},
+        quality::VideoQuality,
+    },
     cli::CaptureSource,
     config::WarThunderConfig,
     warthunder::{
@@ -25,6 +28,7 @@ pub struct AutoClipConfig {
     pub output_dir: Option<PathBuf>,
     pub source: CaptureSource,
     pub keep_segments: bool,
+    pub quality: VideoQuality,
     pub cooldown: Duration,
     pub post_event_delay: Duration,
     pub include_history: bool,
@@ -115,10 +119,12 @@ pub async fn run_auto_clip(
         output_dir: auto_config.output_dir.clone(),
         source: auto_config.source,
         keep_segments: auto_config.keep_segments,
+        quality: auto_config.quality,
     })
     .await?;
 
     println!("Replay buffer active: {}s", auto_config.buffer_seconds);
+    println!("Video target: {}", auto_config.quality.log_summary());
     println!("Auto-clip armed for personal War Thunder kills.");
     println!("Press Ctrl+C to stop.");
 
@@ -336,7 +342,10 @@ fn remember_messages(
 
 fn clip_reason_for_event(event: &WarThunderEvent) -> ClipReason {
     match event {
-        WarThunderEvent::TargetDestroyed { .. } => ClipReason::TargetDestroyed,
+        WarThunderEvent::TargetDestroyed { action, .. } if is_clip_action(action) => {
+            ClipReason::TargetDestroyed
+        }
+        WarThunderEvent::TargetDestroyed { .. } => ClipReason::Unknown,
         WarThunderEvent::PlayerDestroyed { .. } => ClipReason::PlayerDestroyed,
         WarThunderEvent::Unknown(_) => ClipReason::Unknown,
         WarThunderEvent::CriticalHit { .. }
@@ -345,18 +354,23 @@ fn clip_reason_for_event(event: &WarThunderEvent) -> ClipReason {
     }
 }
 
+fn is_clip_action(action: &str) -> bool {
+    matches!(action, "destroyed" | "shot down")
+}
+
 fn event_summary(event: &WarThunderEvent) -> String {
     match event {
         WarThunderEvent::TargetDestroyed {
             attacker,
+            action,
             vehicle,
             target,
             raw,
         } => match (attacker, target, vehicle) {
             (Some(attacker), Some(target), Some(vehicle)) => {
-                format!("{attacker} destroyed {target} with {vehicle}")
+                format!("{attacker} {action} {target} with {vehicle}")
             }
-            (Some(attacker), Some(target), None) => format!("{attacker} destroyed {target}"),
+            (Some(attacker), Some(target), None) => format!("{attacker} {action} {target}"),
             _ => raw.clone(),
         },
         WarThunderEvent::PlayerDestroyed { raw }
@@ -374,6 +388,7 @@ mod tests {
     fn kill(attacker: &str) -> WarThunderEvent {
         WarThunderEvent::TargetDestroyed {
             attacker: Some(attacker.to_owned()),
+            action: "destroyed".to_owned(),
             vehicle: Some("F/A-18C Early".to_owned()),
             target: Some("[ai] MiG-15bis".to_owned()),
             raw: format!("{attacker} (F/A-18C Early) destroyed [ai] MiG-15bis"),

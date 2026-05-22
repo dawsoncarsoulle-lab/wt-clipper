@@ -14,6 +14,7 @@ use tracing::{debug, info};
 use crate::app::auto::{run_auto_clip, AutoClipConfig};
 use crate::capture::buffer::{run_replay_buffer, ReplayBufferConfig};
 use crate::capture::output::resolve_output_path;
+use crate::capture::quality::{QualityPreset, VideoQuality};
 use crate::capture::recorder::{record, RecordingRequest};
 use crate::cli::{CaptureSource, Cli, Command, DumpEndpoint};
 use crate::config::{AppConfig, WarThunderConfig};
@@ -39,12 +40,18 @@ async fn main() -> anyhow::Result<()> {
             duration,
             output,
             source,
-        } => record_command(duration, output, source).await,
+            quality,
+            fps,
+            video_bitrate,
+        } => record_command(duration, output, source, quality, fps, video_bitrate).await,
         Command::Buffer {
             seconds,
             segment_seconds,
             output_dir,
             source,
+            quality,
+            fps,
+            video_bitrate,
             keep_segments,
         } => {
             run_replay_buffer(ReplayBufferConfig {
@@ -53,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
                 output_dir,
                 source,
                 keep_segments,
+                quality: resolve_video_quality(quality, fps, video_bitrate)?,
             })
             .await
         }
@@ -61,6 +69,9 @@ async fn main() -> anyhow::Result<()> {
             segment_seconds,
             output_dir,
             source,
+            quality,
+            fps,
+            video_bitrate,
             keep_segments,
             cooldown_seconds,
             post_event_seconds,
@@ -79,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
                     output_dir,
                     source,
                     keep_segments,
+                    quality: resolve_video_quality(quality, fps, video_bitrate)?,
                     cooldown: Duration::from_secs(cooldown_seconds),
                     post_event_delay: Duration::from_secs(post_event_seconds),
                     include_history,
@@ -109,22 +121,36 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+fn resolve_video_quality(
+    quality: QualityPreset,
+    fps: Option<u32>,
+    video_bitrate: Option<u32>,
+) -> anyhow::Result<VideoQuality> {
+    VideoQuality::with_overrides(quality, fps, video_bitrate)
+}
+
 async fn record_command(
     duration_seconds: u64,
     output: Option<std::path::PathBuf>,
     source: CaptureSource,
+    quality_preset: QualityPreset,
+    fps: Option<u32>,
+    video_bitrate: Option<u32>,
 ) -> anyhow::Result<()> {
     let output_path = resolve_output_path(output)?;
     let duration = Duration::from_secs(duration_seconds);
+    let quality = resolve_video_quality(quality_preset, fps, video_bitrate)?;
 
     println!("Recording output: {}", output_path.display());
     println!("Duration: {duration_seconds}s");
+    println!("Video target: {}", quality.log_summary());
     println!("Starting recording...");
 
     record(RecordingRequest {
         duration,
         output_path: output_path.clone(),
         source,
+        quality,
     })
     .await?;
 
@@ -454,6 +480,7 @@ fn process_messages(
 fn print_kill(event: &WarThunderEvent) {
     let WarThunderEvent::TargetDestroyed {
         attacker,
+        action,
         vehicle,
         target,
         raw,
@@ -472,9 +499,9 @@ fn print_kill(event: &WarThunderEvent) {
     };
 
     if let Some(vehicle) = vehicle {
-        println!("[WT] kill detected: {attacker} destroyed {target} with {vehicle}");
+        println!("[WT] kill detected: {attacker} {action} {target} with {vehicle}");
     } else {
-        println!("[WT] kill detected: {attacker} destroyed {target}");
+        println!("[WT] kill detected: {attacker} {action} {target}");
     }
 }
 

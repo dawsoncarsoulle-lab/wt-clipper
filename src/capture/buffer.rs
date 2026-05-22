@@ -15,6 +15,7 @@ use crate::{
         concat::concatenate_segments_to_webm,
         output::{ensure_unique_path, resolve_replay_clip_dir_with_reason},
         portal::PortalScreencastSession,
+        quality::VideoQuality,
         recorder::{
             choose_backend, encode_location, wait_for_eos_or_error, CaptureBackend, PipelineSource,
         },
@@ -33,6 +34,7 @@ pub struct ReplayBufferConfig {
     pub output_dir: Option<PathBuf>,
     pub source: CaptureSource,
     pub keep_segments: bool,
+    pub quality: VideoQuality,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +80,7 @@ impl ReplayBufferHandle {
         }
 
         gst::init().context("failed to initialize GStreamer")?;
+        info!(video = %config.quality.log_summary(), "replay buffer video target");
 
         let temp_dir = std::env::temp_dir()
             .join("wt-clipper-buffer")
@@ -109,6 +112,7 @@ impl ReplayBufferHandle {
             segment_location_pattern(&temp_dir),
             Duration::from_secs(config.segment_seconds),
             keep_segments,
+            config.quality,
         )?;
         info!(pipeline = %pipeline_description, "starting replay buffer pipeline");
 
@@ -135,6 +139,7 @@ impl ReplayBufferHandle {
         let keep_segments = self.keep_segments;
         let output_dir = self.config.output_dir.clone();
         let keep_saved_segments = self.config.keep_segments;
+        let quality = self.config.quality;
         tokio::task::spawn_blocking(move || {
             save_replay_clip(
                 &temp_dir,
@@ -142,6 +147,7 @@ impl ReplayBufferHandle {
                 output_dir,
                 reason,
                 keep_saved_segments,
+                quality,
             )
         })
         .await?
@@ -245,6 +251,7 @@ fn save_replay_clip(
     output_dir: Option<PathBuf>,
     reason: ClipReason,
     keep_saved_segments: bool,
+    quality: VideoQuality,
 ) -> anyhow::Result<Option<SavedReplay>> {
     let segments = snapshot_recent_segments(temp_dir, keep_segments)?;
     if segments.is_empty() {
@@ -259,7 +266,7 @@ fn save_replay_clip(
     let segment_paths = copied_segment_paths(&segment_dir)?;
     let final_video_path = ensure_unique_path(segment_dir.with_extension("webm"))?;
     println!("[CLIP] assembling replay video...");
-    match concatenate_segments_to_webm(&segment_paths, final_video_path.clone()) {
+    match concatenate_segments_to_webm(&segment_paths, final_video_path.clone(), quality) {
         Ok(path) => {
             if !keep_saved_segments {
                 fs::remove_dir_all(&segment_dir)?;
@@ -348,6 +355,7 @@ pub(crate) fn buffer_pipeline_description(
     location_pattern: PathBuf,
     segment_duration: Duration,
     keep_segments: usize,
+    quality: VideoQuality,
 ) -> anyhow::Result<String> {
     let source_chain = match source {
         PipelineSource::X11 => {
@@ -376,8 +384,10 @@ pub(crate) fn buffer_pipeline_description(
     };
     let location = encode_location(&location_pattern);
     let max_size_time = segment_duration.as_nanos();
+    let raw_caps = quality.raw_video_caps();
+    let encoder = quality.vp8enc_settings();
     Ok(format!(
-        "{source_chain} ! videoconvert ! videorate ! video/x-raw,framerate=30/1 ! queue ! vp8enc deadline=1 cpu-used=8 keyframe-max-dist=60 ! splitmuxsink async-finalize=true muxer-factory=webmmux max-size-time={max_size_time} max-files={keep_segments} send-keyframe-requests=true location=\"{location}\""
+        "{source_chain} ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! splitmuxsink async-finalize=true muxer-factory=webmmux max-size-time={max_size_time} max-files={keep_segments} send-keyframe-requests=true location=\"{location}\""
     ))
 }
 
@@ -395,11 +405,14 @@ mod tests {
             Path::new("/tmp/session/segment-%06d.webm").to_path_buf(),
             Duration::from_secs(2),
             7,
+            VideoQuality::default(),
         )
         .unwrap();
 
         assert!(pipeline.contains("pipewiresrc fd=8 path=99"));
         assert!(pipeline.contains("splitmuxsink"));
+        assert!(pipeline.contains("video/x-raw,framerate=60/1"));
+        assert!(pipeline.contains("target-bitrate=12000000"));
         assert!(pipeline.contains("muxer-factory=webmmux"));
         assert!(pipeline.contains("max-size-time=2000000000"));
         assert!(pipeline.contains("max-files=7"));

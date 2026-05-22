@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::capture::quality::QualityPreset;
+
 #[derive(Debug, Parser)]
 #[command(name = "wt-clipper")]
 #[command(about = "War Thunder clipper telemetry prototype")]
@@ -39,6 +41,15 @@ pub enum Command {
         /// Capture source.
         #[arg(long, value_enum, default_value_t = CaptureSource::Screen)]
         source: CaptureSource,
+        /// Video quality preset.
+        #[arg(long, value_enum, default_value_t = QualityPreset::High)]
+        quality: QualityPreset,
+        /// Target frames per second. Overrides --quality.
+        #[arg(long)]
+        fps: Option<u32>,
+        /// Target video bitrate in kbps. Overrides --quality.
+        #[arg(long)]
+        video_bitrate: Option<u32>,
     },
     /// Keep a rolling replay buffer and save recent segments when Enter is pressed.
     Buffer {
@@ -54,6 +65,15 @@ pub enum Command {
         /// Capture source.
         #[arg(long, value_enum, default_value_t = CaptureSource::Screen)]
         source: CaptureSource,
+        /// Video quality preset.
+        #[arg(long, value_enum, default_value_t = QualityPreset::High)]
+        quality: QualityPreset,
+        /// Target frames per second. Overrides --quality.
+        #[arg(long)]
+        fps: Option<u32>,
+        /// Target video bitrate in kbps. Overrides --quality.
+        #[arg(long)]
+        video_bitrate: Option<u32>,
         /// Keep copied replay segments after the final WebM is assembled.
         #[arg(long)]
         keep_segments: bool,
@@ -72,6 +92,15 @@ pub enum Command {
         /// Capture source.
         #[arg(long, value_enum, default_value_t = CaptureSource::Screen)]
         source: CaptureSource,
+        /// Video quality preset.
+        #[arg(long, value_enum, default_value_t = QualityPreset::High)]
+        quality: QualityPreset,
+        /// Target frames per second. Overrides --quality.
+        #[arg(long)]
+        fps: Option<u32>,
+        /// Target video bitrate in kbps. Overrides --quality.
+        #[arg(long)]
+        video_bitrate: Option<u32>,
         /// Keep copied replay segments after the final WebM is assembled.
         #[arg(long)]
         keep_segments: bool,

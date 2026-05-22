@@ -7,11 +7,15 @@ use anyhow::Context;
 use gst::prelude::*;
 use gstreamer as gst;
 
-use crate::capture::recorder::{encode_location, wait_for_eos_or_error};
+use crate::capture::{
+    quality::VideoQuality,
+    recorder::{encode_location, wait_for_eos_or_error},
+};
 
 pub fn concatenate_segments_to_webm(
     segments: &[PathBuf],
     output_path: PathBuf,
+    quality: VideoQuality,
 ) -> anyhow::Result<PathBuf> {
     let segments = valid_segments(segments)?;
     if segments.is_empty() {
@@ -24,7 +28,7 @@ pub fn concatenate_segments_to_webm(
     }
 
     gst::init().context("failed to initialize GStreamer")?;
-    let pipeline_description = concat_pipeline_description(&segments, &output_path);
+    let pipeline_description = concat_pipeline_description(&segments, &output_path, quality);
     let element =
         gst::parse::launch(&pipeline_description).context("failed to build concat pipeline")?;
     let pipeline = element
@@ -78,10 +82,16 @@ fn verify_output_file(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn concat_pipeline_description(segments: &[PathBuf], output_path: &Path) -> String {
+pub(crate) fn concat_pipeline_description(
+    segments: &[PathBuf],
+    output_path: &Path,
+    quality: VideoQuality,
+) -> String {
     let output = encode_location(output_path);
+    let raw_caps = quality.raw_video_caps();
+    let encoder = quality.vp8enc_settings();
     let mut pipeline = format!(
-        "concat name=c ! videoconvert ! videorate ! video/x-raw,framerate=30/1 ! vp8enc deadline=1 cpu-used=8 ! webmmux ! filesink location=\"{output}\""
+        "concat name=c ! videoconvert ! videorate ! {raw_caps} ! {encoder} ! webmmux ! filesink location=\"{output}\""
     );
 
     for segment in segments {
@@ -127,9 +137,12 @@ mod tests {
                 PathBuf::from("/tmp/segment-000002.webm"),
             ],
             Path::new("/tmp/out.webm"),
+            VideoQuality::default(),
         );
 
         assert!(pipeline.contains("concat name=c"));
+        assert!(pipeline.contains("video/x-raw,framerate=60/1"));
+        assert!(pipeline.contains("target-bitrate=12000000"));
         assert!(pipeline.contains("decodebin"));
         assert!(pipeline.contains("/tmp/segment-000001.webm"));
         assert!(pipeline.contains("/tmp/segment-000002.webm"));
