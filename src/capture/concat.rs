@@ -6,6 +6,7 @@ use std::{
 use anyhow::Context;
 use gst::prelude::*;
 use gstreamer as gst;
+use tracing::debug;
 
 use crate::capture::{
     quality::VideoQuality,
@@ -28,7 +29,16 @@ pub fn concatenate_segments_to_webm(
     }
 
     gst::init().context("failed to initialize GStreamer")?;
+    debug!(
+        target_bitrate = quality.bitrate_bps(),
+        "concat target bitrate: {} bps",
+        quality.bitrate_bps()
+    );
     let pipeline_description = concat_pipeline_description(&segments, &output_path, quality);
+    debug!(
+        pipeline = %pipeline_description,
+        "final concat pipeline"
+    );
     let element =
         gst::parse::launch(&pipeline_description).context("failed to build concat pipeline")?;
     let pipeline = element
@@ -142,11 +152,30 @@ mod tests {
 
         assert!(pipeline.contains("concat name=c"));
         assert!(pipeline.contains("video/x-raw,framerate=60/1"));
-        assert!(pipeline.contains("target-bitrate=12000000"));
+        assert!(pipeline.contains(
+            "vp8enc deadline=1 end-usage=cbr target-bitrate=20000000 cpu-used=2 keyframe-max-dist=120"
+        ));
         assert!(pipeline.contains("decodebin"));
         assert!(pipeline.contains("/tmp/segment-000001.webm"));
         assert!(pipeline.contains("/tmp/segment-000002.webm"));
         assert!(pipeline.contains("filesink location=\"/tmp/out.webm\""));
+    }
+
+    #[test]
+    fn concat_pipeline_uses_overridden_video_bitrate() {
+        let quality = VideoQuality::with_overrides(
+            crate::capture::quality::QualityPreset::High,
+            None,
+            Some(20_000),
+        )
+        .unwrap();
+        let pipeline = concat_pipeline_description(
+            &[PathBuf::from("/tmp/segment-000001.webm")],
+            Path::new("/tmp/out.webm"),
+            quality,
+        );
+
+        assert!(pipeline.contains("target-bitrate=20000000"));
     }
 
     #[test]

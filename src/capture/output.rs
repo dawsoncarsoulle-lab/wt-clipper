@@ -28,25 +28,32 @@ pub fn default_file_name() -> String {
     format!("manual-{}.webm", Local::now().format("%Y-%m-%d-%H-%M-%S"))
 }
 
-pub fn replay_dir_name(reason: Option<&str>) -> String {
-    let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
-    match reason.filter(|reason| !reason.is_empty()) {
-        Some(reason) => format!("replay-{timestamp}-{reason}"),
-        None => format!("replay-{timestamp}"),
+pub fn slugify_filename_part(input: &str) -> String {
+    const MAX_LEN: usize = 40;
+
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+
+    for character in input.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+
+        if slug.len() >= MAX_LEN {
+            break;
+        }
     }
-}
 
-pub fn resolve_replay_clip_dir_with_reason(
-    output_dir: Option<PathBuf>,
-    reason: Option<&str>,
-) -> anyhow::Result<PathBuf> {
-    let parent = match output_dir {
-        Some(path) => path,
-        None => default_output_dir()?,
-    };
-
-    fs::create_dir_all(&parent)?;
-    ensure_unique_path(parent.join(replay_dir_name(reason)))
+    let slug = slug.trim_matches('-').to_owned();
+    if slug.is_empty() {
+        "unknown".to_owned()
+    } else {
+        slug
+    }
 }
 
 pub fn ensure_unique_path(path: PathBuf) -> anyhow::Result<PathBuf> {
@@ -126,27 +133,12 @@ mod tests {
     }
 
     #[test]
-    fn replay_dir_name_is_replay_prefixed() {
-        let name = replay_dir_name(None);
-
-        assert!(name.starts_with("replay-"));
+    fn slugifies_aircraft_name() {
+        assert_eq!(slugify_filename_part("F/A-18C Early"), "f-a-18c-early");
     }
 
     #[test]
-    fn replay_dir_name_includes_reason() {
-        let name = replay_dir_name(Some("target-destroyed"));
-
-        assert!(name.starts_with("replay-"));
-        assert!(name.ends_with("-target-destroyed"));
-    }
-
-    #[test]
-    fn replay_video_path_uses_webm_extension() {
-        let path = PathBuf::from(format!("{}.webm", replay_dir_name(Some("manual"))));
-
-        assert_eq!(
-            path.extension().and_then(|value| value.to_str()),
-            Some("webm")
-        );
+    fn slugifies_symbolic_ground_vehicle_name() {
+        assert_eq!(slugify_filename_part("◍M1A1 HC"), "m1a1-hc");
     }
 }

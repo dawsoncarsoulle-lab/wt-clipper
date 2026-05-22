@@ -8,8 +8,8 @@ use tracing::{debug, info};
 
 use crate::{
     capture::{
-        buffer::{ClipReason, ReplayBufferConfig, ReplayBufferHandle},
-        quality::VideoQuality,
+        buffer::{ClipContext, ClipReason, ReplayBufferConfig, ReplayBufferHandle},
+        quality::{QualityPreset, VideoQuality},
     },
     cli::CaptureSource,
     config::WarThunderConfig,
@@ -28,6 +28,7 @@ pub struct AutoClipConfig {
     pub output_dir: Option<PathBuf>,
     pub source: CaptureSource,
     pub keep_segments: bool,
+    pub quality_preset: QualityPreset,
     pub quality: VideoQuality,
     pub cooldown: Duration,
     pub post_event_delay: Duration,
@@ -61,16 +62,21 @@ struct Cooldown {
 
 #[derive(Debug, Clone)]
 struct PendingClip {
-    reason: ClipReason,
+    context: ClipContext,
     event_time: Instant,
     save_at: Instant,
     description: String,
 }
 
 impl PendingClip {
-    fn new(reason: ClipReason, event_time: Instant, delay: Duration, description: String) -> Self {
+    fn new(
+        context: ClipContext,
+        event_time: Instant,
+        delay: Duration,
+        description: String,
+    ) -> Self {
         Self {
-            reason,
+            context,
             event_time,
             save_at: event_time + delay,
             description,
@@ -119,6 +125,7 @@ pub async fn run_auto_clip(
         output_dir: auto_config.output_dir.clone(),
         source: auto_config.source,
         keep_segments: auto_config.keep_segments,
+        quality_preset: auto_config.quality_preset,
         quality: auto_config.quality,
     })
     .await?;
@@ -180,7 +187,12 @@ pub async fn run_auto_clip(
                     }
 
                     let pending = schedule_pending_clip(
-                        clip_reason_for_event(&event),
+                        clip_context_for_event(
+                            &event,
+                            player_name,
+                            &auto_config,
+                            post_event_delay,
+                        ),
                         summary,
                         Instant::now(),
                         post_event_delay,
@@ -205,12 +217,30 @@ pub async fn run_auto_clip(
 }
 
 fn schedule_pending_clip(
-    reason: ClipReason,
+    context: ClipContext,
     description: String,
     event_time: Instant,
     delay: Duration,
 ) -> PendingClip {
-    PendingClip::new(reason, event_time, delay, description)
+    PendingClip::new(context, event_time, delay, description)
+}
+
+fn clip_context_for_event(
+    event: &WarThunderEvent,
+    player_name: Option<&str>,
+    auto_config: &AutoClipConfig,
+    post_event_delay: Duration,
+) -> ClipContext {
+    ClipContext {
+        reason: clip_reason_for_event(event),
+        event: Some(event.clone()),
+        player_name: player_name.map(str::to_owned),
+        video_quality: auto_config.quality,
+        quality_preset: auto_config.quality_preset,
+        duration_seconds: auto_config.buffer_seconds,
+        post_event_seconds: post_event_delay.as_secs(),
+        segment_seconds: auto_config.segment_seconds,
+    }
 }
 
 fn ready_pending_indices(pending_clips: &[PendingClip], now: Instant) -> Vec<usize> {
@@ -230,13 +260,13 @@ async fn save_ready_pending_clips(
     for index in ready_indices.into_iter().rev() {
         let pending = pending_clips.remove(index);
         debug!(
-            reason = ?pending.reason,
+            reason = ?pending.context.reason,
             event_age_ms = now.duration_since(pending.event_time).as_millis(),
             description = %pending.description,
             "saving pending auto-clip"
         );
         println!("[CLIP] saving replay...");
-        match buffer.save_replay(pending.reason).await? {
+        match buffer.save_replay(pending.context).await? {
             Some(replay) => crate::capture::buffer::print_saved_replay(&replay),
             None => println!("[CLIP] no finalized replay segments available yet"),
         }
@@ -395,6 +425,19 @@ mod tests {
         }
     }
 
+    fn test_clip_context() -> ClipContext {
+        ClipContext {
+            reason: ClipReason::TargetDestroyed,
+            event: Some(kill("dawson16800")),
+            player_name: Some("dawson16800".to_owned()),
+            video_quality: VideoQuality::default(),
+            quality_preset: QualityPreset::High,
+            duration_seconds: 20,
+            post_event_seconds: 5,
+            segment_seconds: 2,
+        }
+    }
+
     #[test]
     fn cooldown_blocks_close_events() {
         let mut cooldown = Cooldown::new(Duration::from_secs(3));
@@ -421,13 +464,13 @@ mod tests {
     fn kill_schedules_pending_clip() {
         let now = Instant::now();
         let pending = schedule_pending_clip(
-            ClipReason::TargetDestroyed,
+            test_clip_context(),
             "kill".to_owned(),
             now,
             Duration::from_secs(5),
         );
 
-        assert_eq!(pending.reason, ClipReason::TargetDestroyed);
+        assert_eq!(pending.context.reason, ClipReason::TargetDestroyed);
         assert_eq!(pending.event_time, now);
         assert_eq!(pending.save_at, now + Duration::from_secs(5));
         assert_eq!(pending.description, "kill");
@@ -437,7 +480,7 @@ mod tests {
     fn pending_clip_is_not_ready_before_save_at() {
         let now = Instant::now();
         let pending = schedule_pending_clip(
-            ClipReason::TargetDestroyed,
+            test_clip_context(),
             "kill".to_owned(),
             now,
             Duration::from_secs(5),
@@ -451,7 +494,7 @@ mod tests {
     fn pending_clip_is_ready_after_save_at() {
         let now = Instant::now();
         let pending = schedule_pending_clip(
-            ClipReason::TargetDestroyed,
+            test_clip_context(),
             "kill".to_owned(),
             now,
             Duration::from_secs(5),
@@ -472,7 +515,7 @@ mod tests {
 
         if cooldown.allows(now) {
             pending.push(schedule_pending_clip(
-                ClipReason::TargetDestroyed,
+                test_clip_context(),
                 "first".to_owned(),
                 now,
                 Duration::from_secs(5),
@@ -480,7 +523,7 @@ mod tests {
         }
         if cooldown.allows(now + Duration::from_secs(1)) {
             pending.push(schedule_pending_clip(
-                ClipReason::TargetDestroyed,
+                test_clip_context(),
                 "second".to_owned(),
                 now + Duration::from_secs(1),
                 Duration::from_secs(5),
@@ -493,7 +536,7 @@ mod tests {
     #[test]
     fn pending_clip_can_be_dropped_on_shutdown_without_saving() {
         let mut pending = vec![schedule_pending_clip(
-            ClipReason::TargetDestroyed,
+            test_clip_context(),
             "kill".to_owned(),
             Instant::now(),
             Duration::from_secs(5),

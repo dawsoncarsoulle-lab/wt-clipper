@@ -8,22 +8,30 @@ pub enum QualityPreset {
 }
 
 impl QualityPreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
     pub fn video_quality(self) -> VideoQuality {
         match self {
             Self::Low => VideoQuality {
                 fps: 30,
-                video_bitrate_kbps: 4_000,
+                video_bitrate_kbps: 6_000,
                 encoder_cpu_used: 6,
             },
             Self::Medium => VideoQuality {
-                fps: 30,
-                video_bitrate_kbps: 8_000,
+                fps: 60,
+                video_bitrate_kbps: 12_000,
                 encoder_cpu_used: 4,
             },
             Self::High => VideoQuality {
                 fps: 60,
-                video_bitrate_kbps: 12_000,
-                encoder_cpu_used: 4,
+                video_bitrate_kbps: 20_000,
+                encoder_cpu_used: 2,
             },
         }
     }
@@ -87,9 +95,9 @@ impl VideoQuality {
 
     pub fn vp8enc_settings(self) -> String {
         format!(
-            "vp8enc deadline=1 cpu-used={} target-bitrate={} keyframe-max-dist={}",
-            self.encoder_cpu_used,
+            "vp8enc deadline=1 end-usage=cbr target-bitrate={} cpu-used={} keyframe-max-dist={}",
             self.bitrate_bps(),
+            self.encoder_cpu_used,
             self.keyframe_max_dist()
         )
     }
@@ -108,22 +116,36 @@ mod tests {
 
     #[test]
     fn presets_have_expected_values() {
-        assert_eq!(QualityPreset::Low.video_quality().video_bitrate_kbps, 4_000);
         assert_eq!(
-            QualityPreset::Medium.video_quality().video_bitrate_kbps,
-            8_000
+            QualityPreset::Low.video_quality(),
+            VideoQuality {
+                fps: 30,
+                video_bitrate_kbps: 6_000,
+                encoder_cpu_used: 6,
+            }
         );
-        assert_eq!(QualityPreset::High.video_quality().fps, 60);
         assert_eq!(
-            QualityPreset::High.video_quality().video_bitrate_kbps,
-            12_000
+            QualityPreset::Medium.video_quality(),
+            VideoQuality {
+                fps: 60,
+                video_bitrate_kbps: 12_000,
+                encoder_cpu_used: 4,
+            }
+        );
+        assert_eq!(
+            QualityPreset::High.video_quality(),
+            VideoQuality {
+                fps: 60,
+                video_bitrate_kbps: 20_000,
+                encoder_cpu_used: 2,
+            }
         );
     }
 
     #[test]
     fn converts_kbps_to_bits_per_second() {
-        let quality = VideoQuality::new(60, 12_000, 4).unwrap();
-        assert_eq!(quality.bitrate_bps(), 12_000_000);
+        let quality = VideoQuality::new(60, 20_000, 2).unwrap();
+        assert_eq!(quality.bitrate_bps(), 20_000_000);
     }
 
     #[test]
@@ -133,7 +155,7 @@ mod tests {
             60
         );
         assert_eq!(
-            VideoQuality::new(60, 12_000, 4)
+            VideoQuality::new(60, 20_000, 2)
                 .unwrap()
                 .keyframe_max_dist(),
             120
@@ -143,9 +165,26 @@ mod tests {
     #[test]
     fn cli_overrides_preset_values() {
         let quality =
-            VideoQuality::with_overrides(QualityPreset::Low, Some(60), Some(16_000)).unwrap();
-        assert_eq!(quality.fps, 60);
-        assert_eq!(quality.video_bitrate_kbps, 16_000);
+            VideoQuality::with_overrides(QualityPreset::Low, Some(30), Some(25_000)).unwrap();
+        assert_eq!(quality.fps, 30);
+        assert_eq!(quality.video_bitrate_kbps, 25_000);
         assert_eq!(quality.encoder_cpu_used, 6);
+    }
+
+    #[test]
+    fn video_bitrate_override_replaces_preset_bitrate() {
+        let quality =
+            VideoQuality::with_overrides(QualityPreset::High, None, Some(25_000)).unwrap();
+        assert_eq!(quality.fps, 60);
+        assert_eq!(quality.video_bitrate_kbps, 25_000);
+        assert_eq!(quality.encoder_cpu_used, 2);
+    }
+
+    #[test]
+    fn fps_override_replaces_preset_fps() {
+        let quality = VideoQuality::with_overrides(QualityPreset::High, Some(30), None).unwrap();
+        assert_eq!(quality.fps, 30);
+        assert_eq!(quality.video_bitrate_kbps, 20_000);
+        assert_eq!(quality.encoder_cpu_used, 2);
     }
 }

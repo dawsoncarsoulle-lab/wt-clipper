@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
                 output_dir,
                 source,
                 keep_segments,
+                quality_preset: quality,
                 quality: resolve_video_quality(quality, fps, video_bitrate)?,
             })
             .await
@@ -90,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
                     output_dir,
                     source,
                     keep_segments,
+                    quality_preset: quality,
                     quality: resolve_video_quality(quality, fps, video_bitrate)?,
                     cooldown: Duration::from_secs(cooldown_seconds),
                     post_event_delay: Duration::from_secs(post_event_seconds),

@@ -296,7 +296,9 @@ mod tests {
 
         assert!(pipeline.contains("pipewiresrc fd=8 path=99"));
         assert!(pipeline.contains("video/x-raw,framerate=60/1"));
-        assert!(pipeline.contains("target-bitrate=12000000"));
+        assert!(pipeline.contains(
+            "vp8enc deadline=1 end-usage=cbr target-bitrate=20000000 cpu-used=2 keyframe-max-dist=120"
+        ));
         assert!(pipeline.contains("webmmux"));
         assert!(pipeline.contains("filesink location=\"/tmp/out.webm\""));
     }
@@ -313,6 +315,6 @@ mod tests {
 
         assert!(pipeline.contains("ximagesrc"));
         assert!(pipeline.contains("vp8enc"));
-        assert!(pipeline.contains("target-bitrate=12000000"));
+        assert!(pipeline.contains("target-bitrate=20000000"));
     }
 }
