@@ -2,6 +2,7 @@ mod app;
 mod capture;
 mod cli;
 mod config;
+mod doctor;
 mod warthunder;
 
 use std::time::Duration;
@@ -36,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command {
+        Command::Doctor { json } => doctor::run_doctor(json).await,
         Command::Record {
             duration,
             output,
@@ -107,6 +109,9 @@ async fn main() -> anyhow::Result<()> {
 
             match command {
                 Command::Status => status(&client).await,
+                Command::Doctor { .. } => {
+                    unreachable!("doctor command is handled before config load")
+                }
                 Command::Dump { endpoint } => dump(&client, endpoint).await,
                 Command::Watch { include_history } => {
                     watch(&client, &config.war_thunder, include_history).await

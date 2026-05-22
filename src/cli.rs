@@ -17,6 +17,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Diagnose local capture dependencies without starting a capture.
+    Doctor {
+        /// Print checks as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Check whether the local War Thunder HTTP API is reachable.
     Status,
     /// Print raw endpoint responses for debugging parser assumptions.
