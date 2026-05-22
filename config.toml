@@ -1,0 +1,5 @@
+[war_thunder]
+base_url = "http://127.0.0.1:8111"
+player_name = "dawson16800"
+poll_interval_ms = 300
+request_timeout_ms = 500
