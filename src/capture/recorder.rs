@@ -10,13 +10,17 @@ use gst::prelude::*;
 use gstreamer as gst;
 use tracing::info;
 
-use crate::{capture::portal::PortalScreencastSession, cli::CaptureSource};
+use crate::{
+    capture::{portal::PortalScreencastSession, quality::VideoQuality},
+    cli::CaptureSource,
+};
 
 #[derive(Debug, Clone)]
 pub struct RecordingRequest {
     pub duration: Duration,
     pub output_path: PathBuf,
     pub source: CaptureSource,
+    pub quality: VideoQuality,
 }
 
 pub async fn record(request: RecordingRequest) -> anyhow::Result<()> {
@@ -30,22 +34,28 @@ pub async fn record(request: RecordingRequest) -> anyhow::Result<()> {
     }
 
     gst::init().context("failed to initialize GStreamer")?;
+    info!(video = %request.quality.log_summary(), "recording video target");
 
     let mut portal_session = None;
     let backend = choose_backend(&std::env::var("XDG_SESSION_TYPE").unwrap_or_default());
     let pipeline_description = match backend {
-        CaptureBackend::X11 => {
-            pipeline_description(PipelineSource::X11, request.source, &request.output_path)?
-        }
+        CaptureBackend::X11 => pipeline_description(
+            PipelineSource::X11,
+            request.source,
+            &request.output_path,
+            request.quality,
+        )?,
         CaptureBackend::ManualPipeWirePath(path) => pipeline_description(
             PipelineSource::PipeWirePath(path),
             request.source,
             &request.output_path,
+            request.quality,
         )?,
         CaptureBackend::ManualPipeWireTarget(target) => pipeline_description(
             PipelineSource::PipeWireTarget(target),
             request.source,
             &request.output_path,
+            request.quality,
         )?,
         CaptureBackend::PortalPipeWire => {
             let session = PortalScreencastSession::start(request.source).await?;
@@ -56,6 +66,7 @@ pub async fn record(request: RecordingRequest) -> anyhow::Result<()> {
                 },
                 request.source,
                 &request.output_path,
+                request.quality,
             )?;
             portal_session = Some(session);
             description
@@ -192,8 +203,11 @@ pub(crate) fn pipeline_description(
     source: PipelineSource,
     capture_source: CaptureSource,
     output_path: &Path,
+    quality: VideoQuality,
 ) -> anyhow::Result<String> {
     let location = escape_gst_string(&output_path.to_string_lossy());
+    let raw_caps = quality.raw_video_caps();
+    let encoder = quality.vp8enc_settings();
 
     match source {
         PipelineSource::X11 => {
@@ -201,23 +215,23 @@ pub(crate) fn pipeline_description(
                 anyhow::bail!("--source window is only supported through the Wayland portal for now");
             }
             Ok(format!(
-            "ximagesrc use-damage=0 show-pointer=true ! videoconvert ! videorate ! video/x-raw,framerate=30/1 ! queue ! vp8enc deadline=1 cpu-used=8 ! webmmux ! filesink location=\"{location}\""
+                "ximagesrc use-damage=0 show-pointer=true ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! webmmux ! filesink location=\"{location}\""
             ))
         }
         PipelineSource::PipeWirePath(path) => {
             let path = escape_gst_string(&path);
             Ok(format!(
-            "pipewiresrc path=\"{path}\" do-timestamp=true ! videoconvert ! videorate ! video/x-raw,framerate=30/1 ! queue ! vp8enc deadline=1 cpu-used=8 ! webmmux ! filesink location=\"{location}\""
+                "pipewiresrc path=\"{path}\" do-timestamp=true ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! webmmux ! filesink location=\"{location}\""
             ))
         }
         PipelineSource::PipeWireTarget(target) => {
             let target = escape_gst_string(&target);
             Ok(format!(
-            "pipewiresrc target-object=\"{target}\" do-timestamp=true ! videoconvert ! videorate ! video/x-raw,framerate=30/1 ! queue ! vp8enc deadline=1 cpu-used=8 ! webmmux ! filesink location=\"{location}\""
+                "pipewiresrc target-object=\"{target}\" do-timestamp=true ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! webmmux ! filesink location=\"{location}\""
             ))
         }
         PipelineSource::PipeWirePortal { fd, node_id } => Ok(format!(
-            "pipewiresrc fd={fd} path={node_id} do-timestamp=true ! videoconvert ! videorate ! video/x-raw,framerate=30/1 ! queue ! vp8enc deadline=1 cpu-used=8 ! webmmux ! filesink location=\"{location}\""
+            "pipewiresrc fd={fd} path={node_id} do-timestamp=true ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! webmmux ! filesink location=\"{location}\""
         )),
     }
 }
@@ -276,10 +290,15 @@ mod tests {
             PipelineSource::PipeWirePortal { fd: 8, node_id: 99 },
             CaptureSource::Screen,
             Path::new("/tmp/out.webm"),
+            VideoQuality::default(),
         )
         .unwrap();
 
         assert!(pipeline.contains("pipewiresrc fd=8 path=99"));
+        assert!(pipeline.contains("video/x-raw,framerate=60/1"));
+        assert!(pipeline.contains(
+            "vp8enc deadline=1 end-usage=cbr target-bitrate=20000000 cpu-used=2 keyframe-max-dist=120"
+        ));
         assert!(pipeline.contains("webmmux"));
         assert!(pipeline.contains("filesink location=\"/tmp/out.webm\""));
     }
@@ -290,10 +309,12 @@ mod tests {
             PipelineSource::X11,
             CaptureSource::Screen,
             Path::new("/tmp/out.webm"),
+            VideoQuality::default(),
         )
         .unwrap();
 
         assert!(pipeline.contains("ximagesrc"));
         assert!(pipeline.contains("vp8enc"));
+        assert!(pipeline.contains("target-bitrate=20000000"));
     }
 }

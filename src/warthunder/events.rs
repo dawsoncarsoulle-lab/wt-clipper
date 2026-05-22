@@ -2,6 +2,7 @@
 pub enum WarThunderEvent {
     TargetDestroyed {
         attacker: Option<String>,
+        action: String,
         vehicle: Option<String>,
         target: Option<String>,
         raw: String,
@@ -26,11 +27,14 @@ impl WarThunderEvent {
         match self {
             Self::TargetDestroyed {
                 attacker: Some(attacker),
-                raw,
+                action,
                 ..
-            } => attacker == player_name || raw.contains(player_name),
-            Self::TargetDestroyed { raw, .. } => raw.contains(player_name),
+            } => is_kill_action(action) && attacker == player_name,
             _ => false,
         }
     }
+}
+
+fn is_kill_action(action: &str) -> bool {
+    matches!(action, "destroyed" | "shot down")
 }
