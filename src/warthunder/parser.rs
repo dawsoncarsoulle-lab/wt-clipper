@@ -90,19 +90,47 @@ fn find_combat_action(raw: &str) -> Option<(&'static str, usize, usize)> {
 }
 
 fn parse_attacker_and_vehicle(attacker_part: &str) -> (Option<String>, Option<String>) {
-    let Some(open_paren) = attacker_part.rfind(" (") else {
-        return (Some(attacker_part.to_owned()), None);
-    };
-    let Some(close_paren) = attacker_part.rfind(')') else {
-        return (Some(attacker_part.to_owned()), None);
-    };
+    let input = attacker_part.trim();
 
-    if close_paren <= open_paren {
-        return (Some(attacker_part.to_owned()), None);
+    if !input.ends_with(')') {
+        return (non_empty_string(input), None);
     }
 
-    let attacker = attacker_part[..open_paren].trim();
-    let vehicle = attacker_part[open_paren + 2..close_paren].trim();
+    let mut depth = 0usize;
+    let mut matching_open = None;
+
+    for (index, ch) in input.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                if depth == 0 {
+                    continue;
+                }
+
+                depth -= 1;
+
+                if depth == 0 {
+                    matching_open = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(open_paren) = matching_open else {
+        return (non_empty_string(input), None);
+    };
+
+    // Require the actor/vehicle separator to be " ("
+    // so we do not split weird malformed strings.
+    if open_paren == 0 || !input[..open_paren].ends_with(' ') {
+        return (non_empty_string(input), None);
+    }
+
+    let close_paren = input.len() - 1;
+    let attacker = input[..open_paren].trim();
+    let vehicle = input[open_paren + 1..close_paren].trim();
 
     (non_empty_string(attacker), non_empty_string(vehicle))
 }
@@ -307,5 +335,47 @@ mod tests {
             parse_gamechat_event("Capture the point"),
             WarThunderEvent::Unknown("Capture the point".to_owned())
         );
+    }
+
+    #[test]
+    fn parses_ground_kill_with_nested_vehicle_parentheses() {
+        let raw = "dawson16800 (Leopard 2 (OTCo)) destroyed IT-1";
+
+        assert_eq!(
+            parse_gamechat_event(raw),
+            WarThunderEvent::TargetDestroyed {
+                attacker: Some("dawson16800".to_owned()),
+                action: "destroyed".to_owned(),
+                vehicle: Some("Leopard 2 (OTCo)".to_owned()),
+                target: Some("IT-1".to_owned()),
+                raw: raw.to_owned(),
+            }
+        );
+
+        assert!(is_personal_kill(
+            &parse_gamechat_event(raw),
+            Some("dawson16800")
+        ));
+    }
+
+    #[test]
+    fn parses_ground_kill_with_target_parentheses() {
+        let raw = "dawson16800 (Leopard 2 (OTCo)) destroyed T-64A (1971)";
+
+        assert_eq!(
+            parse_gamechat_event(raw),
+            WarThunderEvent::TargetDestroyed {
+                attacker: Some("dawson16800".to_owned()),
+                action: "destroyed".to_owned(),
+                vehicle: Some("Leopard 2 (OTCo)".to_owned()),
+                target: Some("T-64A (1971)".to_owned()),
+                raw: raw.to_owned(),
+            }
+        );
+
+        assert!(is_personal_kill(
+            &parse_gamechat_event(raw),
+            Some("dawson16800")
+        ));
     }
 }
