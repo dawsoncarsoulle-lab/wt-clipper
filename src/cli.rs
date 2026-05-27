@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 use crate::capture::quality::QualityPreset;
 
@@ -8,8 +9,8 @@ use crate::capture::quality::QualityPreset;
 #[command(name = "wt-clipper")]
 #[command(about = "War Thunder clipper telemetry prototype")]
 pub struct Cli {
-    #[arg(short, long, default_value = "config.toml")]
-    pub config: PathBuf,
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -17,6 +18,13 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the native egui desktop interface.
+    Gui,
+    /// Manage wt-clipper configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Diagnose local capture dependencies without starting a capture.
     Doctor {
         /// Print checks as JSON.
@@ -40,16 +48,16 @@ pub enum Command {
     Record {
         /// Recording duration in seconds.
         #[arg(long)]
-        duration: u64,
+        duration: Option<u64>,
         /// Output .webm path. Defaults to ~/Videos/WarThunder Clips/manual-*.webm.
         #[arg(long)]
         output: Option<PathBuf>,
         /// Capture source.
-        #[arg(long, value_enum, default_value_t = CaptureSource::Screen)]
-        source: CaptureSource,
+        #[arg(long, value_enum)]
+        source: Option<CaptureSource>,
         /// Video quality preset.
-        #[arg(long, value_enum, default_value_t = QualityPreset::High)]
-        quality: QualityPreset,
+        #[arg(long, value_enum)]
+        quality: Option<QualityPreset>,
         /// Target frames per second. Overrides --quality.
         #[arg(long)]
         fps: Option<u32>,
@@ -61,19 +69,19 @@ pub enum Command {
     Buffer {
         /// Replay buffer duration in seconds.
         #[arg(long)]
-        seconds: u64,
+        seconds: Option<u64>,
         /// Segment duration in seconds.
-        #[arg(long, default_value_t = 2)]
-        segment_seconds: u64,
+        #[arg(long)]
+        segment_seconds: Option<u64>,
         /// Directory where replay clip folders are written.
         #[arg(long)]
         output_dir: Option<PathBuf>,
         /// Capture source.
-        #[arg(long, value_enum, default_value_t = CaptureSource::Screen)]
-        source: CaptureSource,
+        #[arg(long, value_enum)]
+        source: Option<CaptureSource>,
         /// Video quality preset.
-        #[arg(long, value_enum, default_value_t = QualityPreset::High)]
-        quality: QualityPreset,
+        #[arg(long, value_enum)]
+        quality: Option<QualityPreset>,
         /// Target frames per second. Overrides --quality.
         #[arg(long)]
         fps: Option<u32>,
@@ -88,19 +96,19 @@ pub enum Command {
     Auto {
         /// Replay buffer duration in seconds.
         #[arg(long)]
-        seconds: u64,
+        seconds: Option<u64>,
         /// Segment duration in seconds.
-        #[arg(long, default_value_t = 2)]
-        segment_seconds: u64,
+        #[arg(long)]
+        segment_seconds: Option<u64>,
         /// Directory where replay clip folders are written.
         #[arg(long)]
         output_dir: Option<PathBuf>,
         /// Capture source.
-        #[arg(long, value_enum, default_value_t = CaptureSource::Screen)]
-        source: CaptureSource,
+        #[arg(long, value_enum)]
+        source: Option<CaptureSource>,
         /// Video quality preset.
-        #[arg(long, value_enum, default_value_t = QualityPreset::High)]
-        quality: QualityPreset,
+        #[arg(long, value_enum)]
+        quality: Option<QualityPreset>,
         /// Target frames per second. Overrides --quality.
         #[arg(long)]
         fps: Option<u32>,
@@ -114,11 +122,21 @@ pub enum Command {
         #[arg(long, default_value_t = 3)]
         cooldown_seconds: u64,
         /// Delay after a detected event before saving the replay.
-        #[arg(long, default_value_t = 5)]
-        post_event_seconds: u64,
+        #[arg(long)]
+        post_event_seconds: Option<u64>,
         /// Process events already present at startup.
         #[arg(long)]
         include_history: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Create the default user config file.
+    Init {
+        /// Overwrite an existing config file.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -130,8 +148,10 @@ pub enum DumpEndpoint {
     Hudmsg,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum CaptureSource {
     Screen,
+    #[default]
     Window,
 }

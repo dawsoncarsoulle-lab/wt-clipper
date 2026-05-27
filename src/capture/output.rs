@@ -5,13 +5,15 @@ use std::{
 
 use chrono::Local;
 
-pub fn resolve_output_path(output: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+pub fn resolve_output_path_in_dir(
+    output: Option<PathBuf>,
+    output_dir: PathBuf,
+) -> anyhow::Result<PathBuf> {
     match output {
         Some(path) => ensure_unique_path(path),
         None => {
-            let dir = default_output_dir()?;
-            fs::create_dir_all(&dir)?;
-            ensure_unique_path(dir.join(default_file_name()))
+            fs::create_dir_all(&output_dir)?;
+            ensure_unique_path(output_dir.join(default_file_name()))
         }
     }
 }

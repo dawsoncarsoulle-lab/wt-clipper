@@ -1,9 +1,12 @@
 use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum QualityPreset {
     Low,
     Medium,
+    #[default]
     High,
 }
 
@@ -68,6 +71,7 @@ impl VideoQuality {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_overrides(
         preset: QualityPreset,
         fps: Option<u32>,

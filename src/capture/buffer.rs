@@ -1,4 +1,9 @@
-use std::{fs, os::fd::AsRawFd, path::PathBuf, time::Duration};
+use std::{
+    fs,
+    os::fd::AsRawFd,
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::Context;
 use chrono::{DateTime, Local};
@@ -23,7 +28,8 @@ use crate::{
         },
         segments::{
             prune_old_segments, segment_file_name, segment_location_pattern, segments_to_keep,
-            snapshot_recent_segments, ReplaySegment,
+            selected_segments_duration, snapshot_stable_segments, wait_until_segment_stable,
+            ReplaySegment,
         },
     },
     cli::CaptureSource,
@@ -52,6 +58,7 @@ pub struct SavedReplay {
 pub enum ClipReason {
     TargetDestroyed,
     PlayerDestroyed,
+    MultiKill,
     Manual,
     Unknown,
 }
@@ -61,6 +68,7 @@ impl ClipReason {
         match self {
             Self::TargetDestroyed => "target-destroyed",
             Self::PlayerDestroyed => "player-destroyed",
+            Self::MultiKill => "multi-kill",
             Self::Manual => "manual",
             Self::Unknown => "unknown",
         }
@@ -70,6 +78,7 @@ impl ClipReason {
         match self {
             Self::TargetDestroyed => "kill",
             Self::PlayerDestroyed => "death",
+            Self::MultiKill => "multi-kill",
             Self::Manual => "manual",
             Self::Unknown => "clip",
         }
@@ -80,6 +89,7 @@ impl ClipReason {
 pub struct ClipContext {
     pub reason: ClipReason,
     pub event: Option<WarThunderEvent>,
+    pub events: Vec<WarThunderEvent>,
     pub player_name: Option<String>,
     pub video_quality: VideoQuality,
     pub quality_preset: QualityPreset,
@@ -216,6 +226,7 @@ impl ReplayBufferHandle {
         ClipContext {
             reason: ClipReason::Manual,
             event: None,
+            events: Vec::new(),
             player_name: None,
             video_quality: self.config.quality,
             quality_preset: self.config.quality_preset,
@@ -297,8 +308,38 @@ fn save_replay_clip(
     keep_saved_segments: bool,
     context: ClipContext,
 ) -> anyhow::Result<Option<SavedReplay>> {
-    let segments = snapshot_recent_segments(temp_dir, keep_segments)?;
-    if segments.is_empty() {
+    let snapshot = snapshot_stable_segments(
+        temp_dir,
+        keep_segments,
+        context.segment_seconds,
+        SystemTime::now(),
+    )?;
+    println!(
+        "[CLIP] snapshot segments: found={} selected={}",
+        snapshot.found_count,
+        snapshot.selected.len()
+    );
+    if let Some(segment) = &snapshot.excluded_newest {
+        println!(
+            "[CLIP] excluded newest live segment: {}",
+            segment
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+        );
+    }
+    if selected_segments_duration(snapshot.selected.len(), context.segment_seconds)
+        < Duration::from_secs(context.duration_seconds)
+    {
+        debug!(
+            selected = snapshot.selected.len(),
+            segment_seconds = context.segment_seconds,
+            duration_seconds = context.duration_seconds,
+            "selected replay segments do not cover requested clip duration"
+        );
+    }
+    if snapshot.selected.is_empty() {
         println!("No finalized replay segments are available yet.");
         return Ok(None);
     }
@@ -306,12 +347,16 @@ fn save_replay_clip(
     let created_at = Local::now();
     let parent = resolve_clip_parent(output_dir)?;
     let paths = resolve_clip_paths(&parent, &context, created_at)?;
-    let segment_dir = paths.segments_dir.clone();
-    fs::create_dir_all(&segment_dir)?;
-    copy_segments(&segments, &segment_dir)?;
+    let snapshot_dir = create_save_snapshot_dir()?;
+    copy_stable_segments(&snapshot.selected, &snapshot_dir, Duration::from_secs(2))?;
 
-    let segment_paths = copied_segment_paths(&segment_dir)?;
-    println!("[CLIP] assembling replay video...");
+    let segment_paths = copied_segment_paths(&snapshot_dir)?;
+    println!("[CLIP] concat input segments: {}", segment_paths.len());
+    if context.reason == ClipReason::MultiKill {
+        println!("[CLIP] assembling multi-kill replay video...");
+    } else {
+        println!("[CLIP] assembling replay video...");
+    }
     match concatenate_segments_to_webm(
         &segment_paths,
         paths.final_video_path.clone(),
@@ -322,28 +367,29 @@ fn save_replay_clip(
                 &context,
                 created_at,
                 &path,
-                keep_saved_segments.then_some(&segment_dir),
+                keep_saved_segments.then_some(&paths.segments_dir),
             );
             write_clip_metadata(&paths.metadata_path, &metadata)?;
-            if !keep_saved_segments {
-                fs::remove_dir_all(&segment_dir)?;
+            if keep_saved_segments {
+                move_snapshot_segments(&snapshot_dir, &paths.segments_dir)?;
+                Ok(Some(SavedReplay {
+                    final_video_path: Some(path),
+                    metadata_path: Some(paths.metadata_path),
+                    segments_dir: Some(paths.segments_dir),
+                }))
+            } else {
+                fs::remove_dir_all(&snapshot_dir)?;
                 Ok(Some(SavedReplay {
                     final_video_path: Some(path),
                     metadata_path: Some(paths.metadata_path),
                     segments_dir: None,
-                }))
-            } else {
-                Ok(Some(SavedReplay {
-                    final_video_path: Some(path),
-                    metadata_path: Some(paths.metadata_path),
-                    segments_dir: Some(segment_dir),
                 }))
             }
         }
         Err(error) => {
             println!(
                 "[CLIP] failed to assemble final video, segments kept at: {}",
-                segment_dir.display()
+                snapshot_dir.display()
             );
             Err(error)
         }
@@ -395,6 +441,19 @@ fn resolve_clip_paths(
 
 fn clip_file_stem(context: &ClipContext, created_at: DateTime<Local>) -> String {
     let timestamp = created_at.format("%Y-%m-%d-%H-%M-%S");
+    if context.reason == ClipReason::MultiKill {
+        let vehicle = context
+            .events
+            .iter()
+            .find_map(|event| match event {
+                WarThunderEvent::TargetDestroyed { vehicle, .. } => vehicle.as_deref(),
+                _ => None,
+            })
+            .map(slugify_filename_part)
+            .unwrap_or_else(|| "unknown".to_owned());
+        return format!("multi-kill-{timestamp}-{vehicle}-x{}", context.events.len());
+    }
+
     match &context.event {
         Some(WarThunderEvent::TargetDestroyed {
             vehicle, target, ..
@@ -466,6 +525,7 @@ struct ClipMetadata {
     target: Option<String>,
     target_vehicle: Option<String>,
     raw_event: Option<String>,
+    kill_count: Option<usize>,
     duration_seconds: u64,
     post_event_seconds: u64,
     segment_seconds: u64,
@@ -473,6 +533,7 @@ struct ClipMetadata {
     fps: u32,
     video_bitrate_kbps: u32,
     event: Option<serde_json::Value>,
+    events: Option<Vec<serde_json::Value>>,
     segments_dir: Option<String>,
     video_path: String,
 }
@@ -483,7 +544,8 @@ fn build_clip_metadata(
     video_path: &std::path::Path,
     segments_dir: Option<&PathBuf>,
 ) -> ClipMetadata {
-    let (attacker, vehicle, action, target, target_vehicle, raw_event, event) = match &context.event
+    let primary_event = context.event.as_ref().or_else(|| context.events.first());
+    let (attacker, vehicle, action, target, target_vehicle, raw_event, event) = match primary_event
     {
         Some(WarThunderEvent::TargetDestroyed {
             attacker,
@@ -559,6 +621,14 @@ fn build_clip_metadata(
         ),
         None => (None, None, None, None, None, None, None),
     };
+    let event_list = (context.reason == ClipReason::MultiKill).then(|| {
+        context
+            .events
+            .iter()
+            .map(metadata_event_json)
+            .collect::<Vec<_>>()
+    });
+    let kill_count = (context.reason == ClipReason::MultiKill).then_some(context.events.len());
 
     ClipMetadata {
         created_by: "wt-clipper",
@@ -572,6 +642,7 @@ fn build_clip_metadata(
         target,
         target_vehicle,
         raw_event,
+        kill_count,
         duration_seconds: context.duration_seconds,
         post_event_seconds: context.post_event_seconds,
         segment_seconds: context.segment_seconds,
@@ -579,14 +650,125 @@ fn build_clip_metadata(
         fps: context.video_quality.fps,
         video_bitrate_kbps: context.video_quality.video_bitrate_kbps,
         event,
+        events: event_list,
         segments_dir: segments_dir.map(|path| path.display().to_string()),
         video_path: video_path.display().to_string(),
+    }
+}
+
+fn metadata_event_json(event: &WarThunderEvent) -> serde_json::Value {
+    match event {
+        WarThunderEvent::TargetDestroyed {
+            attacker,
+            action,
+            vehicle,
+            target,
+            raw,
+        } => {
+            let target_vehicle = target
+                .as_deref()
+                .and_then(|value| parse_target_details(value).vehicle);
+            serde_json::json!({
+                "type": "target_destroyed",
+                "attacker": attacker,
+                "vehicle": vehicle,
+                "action": action,
+                "target": target,
+                "target_vehicle": target_vehicle,
+                "raw": raw,
+            })
+        }
+        WarThunderEvent::PlayerDestroyed { raw } => {
+            serde_json::json!({ "type": "player_destroyed", "raw": raw })
+        }
+        WarThunderEvent::CriticalHit { raw } => {
+            serde_json::json!({ "type": "critical_hit", "raw": raw })
+        }
+        WarThunderEvent::SevereDamage { raw } => {
+            serde_json::json!({ "type": "severe_damage", "raw": raw })
+        }
+        WarThunderEvent::BaseDestroyed { raw } => {
+            serde_json::json!({ "type": "base_destroyed", "raw": raw })
+        }
+        WarThunderEvent::Unknown(raw) => serde_json::json!({ "type": "unknown", "raw": raw }),
     }
 }
 
 fn write_clip_metadata(path: &std::path::Path, metadata: &ClipMetadata) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(metadata)?;
     fs::write(path, json).with_context(|| format!("failed to write metadata {}", path.display()))
+}
+
+fn create_save_snapshot_dir() -> anyhow::Result<PathBuf> {
+    let dir = std::env::temp_dir()
+        .join("wt-clipper-save")
+        .join(Uuid::new_v4().to_string());
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create save snapshot directory {}", dir.display()))?;
+    Ok(dir)
+}
+
+fn copy_stable_segments(
+    segments: &[ReplaySegment],
+    snapshot_dir: &std::path::Path,
+    stable_timeout: Duration,
+) -> anyhow::Result<()> {
+    for (clip_index, segment) in segments.iter().enumerate() {
+        let name = segment
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown");
+        println!("[CLIP] waiting stable segment: {name}");
+        wait_until_segment_stable(&segment.path, stable_timeout)?;
+
+        let destination = snapshot_dir.join(segment_file_name(clip_index as u64));
+        fs::copy(&segment.path, &destination).with_context(|| {
+            format!(
+                "failed to copy replay segment {} to {}",
+                segment.path.display(),
+                destination.display()
+            )
+        })?;
+        println!("[CLIP] copied stable segment: {}", destination.display());
+    }
+    Ok(())
+}
+
+fn move_snapshot_segments(
+    snapshot_dir: &std::path::Path,
+    final_segment_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    if final_segment_dir.exists() {
+        anyhow::bail!(
+            "segment output directory already exists: {}",
+            final_segment_dir.display()
+        );
+    }
+    match fs::rename(snapshot_dir, final_segment_dir) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            debug!(
+                %rename_error,
+                from = %snapshot_dir.display(),
+                to = %final_segment_dir.display(),
+                "failed to move snapshot directory, copying files instead"
+            );
+            fs::create_dir_all(final_segment_dir)?;
+            for entry in fs::read_dir(snapshot_dir)? {
+                let entry = entry?;
+                let destination = final_segment_dir.join(entry.file_name());
+                fs::copy(entry.path(), &destination).with_context(|| {
+                    format!(
+                        "failed to copy snapshot segment to {}",
+                        destination.display()
+                    )
+                })?;
+            }
+            fs::remove_dir_all(snapshot_dir)?;
+            Ok(())
+        }
+    }
 }
 
 fn copied_segment_paths(segment_dir: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -610,20 +792,6 @@ pub fn print_saved_replay(replay: &SavedReplay) {
     if let Some(path) = &replay.metadata_path {
         println!("[CLIP] metadata: {}", path.display());
     }
-}
-
-fn copy_segments(segments: &[ReplaySegment], clip_dir: &std::path::Path) -> anyhow::Result<()> {
-    for (clip_index, segment) in segments.iter().enumerate() {
-        let destination = clip_dir.join(segment_file_name(clip_index as u64));
-        fs::copy(&segment.path, &destination).with_context(|| {
-            format!(
-                "failed to copy replay segment {} to {}",
-                segment.path.display(),
-                destination.display()
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn check_pipeline_bus(pipeline: &gst::Pipeline) -> anyhow::Result<()> {
@@ -729,6 +897,7 @@ mod tests {
     fn clip_reason_slug() {
         assert_eq!(ClipReason::TargetDestroyed.slug(), "target-destroyed");
         assert_eq!(ClipReason::PlayerDestroyed.slug(), "player-destroyed");
+        assert_eq!(ClipReason::MultiKill.slug(), "multi-kill");
         assert_eq!(ClipReason::Manual.slug(), "manual");
         assert_eq!(ClipReason::Unknown.slug(), "unknown");
     }
@@ -748,15 +917,17 @@ mod tests {
     }
 
     fn test_kill_context() -> ClipContext {
+        let event = WarThunderEvent::TargetDestroyed {
+            attacker: Some("dawson16800".to_owned()),
+            action: "shot down".to_owned(),
+            vehicle: Some("F/A-18C Early".to_owned()),
+            target: Some("=3BEHO= BoBka_V (MiG-21bis)".to_owned()),
+            raw: "dawson16800 (F/A-18C Early) shot down =3BEHO= BoBka_V (MiG-21bis)".to_owned(),
+        };
         ClipContext {
             reason: ClipReason::TargetDestroyed,
-            event: Some(WarThunderEvent::TargetDestroyed {
-                attacker: Some("dawson16800".to_owned()),
-                action: "shot down".to_owned(),
-                vehicle: Some("F/A-18C Early".to_owned()),
-                target: Some("=3BEHO= BoBka_V (MiG-21bis)".to_owned()),
-                raw: "dawson16800 (F/A-18C Early) shot down =3BEHO= BoBka_V (MiG-21bis)".to_owned(),
-            }),
+            event: Some(event.clone()),
+            events: vec![event],
             player_name: Some("dawson16800".to_owned()),
             video_quality: VideoQuality::default(),
             quality_preset: QualityPreset::High,
@@ -795,6 +966,27 @@ mod tests {
     }
 
     #[test]
+    fn builds_multi_kill_file_stem() {
+        let created_at = DateTime::parse_from_rfc3339("2026-05-22T21:12:14+02:00")
+            .unwrap()
+            .with_timezone(&Local);
+        let mut context = test_kill_context();
+        context.reason = ClipReason::MultiKill;
+        context.events.push(WarThunderEvent::TargetDestroyed {
+            attacker: Some("dawson16800".to_owned()),
+            action: "shot down".to_owned(),
+            vehicle: Some("F/A-18C Early".to_owned()),
+            target: Some("Player2 (F-4E)".to_owned()),
+            raw: "dawson16800 (F/A-18C Early) shot down Player2 (F-4E)".to_owned(),
+        });
+
+        assert_eq!(
+            clip_file_stem(&context, created_at),
+            "multi-kill-2026-05-22-21-12-14-f-a-18c-early-x2"
+        );
+    }
+
+    #[test]
     fn builds_manual_file_stem() {
         let created_at = DateTime::parse_from_rfc3339("2026-05-22T21:12:14+02:00")
             .unwrap()
@@ -803,6 +995,7 @@ mod tests {
         let context = ClipContext {
             reason: ClipReason::Manual,
             event: None,
+            events: Vec::new(),
             player_name: None,
             video_quality: VideoQuality::default(),
             quality_preset: QualityPreset::High,
@@ -845,5 +1038,57 @@ mod tests {
         assert_eq!(json["fps"], 60);
         assert_eq!(json["video_bitrate_kbps"], 20_000);
         assert_eq!(json["segments_dir"], "/tmp/kill-segments");
+    }
+
+    #[test]
+    fn multi_kill_metadata_contains_kill_count_and_events() {
+        let created_at = DateTime::parse_from_rfc3339("2026-05-22T21:12:14+02:00")
+            .unwrap()
+            .with_timezone(&Local);
+        let mut context = test_kill_context();
+        context.reason = ClipReason::MultiKill;
+        context.events.push(WarThunderEvent::TargetDestroyed {
+            attacker: Some("dawson16800".to_owned()),
+            action: "shot down".to_owned(),
+            vehicle: Some("F/A-18C Early".to_owned()),
+            target: Some("Player2 (F-4E)".to_owned()),
+            raw: "dawson16800 (F/A-18C Early) shot down Player2 (F-4E)".to_owned(),
+        });
+
+        let metadata =
+            build_clip_metadata(&context, created_at, Path::new("/tmp/multi.webm"), None);
+        let json = serde_json::to_value(&metadata).unwrap();
+
+        assert_eq!(json["reason"], "multi-kill");
+        assert_eq!(json["kill_count"], 2);
+        assert_eq!(json["events"].as_array().unwrap().len(), 2);
+        assert_eq!(json["events"][1]["target_vehicle"], "F-4E");
+    }
+
+    #[test]
+    fn copied_concat_inputs_come_from_snapshot_directory() {
+        let live_dir =
+            std::env::temp_dir().join(format!("wt-clipper-live-test-{}", std::process::id()));
+        let snapshot_dir =
+            std::env::temp_dir().join(format!("wt-clipper-snapshot-test-{}", std::process::id()));
+        fs::create_dir_all(&live_dir).unwrap();
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        let live_segment = live_dir.join(segment_file_name(7));
+        fs::write(&live_segment, b"stable segment").unwrap();
+        let segment = ReplaySegment {
+            index: 7,
+            path: live_segment.clone(),
+            modified: SystemTime::now(),
+        };
+
+        copy_stable_segments(&[segment], &snapshot_dir, Duration::from_secs(1)).unwrap();
+        let copied = copied_segment_paths(&snapshot_dir).unwrap();
+
+        assert_eq!(copied.len(), 1);
+        assert!(copied[0].starts_with(&snapshot_dir));
+        assert!(!copied[0].starts_with(&live_dir));
+
+        fs::remove_dir_all(live_dir).unwrap();
+        fs::remove_dir_all(snapshot_dir).unwrap();
     }
 }

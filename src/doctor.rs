@@ -39,8 +39,8 @@ enum SessionKind {
     Unknown,
 }
 
-pub async fn run_doctor(json: bool) -> anyhow::Result<()> {
-    let report = build_report().await;
+pub async fn run_doctor(json: bool, output_dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let report = build_report(output_dir).await;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -49,7 +49,7 @@ pub async fn run_doctor(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn build_report() -> DoctorReport {
+pub async fn build_report(output_dir: Option<PathBuf>) -> DoctorReport {
     let mut checks = Vec::new();
     let (session_kind, session_check) = check_session();
     checks.push(session_check);
@@ -58,7 +58,7 @@ async fn build_report() -> DoctorReport {
     checks.push(check_war_thunder_localhost().await);
     checks.push(check_writable_dir(
         "Output dir writable",
-        default_output_dir(),
+        output_dir.map(Ok).unwrap_or_else(default_output_dir),
     ));
     checks.push(check_writable_dir(
         "Temp dir writable",

@@ -3,29 +3,34 @@ mod capture;
 mod cli;
 mod config;
 mod doctor;
+mod ui;
 mod warthunder;
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
-use anyhow::Context;
 use clap::Parser;
+use eframe::egui;
+use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::app::auto::{run_auto_clip, AutoClipConfig};
 use crate::capture::buffer::{run_replay_buffer, ReplayBufferConfig};
-use crate::capture::output::resolve_output_path;
+use crate::capture::output::resolve_output_path_in_dir;
 use crate::capture::quality::{QualityPreset, VideoQuality};
 use crate::capture::recorder::{record, RecordingRequest};
-use crate::cli::{CaptureSource, Cli, Command, DumpEndpoint};
-use crate::config::{AppConfig, WarThunderConfig};
+use crate::cli::{CaptureSource, Cli, Command, ConfigCommand, DumpEndpoint};
+use crate::config::{default_config_path, expand_tilde, AppConfig, ClipConfig, WarThunderConfig};
+use crate::ui::{
+    app::WtClipperApp,
+    bridge::{AppEvent, Bridge, ClipInfo, UiCommand},
+};
 use crate::warthunder::client::{ChatMessage, Endpoint, EndpointProbe, WarThunderClient};
 use crate::warthunder::events::WarThunderEvent;
 use crate::warthunder::parser::{is_personal_kill, parse_gamechat_event};
 use crate::warthunder::recent::RecentMessageCache;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
@@ -36,8 +41,32 @@ async fn main() -> anyhow::Result<()> {
         .without_time()
         .init();
 
+    if matches!(cli.command, Command::Gui) {
+        return gui_command(cli.config);
+    }
+
+    tokio::runtime::Runtime::new()?.block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Doctor { json } => doctor::run_doctor(json).await,
+        Command::Gui => unreachable!("gui command is handled before tokio runtime creation"),
+        Command::Config {
+            command: ConfigCommand::Init { force },
+        } => {
+            let path = cli
+                .config
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(default_config_path);
+            AppConfig::write_default(&path, force)?;
+            println!("Config written: {}", path.display());
+            Ok(())
+        }
+        Command::Doctor { json } => {
+            let config = AppConfig::load(cli.config.as_deref())?;
+            doctor::run_doctor(json, Some(config.clip.output_dir_path()?)).await
+        }
         Command::Record {
             duration,
             output,
@@ -45,7 +74,19 @@ async fn main() -> anyhow::Result<()> {
             quality,
             fps,
             video_bitrate,
-        } => record_command(duration, output, source, quality, fps, video_bitrate).await,
+        } => {
+            let config = AppConfig::load(cli.config.as_deref())?;
+            record_command(
+                &config.clip,
+                duration,
+                output,
+                source,
+                quality,
+                fps,
+                video_bitrate,
+            )
+            .await
+        }
         Command::Buffer {
             seconds,
             segment_seconds,
@@ -56,14 +97,18 @@ async fn main() -> anyhow::Result<()> {
             video_bitrate,
             keep_segments,
         } => {
+            let config = AppConfig::load(cli.config.as_deref())?;
+            let quality_preset = quality.unwrap_or(config.clip.quality);
+            let quality =
+                resolve_configured_video_quality(&config.clip, quality, fps, video_bitrate)?;
             run_replay_buffer(ReplayBufferConfig {
-                buffer_seconds: seconds,
-                segment_seconds,
-                output_dir,
-                source,
-                keep_segments,
-                quality_preset: quality,
-                quality: resolve_video_quality(quality, fps, video_bitrate)?,
+                buffer_seconds: seconds.unwrap_or(config.clip.seconds),
+                segment_seconds: segment_seconds.unwrap_or(config.clip.segment_seconds),
+                output_dir: Some(resolve_output_dir(output_dir, &config.clip)?),
+                source: source.unwrap_or(config.clip.source),
+                keep_segments: keep_segments || config.clip.keep_segments,
+                quality_preset,
+                quality,
             })
             .await
         }
@@ -80,35 +125,44 @@ async fn main() -> anyhow::Result<()> {
             post_event_seconds,
             include_history,
         } => {
-            let config = AppConfig::load(&cli.config)
-                .with_context(|| format!("failed to read config from {}", cli.config.display()))?;
+            let config = AppConfig::load(cli.config.as_deref())?;
             let client = WarThunderClient::new(config.war_thunder.clone())?;
+            let quality_preset = quality.unwrap_or(config.clip.quality);
+            let quality =
+                resolve_configured_video_quality(&config.clip, quality, fps, video_bitrate)?;
 
             run_auto_clip(
                 client,
                 config.war_thunder,
                 AutoClipConfig {
-                    buffer_seconds: seconds,
-                    segment_seconds,
-                    output_dir,
-                    source,
-                    keep_segments,
-                    quality_preset: quality,
-                    quality: resolve_video_quality(quality, fps, video_bitrate)?,
+                    buffer_seconds: seconds.unwrap_or(config.clip.seconds),
+                    segment_seconds: segment_seconds.unwrap_or(config.clip.segment_seconds),
+                    output_dir: Some(resolve_output_dir(output_dir, &config.clip)?),
+                    source: source.unwrap_or(config.clip.source),
+                    keep_segments: keep_segments || config.clip.keep_segments,
+                    quality_preset,
+                    quality,
                     cooldown: Duration::from_secs(cooldown_seconds),
-                    post_event_delay: Duration::from_secs(post_event_seconds),
+                    post_event_delay: Duration::from_secs(
+                        post_event_seconds.unwrap_or(config.clip.post_event_seconds),
+                    ),
+                    multi_kill_window: Duration::from_secs(config.clip.multi_kill_window_seconds),
                     include_history,
+                    target_destroyed_trigger: config.triggers.target_destroyed,
+                    ui_events: None,
                 },
             )
             .await
         }
         command => {
-            let config = AppConfig::load(&cli.config)
-                .with_context(|| format!("failed to read config from {}", cli.config.display()))?;
+            let config = AppConfig::load(cli.config.as_deref())?;
             let client = WarThunderClient::new(config.war_thunder.clone())?;
 
             match command {
                 Command::Status => status(&client).await,
+                Command::Config { .. } => {
+                    unreachable!("config command is handled before config load")
+                }
                 Command::Doctor { .. } => {
                     unreachable!("doctor command is handled before config load")
                 }
@@ -116,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
                 Command::Watch { include_history } => {
                     watch(&client, &config.war_thunder, include_history).await
                 }
+                Command::Gui => unreachable!("gui command is handled before config load"),
                 Command::Record { .. } => {
                     unreachable!("record command is handled before config load")
                 }
@@ -128,25 +183,327 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn resolve_video_quality(
-    quality: QualityPreset,
+fn gui_command(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let config = AppConfig::load(config_path.as_deref())?;
+    let config_save_path = config_path.unwrap_or_else(default_config_path);
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    spawn_gui_runtime(config.clone(), config_save_path, event_tx, cmd_rx);
+
+    let bridge = Bridge { event_rx, cmd_tx };
+    let ui_config = config.clone();
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("WT Clipper")
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([920.0, 620.0]),
+        ..eframe::NativeOptions::default()
+    };
+
+    eframe::run_native(
+        "wt-clipper",
+        native_options,
+        Box::new(move |cc| Ok(Box::new(WtClipperApp::new(cc, bridge, ui_config)))),
+    )
+    .map_err(|error| anyhow::anyhow!("failed to launch GUI: {error}"))
+}
+
+fn spawn_gui_runtime(
+    config: AppConfig,
+    config_path: PathBuf,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+    cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
+) {
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = event_tx.send(AppEvent::ClipFailed {
+                    message: format!("Tokio runtime: {error}"),
+                });
+                return;
+            }
+        };
+
+        runtime.block_on(async move {
+            let client = match WarThunderClient::new(config.war_thunder.clone()) {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = event_tx.send(AppEvent::ClipFailed {
+                        message: format!("War Thunder client: {error}"),
+                    });
+                    return;
+                }
+            };
+            let quality_preset = config.clip.quality;
+            let quality = match resolve_configured_video_quality(&config.clip, None, None, None) {
+                Ok(quality) => quality,
+                Err(error) => {
+                    let _ = event_tx.send(AppEvent::ClipFailed {
+                        message: format!("Video quality: {error}"),
+                    });
+                    return;
+                }
+            };
+            let output_dir = match config.clip.output_dir_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = event_tx.send(AppEvent::ClipFailed {
+                        message: format!("Output dir: {error}"),
+                    });
+                    return;
+                }
+            };
+
+            let command_events = event_tx.clone();
+            let command_output_dir = output_dir.clone();
+            tokio::spawn(async move {
+                command_loop(cmd_rx, command_events, command_output_dir, config_path).await;
+            });
+
+            let auto = run_auto_clip(
+                client,
+                config.war_thunder.clone(),
+                AutoClipConfig {
+                    buffer_seconds: config.clip.seconds,
+                    segment_seconds: config.clip.segment_seconds,
+                    output_dir: Some(output_dir),
+                    source: config.clip.source,
+                    keep_segments: config.clip.keep_segments,
+                    quality_preset,
+                    quality,
+                    cooldown: Duration::from_secs(3),
+                    post_event_delay: Duration::from_secs(config.clip.post_event_seconds),
+                    multi_kill_window: Duration::from_secs(config.clip.multi_kill_window_seconds),
+                    include_history: false,
+                    target_destroyed_trigger: config.triggers.target_destroyed,
+                    ui_events: Some(event_tx.clone()),
+                },
+            );
+
+            tokio::select! {
+                result = auto => {
+                    if let Err(error) = result {
+                        error!(%error, "auto clip task failed");
+                        let _ = event_tx.send(AppEvent::ClipFailed {
+                            message: format!("Auto clip: {error}"),
+                        });
+                    }
+                }
+            }
+        });
+    });
+}
+
+async fn command_loop(
+    mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+    output_dir: PathBuf,
+    config_path: PathBuf,
+) {
+    while let Some(command) = cmd_rx.recv().await {
+        match command {
+            UiCommand::LoadClips => {
+                let output_dir = output_dir.clone();
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    match scan_clips(output_dir).await {
+                        Ok((clips, total_bytes)) => {
+                            let _ = event_tx.send(AppEvent::ClipsLoaded { clips, total_bytes });
+                        }
+                        Err(error) => {
+                            let _ = event_tx.send(AppEvent::ClipFailed {
+                                message: format!("Scan clips: {error}"),
+                            });
+                        }
+                    }
+                });
+            }
+            UiCommand::RunDiagnostics => {
+                let event_tx = event_tx.clone();
+                let output_dir = Some(output_dir.clone());
+                tokio::spawn(async move {
+                    let report = doctor::build_report(output_dir).await;
+                    let _ = event_tx.send(AppEvent::DiagnosticsReady(report));
+                });
+            }
+            UiCommand::DeleteClip(path) => {
+                let event_tx = event_tx.clone();
+                tokio::task::spawn_blocking(move || delete_clip_files(&path))
+                    .await
+                    .ok();
+                let _ = event_tx.send(AppEvent::ClipFailed {
+                    message: "Clip supprimé".to_owned(),
+                });
+                let _ = event_tx.send(AppEvent::DiskUsage { used_bytes: 0 });
+            }
+            UiCommand::OpenOutputFolder => {
+                let dir = output_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = std::process::Command::new("xdg-open").arg(&dir).spawn() {
+                        debug!(%error, path = %dir.display(), "failed to open output folder");
+                    }
+                })
+                .await
+                .ok();
+            }
+            UiCommand::UpdateConfig(config) => {
+                let event_tx = event_tx.clone();
+                let path = config_path.clone();
+                tokio::task::spawn_blocking(move || write_config(&path, &config))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                let _ = event_tx.send(AppEvent::ClipFailed {
+                    message: "Configuration sauvegardée".to_owned(),
+                });
+            }
+            UiCommand::SaveManualClip => {
+                let _ = event_tx.send(AppEvent::ClipFailed {
+                    message: "Clip manuel indisponible pendant cette session".to_owned(),
+                });
+            }
+            UiCommand::RestartBuffer => {
+                let _ = event_tx.send(AppEvent::ClipFailed {
+                    message: "Redémarrage appliqué au prochain lancement".to_owned(),
+                });
+            }
+        }
+    }
+}
+
+async fn scan_clips(output_dir: PathBuf) -> anyhow::Result<(Vec<ClipInfo>, u64)> {
+    tokio::task::spawn_blocking(move || {
+        let mut clips = Vec::new();
+        let mut total_bytes = 0_u64;
+        let now = std::time::SystemTime::now();
+        for entry in walkdir::WalkDir::new(&output_dir)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("webm") {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    debug!(%error, path = %path.display(), "failed to read clip metadata");
+                    continue;
+                }
+            };
+            let size_bytes = metadata.len();
+            total_bytes = total_bytes.saturating_add(size_bytes);
+            let modified_secs_ago = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| path.display().to_string());
+            clips.push(ClipInfo {
+                reason: clip_reason_from_name(&file_name),
+                path: path.to_path_buf(),
+                file_name,
+                size_bytes,
+                duration_seconds: 0,
+                modified_secs_ago,
+            });
+        }
+        clips.sort_by_key(|clip| std::cmp::Reverse(clip.modified_secs_ago));
+        Ok((clips, total_bytes))
+    })
+    .await?
+}
+
+fn clip_reason_from_name(name: &str) -> crate::capture::buffer::ClipReason {
+    if name.starts_with("multi-kill") {
+        crate::capture::buffer::ClipReason::MultiKill
+    } else if name.starts_with("kill") {
+        crate::capture::buffer::ClipReason::TargetDestroyed
+    } else if name.starts_with("death") {
+        crate::capture::buffer::ClipReason::PlayerDestroyed
+    } else if name.starts_with("manual") {
+        crate::capture::buffer::ClipReason::Manual
+    } else {
+        crate::capture::buffer::ClipReason::Unknown
+    }
+}
+
+fn delete_clip_files(path: &std::path::Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        debug!(%error, path = %path.display(), "failed to delete clip video");
+    }
+    let mut metadata_path = path.to_path_buf();
+    metadata_path.set_extension("json");
+    if metadata_path.exists() {
+        if let Err(error) = std::fs::remove_file(&metadata_path) {
+            debug!(%error, path = %metadata_path.display(), "failed to delete clip metadata");
+        }
+    }
+}
+
+fn write_config(path: &std::path::Path, config: &AppConfig) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(config)?)?;
+    Ok(())
+}
+
+fn resolve_configured_video_quality(
+    config: &ClipConfig,
+    cli_quality: Option<QualityPreset>,
     fps: Option<u32>,
     video_bitrate: Option<u32>,
 ) -> anyhow::Result<VideoQuality> {
-    VideoQuality::with_overrides(quality, fps, video_bitrate)
+    let preset = cli_quality.unwrap_or(config.quality);
+    let base = if cli_quality.is_some() {
+        preset.video_quality()
+    } else {
+        VideoQuality::new(
+            config.fps,
+            config.video_bitrate_kbps,
+            preset.video_quality().encoder_cpu_used,
+        )?
+    };
+
+    VideoQuality::new(
+        fps.unwrap_or(base.fps),
+        video_bitrate.unwrap_or(base.video_bitrate_kbps),
+        base.encoder_cpu_used,
+    )
+}
+
+fn resolve_output_dir(
+    cli_output_dir: Option<PathBuf>,
+    config: &ClipConfig,
+) -> anyhow::Result<PathBuf> {
+    match cli_output_dir {
+        Some(path) => expand_tilde(&path.to_string_lossy()),
+        None => config.output_dir_path(),
+    }
 }
 
 async fn record_command(
-    duration_seconds: u64,
+    clip_config: &ClipConfig,
+    duration_seconds: Option<u64>,
     output: Option<std::path::PathBuf>,
-    source: CaptureSource,
-    quality_preset: QualityPreset,
+    source: Option<CaptureSource>,
+    quality_preset: Option<QualityPreset>,
     fps: Option<u32>,
     video_bitrate: Option<u32>,
 ) -> anyhow::Result<()> {
-    let output_path = resolve_output_path(output)?;
+    let duration_seconds = duration_seconds.unwrap_or(clip_config.seconds);
+    let output_path = resolve_output_path_in_dir(output, clip_config.output_dir_path()?)?;
     let duration = Duration::from_secs(duration_seconds);
-    let quality = resolve_video_quality(quality_preset, fps, video_bitrate)?;
+    let quality =
+        resolve_configured_video_quality(clip_config, quality_preset, fps, video_bitrate)?;
 
     println!("Recording output: {}", output_path.display());
     println!("Duration: {duration_seconds}s");
@@ -156,7 +513,7 @@ async fn record_command(
     record(RecordingRequest {
         duration,
         output_path: output_path.clone(),
-        source,
+        source: source.unwrap_or(clip_config.source),
         quality,
     })
     .await?;
@@ -581,5 +938,31 @@ mod tests {
         assert!(state.seen_messages.contains("hud:event:2"));
         assert!(state.seen_messages.contains("hud:damage:3"));
         assert_eq!(state.seen_messages.len(), 3);
+    }
+
+    #[test]
+    fn cli_quality_override_replaces_config_preset_defaults() {
+        let mut config = ClipConfig::default();
+        config.quality = QualityPreset::High;
+        config.fps = 60;
+        config.video_bitrate_kbps = 20_000;
+
+        let quality =
+            resolve_configured_video_quality(&config, Some(QualityPreset::Medium), None, None)
+                .unwrap();
+
+        assert_eq!(quality.fps, 60);
+        assert_eq!(quality.video_bitrate_kbps, 12_000);
+        assert_eq!(quality.encoder_cpu_used, 4);
+    }
+
+    #[test]
+    fn cli_output_dir_override_replaces_config_output_dir() {
+        let mut config = ClipConfig::default();
+        config.output_dir = "/tmp/from-config".to_owned();
+
+        let output_dir = resolve_output_dir(Some(PathBuf::from("/tmp/from-cli")), &config).unwrap();
+
+        assert_eq!(output_dir, PathBuf::from("/tmp/from-cli"));
     }
 }
