@@ -9,7 +9,7 @@ use anyhow::Context;
 use chrono::{DateTime, Local};
 use gst::prelude::*;
 use gstreamer as gst;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::mpsc,
     time::{interval, MissedTickBehavior},
@@ -54,7 +54,8 @@ pub struct SavedReplay {
     pub segments_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ClipReason {
     TargetDestroyed,
     PlayerDestroyed,

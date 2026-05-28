@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::{capture::buffer::ClipReason, config::AppConfig, doctor::DoctorReport};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
 pub enum AppEvent {
     WtConnected,
     WtDisconnected,
@@ -53,9 +55,11 @@ pub struct Bridge {
     pub cmd_tx: mpsc::UnboundedSender<UiCommand>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClipInfo {
     pub path: PathBuf,
+    pub thumbnail_path: Option<PathBuf>,
     pub file_name: String,
     pub reason: ClipReason,
     pub size_bytes: u64,

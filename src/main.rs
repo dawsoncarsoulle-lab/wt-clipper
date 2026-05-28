@@ -1,11 +1,3 @@
-mod app;
-mod capture;
-mod cli;
-mod config;
-mod doctor;
-mod ui;
-mod warthunder;
-
 use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
@@ -14,21 +6,24 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info};
 
-use crate::app::auto::{run_auto_clip, AutoClipConfig};
-use crate::capture::buffer::{run_replay_buffer, ReplayBufferConfig};
-use crate::capture::output::resolve_output_path_in_dir;
-use crate::capture::quality::{QualityPreset, VideoQuality};
-use crate::capture::recorder::{record, RecordingRequest};
-use crate::cli::{CaptureSource, Cli, Command, ConfigCommand, DumpEndpoint};
-use crate::config::{default_config_path, expand_tilde, AppConfig, ClipConfig, WarThunderConfig};
-use crate::ui::{
+use wt_clipper::app::auto::{run_auto_clip, AutoClipConfig};
+use wt_clipper::capture::buffer::{run_replay_buffer, ReplayBufferConfig};
+use wt_clipper::capture::output::resolve_output_path_in_dir;
+use wt_clipper::capture::quality::{QualityPreset, VideoQuality};
+use wt_clipper::capture::recorder::{record, RecordingRequest};
+use wt_clipper::cli::{CaptureSource, Cli, Command, ConfigCommand, DumpEndpoint};
+use wt_clipper::config::{
+    default_config_path, expand_tilde, AppConfig, ClipConfig, WarThunderConfig,
+};
+use wt_clipper::doctor;
+use wt_clipper::ui::{
     app::WtClipperApp,
     bridge::{AppEvent, Bridge, ClipInfo, UiCommand},
 };
-use crate::warthunder::client::{ChatMessage, Endpoint, EndpointProbe, WarThunderClient};
-use crate::warthunder::events::WarThunderEvent;
-use crate::warthunder::parser::{is_personal_kill, parse_gamechat_event};
-use crate::warthunder::recent::RecentMessageCache;
+use wt_clipper::warthunder::client::{ChatMessage, Endpoint, EndpointProbe, WarThunderClient};
+use wt_clipper::warthunder::events::WarThunderEvent;
+use wt_clipper::warthunder::parser::{is_personal_kill, parse_gamechat_event};
+use wt_clipper::warthunder::recent::RecentMessageCache;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -184,6 +179,33 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn gui_command(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    launch_tauri_gui(config_path)
+}
+
+fn launch_tauri_gui(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let manifest_dir = std::env::current_dir()?;
+    let tauri_dir = manifest_dir.join("src-tauri");
+    if !tauri_dir.join("tauri.conf.json").exists() {
+        anyhow::bail!(
+            "Tauri UI not found at {}; run from the wt-clipper source tree",
+            tauri_dir.display()
+        );
+    }
+
+    let mut command = std::process::Command::new("cargo");
+    command.arg("tauri").arg("dev").current_dir(&manifest_dir);
+    if let Some(path) = config_path {
+        command.env("WT_CLIPPER_CONFIG", path);
+    }
+    let status = command.status()?;
+    if !status.success() {
+        anyhow::bail!("Tauri GUI exited with status {status}");
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn legacy_egui_command(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let config = AppConfig::load(config_path.as_deref())?;
     let config_save_path = config_path.unwrap_or_else(default_config_path);
     let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -409,6 +431,10 @@ async fn scan_clips(output_dir: PathBuf) -> anyhow::Result<(Vec<ClipInfo>, u64)>
             clips.push(ClipInfo {
                 reason: clip_reason_from_name(&file_name),
                 path: path.to_path_buf(),
+                thumbnail_path: path
+                    .with_extension("jpg")
+                    .exists()
+                    .then(|| path.with_extension("jpg")),
                 file_name,
                 size_bytes,
                 duration_seconds: 0,
@@ -421,17 +447,17 @@ async fn scan_clips(output_dir: PathBuf) -> anyhow::Result<(Vec<ClipInfo>, u64)>
     .await?
 }
 
-fn clip_reason_from_name(name: &str) -> crate::capture::buffer::ClipReason {
+fn clip_reason_from_name(name: &str) -> wt_clipper::capture::buffer::ClipReason {
     if name.starts_with("multi-kill") {
-        crate::capture::buffer::ClipReason::MultiKill
+        wt_clipper::capture::buffer::ClipReason::MultiKill
     } else if name.starts_with("kill") {
-        crate::capture::buffer::ClipReason::TargetDestroyed
+        wt_clipper::capture::buffer::ClipReason::TargetDestroyed
     } else if name.starts_with("death") {
-        crate::capture::buffer::ClipReason::PlayerDestroyed
+        wt_clipper::capture::buffer::ClipReason::PlayerDestroyed
     } else if name.starts_with("manual") {
-        crate::capture::buffer::ClipReason::Manual
+        wt_clipper::capture::buffer::ClipReason::Manual
     } else {
-        crate::capture::buffer::ClipReason::Unknown
+        wt_clipper::capture::buffer::ClipReason::Unknown
     }
 }
 

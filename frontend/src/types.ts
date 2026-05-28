@@ -1,0 +1,69 @@
+export type ClipReason =
+  | "target-destroyed"
+  | "player-destroyed"
+  | "multi-kill"
+  | "manual"
+  | "unknown";
+
+export type ClipInfo = {
+  path: string;
+  thumbnailPath?: string | null;
+  fileName: string;
+  reason: ClipReason;
+  sizeBytes: number;
+  durationSeconds: number;
+  modifiedSecsAgo: number;
+};
+
+export type AppConfig = {
+  clip: {
+    seconds: number;
+    segment_seconds: number;
+    post_event_seconds: number;
+    multi_kill_window_seconds: number;
+    output_dir: string;
+    quality: "low" | "medium" | "high";
+    fps: number;
+    video_bitrate_kbps: number;
+    source: "screen" | "window";
+    keep_segments: boolean;
+  };
+  war_thunder: {
+    base_url: string;
+    player_name: string | null;
+    poll_interval_ms: number;
+    request_timeout_ms: number;
+  };
+  triggers: {
+    target_destroyed: boolean;
+    player_destroyed: boolean;
+    critical_hit: boolean;
+    severe_damage: boolean;
+    set_afire: boolean;
+    crash: boolean;
+  };
+  storage: {
+    max_clips: number;
+    max_storage_gb: number;
+  };
+};
+
+export type DoctorStatus = "ok" | "warn" | "error";
+
+export type DoctorReport = {
+  summary: string;
+  checks: Array<{
+    name: string;
+    status: DoctorStatus;
+    message: string;
+    hint?: string | null;
+  }>;
+};
+
+export type EventEntry = {
+  id: string;
+  at: string;
+  kind: ClipReason | "system";
+  title: string;
+  detail?: string;
+};
