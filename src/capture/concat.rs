@@ -56,11 +56,19 @@ pub fn concatenate_segments_to_webm(
 }
 
 pub(crate) fn valid_segments(segments: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
-    let mut segments = segments.to_vec();
-    segments.sort();
+    let segments = segments
+        .iter()
+        .map(|path| {
+            let index = parse_segment_index(path).ok_or_else(|| {
+                anyhow::anyhow!("invalid replay segment name: {}", path.display())
+            })?;
+            Ok((index, path.clone()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    validate_segment_indexes(&segments)?;
 
     let mut valid = Vec::new();
-    for segment in segments {
+    for (position, (index, segment)) in segments.into_iter().enumerate() {
         let metadata = fs::metadata(&segment)
             .with_context(|| format!("replay segment does not exist: {}", segment.display()))?;
         if !metadata.is_file() {
@@ -69,10 +77,43 @@ pub(crate) fn valid_segments(segments: &[PathBuf]) -> anyhow::Result<Vec<PathBuf
         if metadata.len() == 0 {
             continue;
         }
+        debug!(position, index, path = %segment.display(), "concat input segment");
         valid.push(segment);
     }
 
     Ok(valid)
+}
+
+fn validate_segment_indexes(segments: &[(u64, PathBuf)]) -> anyhow::Result<()> {
+    let mut previous = None;
+    for (index, path) in segments {
+        if previous.is_some_and(|previous| *index <= previous) {
+            debug!(
+                previous_index = previous,
+                index,
+                path = %path.display(),
+                "concat input segment indexes are not chronological; preserving input order"
+            );
+        } else if previous.is_some_and(|previous| *index > previous + 1) {
+            debug!(
+                previous_index = previous,
+                index,
+                path = %path.display(),
+                "gap in replay segment indexes selected for concat"
+            );
+        }
+        previous = Some(*index);
+    }
+    Ok(())
+}
+
+fn parse_segment_index(path: &Path) -> Option<u64> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("segment-")?
+        .strip_suffix(".webm")?
+        .parse()
+        .ok()
 }
 
 fn run_concat_pipeline(pipeline: &gst::Pipeline, output_path: &Path) -> anyhow::Result<()> {
@@ -123,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_segments_are_sorted_and_empty_files_filtered() {
+    fn valid_segments_preserve_input_order_and_filter_empty_files() {
         let dir = test_dir("valid");
         fs::create_dir_all(&dir).unwrap();
         let a = dir.join("segment-000001.webm");
@@ -135,7 +176,7 @@ mod tests {
 
         let valid = valid_segments(&[b.clone(), empty, a.clone()]).unwrap();
 
-        assert_eq!(valid, vec![a, b]);
+        assert_eq!(valid, vec![b, a]);
         fs::remove_dir_all(dir).unwrap();
     }
 

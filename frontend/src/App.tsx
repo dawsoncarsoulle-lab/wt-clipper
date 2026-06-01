@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -31,7 +31,7 @@ import {
   Zap,
 } from "lucide-react";
 import { useAppStore } from "./store";
-import type { AppConfig, ClipInfo, ClipReason, DoctorReport } from "./types";
+import type { AppConfig, ClipInfo, ClipReason, DoctorReport, RuntimeStatus } from "./types";
 
 const nav = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -50,15 +50,33 @@ const reasonLabel: Record<ClipReason, string> = {
 
 export function App() {
   const store = useAppStore();
+  const seenRuntimeEvents = useRef(new Set<string>());
 
   useEffect(() => {
     void bootstrap();
+    const runtimePoll = window.setInterval(() => {
+      void refreshRuntimeStatus().catch((error) =>
+        console.info("[FRONTEND] runtime status refresh failed", error),
+      );
+    }, 1000);
+    console.info("[FRONTEND] listening to wt-connected");
+    console.info("[FRONTEND] listening to wt-disconnected");
+    console.info("[FRONTEND] listening to buffer-progress");
+    console.info("[FRONTEND] listening to kill-detected");
+    console.info("[FRONTEND] listening to clip-saved");
     const unsubs = [
-      listen("wt-connected", () => store.setWtConnected(true)),
-      listen("wt-disconnected", () => store.setWtConnected(false)),
+      listen("wt-connected", () => {
+        console.info("[FRONTEND] received wt-connected");
+        store.setWtConnected(true);
+      }),
+      listen("wt-disconnected", () => {
+        console.info("[FRONTEND] received wt-disconnected");
+        store.setWtConnected(false);
+      }),
       listen<{ reason: ClipReason; vehicle?: string; target?: string; description: string }>(
         "kill-detected",
         (event) => {
+          console.info("[FRONTEND] received kill-detected", event.payload);
           store.addEvent({
             kind: event.payload.reason,
             title: reasonLabel[event.payload.reason],
@@ -67,6 +85,7 @@ export function App() {
         },
       ),
       listen<ClipInfo>("clip-saved", (event) => {
+        console.info("[FRONTEND] received clip-saved", event.payload);
         store.addClip(event.payload);
         store.addEvent({
           kind: event.payload.reason,
@@ -75,10 +94,14 @@ export function App() {
         });
         store.showToast("Clip sauvegardé");
       }),
-      listen<{ message: string }>("clip-failed", (event) => store.showToast(event.payload.message)),
-      listen<{ filledSecs: number; totalSecs: number }>("buffer-progress", (event) =>
-        store.setBuffer(event.payload.filledSecs, event.payload.totalSecs),
-      ),
+      listen<{ message: string }>("clip-failed", (event) => {
+        console.info("[FRONTEND] received clip-failed", event.payload);
+        store.showToast(event.payload.message);
+      }),
+      listen<{ filledSecs: number; totalSecs: number }>("buffer-progress", (event) => {
+        console.info("[FRONTEND] received buffer-progress", event.payload);
+        store.setBuffer(event.payload.filledSecs, event.payload.totalSecs);
+      }),
       listen<{ usedBytes: number }>("disk-usage", (event) =>
         store.setDiskUsedBytes(event.payload.usedBytes),
       ),
@@ -89,6 +112,7 @@ export function App() {
       listen<DoctorReport>("diagnostics-ready", (event) => store.setDiagnostics(event.payload)),
     ];
     return () => {
+      window.clearInterval(runtimePoll);
       void Promise.all(unsubs).then((items) => items.forEach((unlisten) => unlisten()));
     };
   }, []);
@@ -103,8 +127,32 @@ export function App() {
       store.setConfig(config);
       store.setClips(clips);
       store.setDiagnostics(diagnostics);
+      await refreshRuntimeStatus();
     } catch (error) {
       store.showToast(String(error));
+    }
+  }
+
+  async function refreshRuntimeStatus() {
+    const status = await invoke<RuntimeStatus>("get_runtime_status");
+    applyRuntimeStatus(status);
+  }
+
+  function applyRuntimeStatus(status: RuntimeStatus) {
+    store.setWtConnected(status.wtConnected);
+    store.setBuffer(status.bufferFilledSecs, status.bufferTotalSecs);
+    for (const event of [...status.recentEvents].reverse()) {
+      if (seenRuntimeEvents.current.has(event.id)) {
+        continue;
+      }
+      seenRuntimeEvents.current.add(event.id);
+      store.addEventEntry({
+        id: event.id,
+        at: event.at,
+        kind: event.kind,
+        title: reasonLabel[event.kind],
+        detail: event.description,
+      });
     }
   }
 

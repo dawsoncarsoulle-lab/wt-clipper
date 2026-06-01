@@ -1,4 +1,7 @@
-use std::collections::{HashSet, VecDeque};
+use std::{
+    collections::{HashSet, VecDeque},
+    time::{Duration, Instant},
+};
 
 #[derive(Debug)]
 pub struct RecentMessageCache {
@@ -35,8 +38,65 @@ impl RecentMessageCache {
         }
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
+#[derive(Debug)]
+pub struct RecentEventCache {
+    ttl: Duration,
+    queue: VecDeque<(String, Instant)>,
+    set: HashSet<String>,
+}
+
+impl RecentEventCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            queue: VecDeque::new(),
+            set: HashSet::new(),
+        }
+    }
+
+    pub fn contains(&mut self, key: &str, now: Instant) -> bool {
+        self.prune(now);
+        self.set.contains(key)
+    }
+
+    pub fn insert(&mut self, key: String, now: Instant) {
+        self.prune(now);
+        if self.set.contains(&key) {
+            return;
+        }
+
+        self.queue.push_back((key.clone(), now));
+        self.set.insert(key);
+    }
+
+    pub fn insert_new(&mut self, key: String, now: Instant) -> bool {
+        if self.contains(&key, now) {
+            false
+        } else {
+            self.insert(key, now);
+            true
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some((key, inserted_at)) = self.queue.front() {
+            if now.duration_since(*inserted_at) <= self.ttl {
+                break;
+            }
+            let key = key.clone();
+            self.queue.pop_front();
+            self.set.remove(&key);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn len(&mut self, now: Instant) -> usize {
+        self.prune(now);
         self.set.len()
     }
 }
@@ -68,5 +128,16 @@ mod tests {
         assert!(!cache.contains("chat:1"));
         assert!(cache.contains("chat:2"));
         assert!(cache.contains("chat:3"));
+    }
+
+    #[test]
+    fn event_cache_ignores_duplicates_until_ttl_expires() {
+        let mut cache = RecentEventCache::new(Duration::from_secs(10));
+        let now = Instant::now();
+
+        assert!(cache.insert_new("kill".to_owned(), now));
+        assert!(!cache.insert_new("kill".to_owned(), now + Duration::from_secs(5)));
+        assert!(cache.insert_new("kill".to_owned(), now + Duration::from_secs(11)));
+        assert_eq!(cache.len(now + Duration::from_secs(11)), 1);
     }
 }

@@ -1,8 +1,10 @@
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{Emitter, Manager, State};
 use tokio::sync::mpsc;
@@ -10,7 +12,7 @@ use tracing::debug;
 use wt_clipper::{
     app::auto::{run_auto_clip, AutoClipConfig},
     capture::{
-        buffer::{ClipReason, ReplayBufferConfig, ReplayBufferHandle},
+        buffer::{ClipReason, ReplayBufferConfig, ReplayBufferHandle, SaveReplayOutcome},
         quality::VideoQuality,
     },
     config::{default_config_path, AppConfig, ClipConfig},
@@ -22,6 +24,42 @@ use wt_clipper::{
 struct BackendState {
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
     config_path: PathBuf,
+    runtime_status: Arc<Mutex<RuntimeStatus>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeStatus {
+    wt_connected: bool,
+    buffer_filled_secs: f32,
+    buffer_total_secs: f32,
+    auto_clip_running: bool,
+    clips_saved: usize,
+    recent_events: Vec<RuntimeEvent>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeEvent {
+    id: String,
+    at: String,
+    kind: ClipReason,
+    description: String,
+}
+
+impl RuntimeStatus {
+    fn from_config(config: &AppConfig) -> Self {
+        Self {
+            wt_connected: false,
+            buffer_filled_secs: 0.0,
+            buffer_total_secs: config.clip.seconds as f32,
+            auto_clip_running: false,
+            clips_saved: 0,
+            recent_events: Vec::new(),
+            last_error: None,
+        }
+    }
 }
 
 #[tauri::command]
@@ -90,6 +128,15 @@ fn restart_buffer(state: State<'_, BackendState>) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn get_runtime_status(state: State<'_, BackendState>) -> Result<RuntimeStatus, String> {
+    state
+        .runtime_status
+        .lock()
+        .map(|status| status.clone())
+        .map_err(|error| error.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -97,10 +144,17 @@ fn main() {
                 .map(PathBuf::from)
                 .unwrap_or_else(default_config_path);
             let config = AppConfig::load(Some(&config_path)).unwrap_or_default();
-            let cmd_tx = spawn_backend(app.handle().clone(), config, config_path.clone());
+            let runtime_status = Arc::new(Mutex::new(RuntimeStatus::from_config(&config)));
+            let cmd_tx = spawn_backend(
+                app.handle().clone(),
+                config,
+                config_path.clone(),
+                runtime_status.clone(),
+            );
             app.manage(BackendState {
                 cmd_tx,
                 config_path,
+                runtime_status,
             });
             Ok(())
         })
@@ -112,7 +166,8 @@ fn main() {
             open_output_folder,
             run_diagnostics,
             save_manual_clip,
-            restart_buffer
+            restart_buffer,
+            get_runtime_status
         ])
         .run(tauri::generate_context!())
         .expect("failed to run WT Clipper Tauri app");
@@ -122,6 +177,7 @@ fn spawn_backend(
     app: tauri::AppHandle,
     config: AppConfig,
     config_path: PathBuf,
+    runtime_status: Arc<Mutex<RuntimeStatus>>,
 ) -> mpsc::UnboundedSender<UiCommand> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -131,6 +187,7 @@ fn spawn_backend(
             Err(error) => {
                 emit_app_event(
                     &app,
+                    &runtime_status,
                     AppEvent::ClipFailed {
                         message: format!("Tokio runtime: {error}"),
                     },
@@ -145,6 +202,7 @@ fn spawn_backend(
                 Err(error) => {
                     emit_app_event(
                         &app,
+                        &runtime_status,
                         AppEvent::ClipFailed {
                             message: format!("Output dir: {error}"),
                         },
@@ -154,8 +212,9 @@ fn spawn_backend(
             };
 
             let forward_app = app.clone();
+            let forward_runtime_status = runtime_status.clone();
             tokio::spawn(async move {
-                forward_events(forward_app, event_rx).await;
+                forward_events(forward_app, forward_runtime_status, event_rx).await;
             });
 
             let command_events = event_tx.clone();
@@ -164,10 +223,19 @@ fn spawn_backend(
                 command_loop(cmd_rx, command_events, command_output_dir, config_path).await;
             });
 
+            if let Ok(mut status) = runtime_status.lock() {
+                status.auto_clip_running = true;
+            }
             if let Err(error) = run_auto_backend(config, output_dir, event_tx.clone()).await {
+                if let Ok(mut status) = runtime_status.lock() {
+                    status.auto_clip_running = false;
+                    status.last_error = Some(error.to_string());
+                }
                 let _ = event_tx.send(AppEvent::ClipFailed {
                     message: format!("Auto clip: {error}"),
                 });
+            } else if let Ok(mut status) = runtime_status.lock() {
+                status.auto_clip_running = false;
             }
         });
     });
@@ -204,13 +272,25 @@ async fn run_auto_backend(
     .await
 }
 
-async fn forward_events(app: tauri::AppHandle, mut event_rx: mpsc::UnboundedReceiver<AppEvent>) {
+async fn forward_events(
+    app: tauri::AppHandle,
+    runtime_status: Arc<Mutex<RuntimeStatus>>,
+    mut event_rx: mpsc::UnboundedReceiver<AppEvent>,
+) {
     while let Some(event) = event_rx.recv().await {
-        emit_app_event(&app, event);
+        emit_app_event(&app, &runtime_status, event);
     }
 }
 
-fn emit_app_event(app: &tauri::AppHandle, event: AppEvent) {
+fn emit_app_event(
+    app: &tauri::AppHandle,
+    runtime_status: &Arc<Mutex<RuntimeStatus>>,
+    event: AppEvent,
+) {
+    update_runtime_status(runtime_status, &event);
+    log_bridge_event_received(&event);
+    let event_name = tauri_event_name(&event);
+    let generic_event = event.clone();
     let result = match event {
         AppEvent::WtConnected => app.emit("wt-connected", json!({})),
         AppEvent::WtDisconnected => app.emit("wt-disconnected", json!({})),
@@ -268,9 +348,129 @@ fn emit_app_event(app: &tauri::AppHandle, event: AppEvent) {
         AppEvent::DiagnosticsReady(report) => app.emit("diagnostics-ready", report),
     };
 
-    if let Err(error) = result {
-        debug!(%error, "failed to emit Tauri event");
+    match result {
+        Ok(()) => println!("[UI-BRIDGE] emitted tauri event {event_name}"),
+        Err(error) => debug!(%error, "failed to emit Tauri event"),
     }
+    if let Err(error) = app.emit("app-event", generic_event) {
+        debug!(%error, "failed to emit generic Tauri app event");
+    } else {
+        println!("[UI-BRIDGE] emitted tauri event app-event");
+    }
+}
+
+fn tauri_event_name(event: &AppEvent) -> &'static str {
+    match event {
+        AppEvent::WtConnected => "wt-connected",
+        AppEvent::WtDisconnected => "wt-disconnected",
+        AppEvent::KillDetected { .. } => "kill-detected",
+        AppEvent::ClipSaved { .. } => "clip-saved",
+        AppEvent::ClipFailed { .. } => "clip-failed",
+        AppEvent::BufferProgress { .. } => "buffer-progress",
+        AppEvent::DiskUsage { .. } => "disk-usage",
+        AppEvent::ClipsLoaded { .. } => "clips-loaded",
+        AppEvent::DiagnosticsReady(_) => "diagnostics-ready",
+    }
+}
+
+fn log_bridge_event_received(event: &AppEvent) {
+    match event {
+        AppEvent::WtConnected => println!("[UI-BRIDGE] AppEvent::WtConnected received from backend"),
+        AppEvent::WtDisconnected => {
+            println!("[UI-BRIDGE] AppEvent::WtDisconnected received from backend")
+        }
+        AppEvent::BufferProgress {
+            filled_secs,
+            total_secs,
+        } => println!(
+            "[UI-BRIDGE] AppEvent::BufferProgress filled={filled_secs:.1} total={total_secs:.1}"
+        ),
+        AppEvent::KillDetected {
+            reason,
+            description,
+            ..
+        } => println!(
+            "[UI-BRIDGE] AppEvent::KillDetected reason={reason:?} description={description}"
+        ),
+        AppEvent::ClipSaved { path, reason, .. } => println!(
+            "[UI-BRIDGE] AppEvent::ClipSaved reason={reason:?} path={}",
+            path.display()
+        ),
+        AppEvent::ClipFailed { message } => {
+            println!("[UI-BRIDGE] AppEvent::ClipFailed message={message}")
+        }
+        AppEvent::DiskUsage { used_bytes } => {
+            println!("[UI-BRIDGE] AppEvent::DiskUsage used={used_bytes}")
+        }
+        AppEvent::ClipsLoaded { clips, total_bytes } => println!(
+            "[UI-BRIDGE] AppEvent::ClipsLoaded clips={} total={total_bytes}",
+            clips.len()
+        ),
+        AppEvent::DiagnosticsReady(_) => {
+            println!("[UI-BRIDGE] AppEvent::DiagnosticsReady received from backend")
+        }
+    }
+}
+
+fn update_runtime_status(runtime_status: &Arc<Mutex<RuntimeStatus>>, event: &AppEvent) {
+    let Ok(mut status) = runtime_status.lock() else {
+        return;
+    };
+    match event {
+        AppEvent::WtConnected => status.wt_connected = true,
+        AppEvent::WtDisconnected => status.wt_connected = false,
+        AppEvent::BufferProgress {
+            filled_secs,
+            total_secs,
+        } => {
+            status.buffer_filled_secs = *filled_secs;
+            status.buffer_total_secs = *total_secs;
+        }
+        AppEvent::KillDetected {
+            reason,
+            description,
+            ..
+        } => {
+            status.recent_events.insert(
+                0,
+                RuntimeEvent {
+                    id: runtime_event_id("kill"),
+                    at: runtime_event_time(),
+                    kind: *reason,
+                    description: description.clone(),
+                },
+            );
+            status.recent_events.truncate(24);
+        }
+        AppEvent::ClipFailed { message } => status.last_error = Some(message.clone()),
+        AppEvent::ClipSaved { .. } => {
+            status.clips_saved = status.clips_saved.saturating_add(1);
+            status.last_error = None;
+        }
+        AppEvent::ClipsLoaded { clips, .. } => status.clips_saved = clips.len(),
+        _ => {}
+    }
+}
+
+fn runtime_event_id(prefix: &str) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("{prefix}-{millis}")
+}
+
+fn runtime_event_time() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() % 86_400)
+        .unwrap_or(0);
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3_600,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
 }
 
 async fn command_loop(
@@ -404,7 +604,7 @@ async fn save_standalone_manual_clip(
     })
     .await?;
     tokio::time::sleep(Duration::from_secs(config.clip.seconds.min(5))).await;
-    if let Some(replay) = handle.save_replay(handle.manual_clip_context()).await? {
+    if let SaveReplayOutcome::Saved(replay) = handle.save_replay(handle.manual_clip_context()).await? {
         if let Some(path) = replay.final_video_path {
             let size_bytes = std::fs::metadata(&path)
                 .map(|metadata| metadata.len())

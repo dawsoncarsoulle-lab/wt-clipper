@@ -26,6 +26,7 @@ type AppState = {
   setDiskUsedBytes: (bytes: number) => void;
   addClip: (clip: ClipInfo) => void;
   addEvent: (event: Omit<EventEntry, "id" | "at">) => void;
+  addEventEntry: (event: EventEntry) => void;
   showToast: (message: string) => void;
 };
 
@@ -85,6 +86,21 @@ export const useAppStore = create<AppState>((set) => ({
         ...state.events,
       ].slice(0, 24),
     })),
+  addEventEntry: (event) =>
+    set((state) => {
+      if (state.events.some((item) => item.id === event.id)) {
+        return state;
+      }
+      return {
+        sessionKills:
+          event.kind === "target-destroyed" || event.kind === "multi-kill"
+            ? state.sessionKills + 1
+            : state.sessionKills,
+        sessionMultiKills:
+          event.kind === "multi-kill" ? state.sessionMultiKills + 1 : state.sessionMultiKills,
+        events: [event, ...state.events].slice(0, 24),
+      };
+    }),
   showToast: (toast) => {
     set({ toast });
     window.setTimeout(() => set({ toast: null }), 3200);

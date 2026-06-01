@@ -60,6 +60,21 @@ export type DoctorReport = {
   }>;
 };
 
+export type RuntimeStatus = {
+  wtConnected: boolean;
+  bufferFilledSecs: number;
+  bufferTotalSecs: number;
+  autoClipRunning: boolean;
+  clipsSaved: number;
+  recentEvents: Array<{
+    id: string;
+    at: string;
+    kind: ClipReason;
+    description: string;
+  }>;
+  lastError?: string | null;
+};
+
 export type EventEntry = {
   id: string;
   at: string;
