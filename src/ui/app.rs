@@ -148,6 +148,10 @@ impl WtClipperApp {
                     0,
                     ClipInfo {
                         path: path.clone(),
+                        thumbnail_path: path
+                            .with_extension("jpg")
+                            .exists()
+                            .then(|| path.with_extension("jpg")),
                         file_name,
                         reason,
                         size_bytes,

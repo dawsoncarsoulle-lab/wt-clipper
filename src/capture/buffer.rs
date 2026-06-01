@@ -9,7 +9,7 @@ use anyhow::Context;
 use chrono::{DateTime, Local};
 use gst::prelude::*;
 use gstreamer as gst;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::mpsc,
     time::{interval, MissedTickBehavior},
@@ -28,7 +28,8 @@ use crate::{
         },
         segments::{
             prune_old_segments, segment_file_name, segment_location_pattern, segments_to_keep,
-            selected_segments_duration, snapshot_stable_segments, wait_until_segment_stable,
+            select_segments_around_event, select_segments_for_duration, selected_segments_duration,
+            snapshot_stable_segments, wait_until_segment_stable, EventSegmentSelection,
             ReplaySegment,
         },
     },
@@ -54,7 +55,15 @@ pub struct SavedReplay {
     pub segments_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveReplayOutcome {
+    Saved(SavedReplay),
+    NotReadyYet(String),
+    SkippedTooOld(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ClipReason {
     TargetDestroyed,
     PlayerDestroyed,
@@ -96,6 +105,8 @@ pub struct ClipContext {
     pub duration_seconds: u64,
     pub post_event_seconds: u64,
     pub segment_seconds: u64,
+    pub first_event_time: Option<SystemTime>,
+    pub last_event_time: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +187,7 @@ impl ReplayBufferHandle {
         })
     }
 
-    pub async fn save_replay(&self, context: ClipContext) -> anyhow::Result<Option<SavedReplay>> {
+    pub async fn save_replay(&self, context: ClipContext) -> anyhow::Result<SaveReplayOutcome> {
         let temp_dir = self.temp_dir.clone();
         let keep_segments = self.keep_segments;
         let output_dir = self.config.output_dir.clone();
@@ -233,6 +244,8 @@ impl ReplayBufferHandle {
             duration_seconds: self.config.buffer_seconds,
             post_event_seconds: 0,
             segment_seconds: self.config.segment_seconds,
+            first_event_time: None,
+            last_event_time: None,
         }
     }
 }
@@ -264,8 +277,14 @@ async fn run_buffer_loop(handle: ReplayBufferHandle) -> anyhow::Result<()> {
                 if request.is_some() {
                     println!("[CLIP] saving replay...");
                     let context = handle.manual_clip_context();
-                    if let Some(replay) = handle.save_replay(context).await? {
-                        print_saved_replay(&replay);
+                    match handle.save_replay(context).await? {
+                        SaveReplayOutcome::Saved(replay) => print_saved_replay(&replay),
+                        SaveReplayOutcome::NotReadyYet(reason) => {
+                            println!("[CLIP] replay not ready yet: {reason}");
+                        }
+                        SaveReplayOutcome::SkippedTooOld(reason) => {
+                            println!("[CLIP] replay skipped: {reason}");
+                        }
                     }
                 }
             }
@@ -307,7 +326,7 @@ fn save_replay_clip(
     output_dir: Option<PathBuf>,
     keep_saved_segments: bool,
     context: ClipContext,
-) -> anyhow::Result<Option<SavedReplay>> {
+) -> anyhow::Result<SaveReplayOutcome> {
     let snapshot = snapshot_stable_segments(
         temp_dir,
         keep_segments,
@@ -329,26 +348,73 @@ fn save_replay_clip(
                 .unwrap_or("unknown")
         );
     }
-    if selected_segments_duration(snapshot.selected.len(), context.segment_seconds)
+    let selected = match select_export_segments(&snapshot.selected, &context) {
+        SaveReplaySelection::Selected(selected) => selected,
+        SaveReplaySelection::NotReadyYet(reason) => {
+            println!("[CLIP] replay segments not ready yet: {reason}");
+            debug!(
+                first_event_time = ?context.first_event_time,
+                last_event_time = ?context.last_event_time,
+                duration_seconds = context.duration_seconds,
+                post_event_seconds = context.post_event_seconds,
+                segment_seconds = context.segment_seconds,
+                available_segments = snapshot.selected.len(),
+                reason,
+                "replay segments not ready yet"
+            );
+            return Ok(SaveReplayOutcome::NotReadyYet(reason));
+        }
+        SaveReplaySelection::TooOld(reason) => {
+            println!("[CLIP] replay event outside buffer window, skipping clip: {reason}");
+            debug!(
+                first_event_time = ?context.first_event_time,
+                last_event_time = ?context.last_event_time,
+                duration_seconds = context.duration_seconds,
+                post_event_seconds = context.post_event_seconds,
+                segment_seconds = context.segment_seconds,
+                available_segments = snapshot.selected.len(),
+                reason,
+                "replay event outside buffer window"
+            );
+            return Ok(SaveReplayOutcome::SkippedTooOld(reason));
+        }
+    };
+    println!(
+        "[CLIP] selected chronological indexes: {:?}",
+        selected
+            .iter()
+            .map(|segment| segment.index)
+            .collect::<Vec<_>>()
+    );
+    debug!(
+        selected_segment_indexes = ?selected.iter().map(|segment| segment.index).collect::<Vec<_>>(),
+        selected_segment_modified_times = ?selected.iter().map(|segment| segment.modified).collect::<Vec<_>>(),
+        expected_clip_duration_seconds = context.duration_seconds,
+        actual_segment_count = selected.len(),
+        "selected replay segments for export in chronological order"
+    );
+    if selected_segments_duration(selected.len(), context.segment_seconds)
         < Duration::from_secs(context.duration_seconds)
     {
         debug!(
-            selected = snapshot.selected.len(),
+            selected = selected.len(),
             segment_seconds = context.segment_seconds,
             duration_seconds = context.duration_seconds,
             "selected replay segments do not cover requested clip duration"
         );
     }
-    if snapshot.selected.is_empty() {
+    if selected.is_empty() {
         println!("No finalized replay segments are available yet.");
-        return Ok(None);
+        return Ok(SaveReplayOutcome::NotReadyYet(
+            "no finalized replay segments are available yet".to_owned(),
+        ));
     }
 
     let created_at = Local::now();
     let parent = resolve_clip_parent(output_dir)?;
     let paths = resolve_clip_paths(&parent, &context, created_at)?;
     let snapshot_dir = create_save_snapshot_dir()?;
-    copy_stable_segments(&snapshot.selected, &snapshot_dir, Duration::from_secs(2))?;
+    copy_stable_segments(&selected, &snapshot_dir, Duration::from_secs(2))?;
 
     let segment_paths = copied_segment_paths(&snapshot_dir)?;
     println!("[CLIP] concat input segments: {}", segment_paths.len());
@@ -372,14 +438,14 @@ fn save_replay_clip(
             write_clip_metadata(&paths.metadata_path, &metadata)?;
             if keep_saved_segments {
                 move_snapshot_segments(&snapshot_dir, &paths.segments_dir)?;
-                Ok(Some(SavedReplay {
+                Ok(SaveReplayOutcome::Saved(SavedReplay {
                     final_video_path: Some(path),
                     metadata_path: Some(paths.metadata_path),
                     segments_dir: Some(paths.segments_dir),
                 }))
             } else {
                 fs::remove_dir_all(&snapshot_dir)?;
-                Ok(Some(SavedReplay {
+                Ok(SaveReplayOutcome::Saved(SavedReplay {
                     final_video_path: Some(path),
                     metadata_path: Some(paths.metadata_path),
                     segments_dir: None,
@@ -393,6 +459,45 @@ fn save_replay_clip(
             );
             Err(error)
         }
+    }
+}
+
+#[derive(Debug)]
+enum SaveReplaySelection {
+    Selected(Vec<ReplaySegment>),
+    NotReadyYet(String),
+    TooOld(String),
+}
+
+fn select_export_segments(
+    stable_segments: &[ReplaySegment],
+    context: &ClipContext,
+) -> SaveReplaySelection {
+    match (context.first_event_time, context.last_event_time) {
+        (Some(first_event_time), Some(last_event_time)) => match select_segments_around_event(
+            stable_segments,
+            first_event_time,
+            last_event_time,
+            context.duration_seconds,
+            context.post_event_seconds,
+            context.segment_seconds,
+        ) {
+            EventSegmentSelection::Selected(selected) => SaveReplaySelection::Selected(selected),
+            EventSegmentSelection::NotReadyYet { reason } => {
+                SaveReplaySelection::NotReadyYet(reason)
+            }
+            EventSegmentSelection::NotEnoughSegments { available, needed } => {
+                SaveReplaySelection::NotReadyYet(format!(
+                    "not enough finalized segments yet: available={available}, needed={needed}"
+                ))
+            }
+            EventSegmentSelection::TooOld { reason } => SaveReplaySelection::TooOld(reason),
+        },
+        _ => SaveReplaySelection::Selected(select_segments_for_duration(
+            stable_segments,
+            context.duration_seconds,
+            context.segment_seconds,
+        )),
     }
 }
 
@@ -934,6 +1039,8 @@ mod tests {
             duration_seconds: 20,
             post_event_seconds: 5,
             segment_seconds: 2,
+            first_event_time: None,
+            last_event_time: None,
         }
     }
 
@@ -1002,6 +1109,8 @@ mod tests {
             duration_seconds: 20,
             post_event_seconds: 0,
             segment_seconds: 2,
+            first_event_time: None,
+            last_event_time: None,
         };
 
         assert_eq!(

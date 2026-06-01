@@ -6,11 +6,11 @@ use std::{
 
 use ashpd::desktop::screencast::Screencast;
 use gstreamer as gst;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::capture::output::default_output_dir;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DoctorStatus {
     Ok,
@@ -18,7 +18,7 @@ pub enum DoctorStatus {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorCheck {
     pub name: String,
     pub status: DoctorStatus,
@@ -26,7 +26,7 @@ pub struct DoctorCheck {
     pub hint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorReport {
     pub checks: Vec<DoctorCheck>,
     pub summary: String,
