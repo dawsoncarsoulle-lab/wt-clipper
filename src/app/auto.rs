@@ -75,6 +75,7 @@ struct PendingClip {
     reason: ClipReason,
     first_event_time: Instant,
     last_event_time: Instant,
+    last_event_game_time: Option<Duration>,
     first_event_wall_time: SystemTime,
     last_event_wall_time: SystemTime,
     save_at: Instant,
@@ -89,6 +90,7 @@ impl PendingClip {
         event_key: String,
         reason: ClipReason,
         event_time: Instant,
+        event_game_time: Option<Duration>,
         event_wall_time: SystemTime,
         delay: Duration,
         description: String,
@@ -99,6 +101,7 @@ impl PendingClip {
             reason,
             first_event_time: event_time,
             last_event_time: event_time,
+            last_event_game_time: event_game_time,
             first_event_wall_time: event_wall_time,
             last_event_wall_time: event_wall_time,
             save_at: event_time + delay,
@@ -113,6 +116,7 @@ impl PendingClip {
         event: WarThunderEvent,
         event_key: String,
         event_time: Instant,
+        event_game_time: Option<Duration>,
         event_wall_time: SystemTime,
         delay: Duration,
         description: String,
@@ -121,6 +125,7 @@ impl PendingClip {
             return false;
         }
         self.last_event_time = event_time;
+        self.last_event_game_time = event_game_time.or(self.last_event_game_time);
         self.last_event_wall_time = event_wall_time;
         self.save_at = event_time + delay;
         self.events.push(event);
@@ -168,6 +173,7 @@ struct DetectedEvent {
     event: WarThunderEvent,
     canonical_key: String,
     detected_at: Instant,
+    game_time: Option<Duration>,
     detected_wall_time: SystemTime,
 }
 
@@ -178,13 +184,23 @@ pub(crate) fn effective_post_event_delay(
     post_event_delay + Duration::from_secs(segment_seconds.saturating_add(1))
 }
 
+fn replay_buffer_seconds_for_auto(auto_config: &AutoClipConfig) -> u64 {
+    let multi_kill_margin = auto_config
+        .multi_kill_window
+        .as_secs()
+        .saturating_mul(8)
+        .max(60);
+    auto_config.buffer_seconds.saturating_add(multi_kill_margin)
+}
+
 pub async fn run_auto_clip(
     client: WarThunderClient,
     warthunder_config: WarThunderConfig,
     auto_config: AutoClipConfig,
 ) -> anyhow::Result<()> {
+    let replay_buffer_seconds = replay_buffer_seconds_for_auto(&auto_config);
     let buffer = ReplayBufferHandle::start(ReplayBufferConfig {
-        buffer_seconds: auto_config.buffer_seconds,
+        buffer_seconds: replay_buffer_seconds,
         segment_seconds: auto_config.segment_seconds,
         output_dir: auto_config.output_dir.clone(),
         source: auto_config.source,
@@ -194,7 +210,10 @@ pub async fn run_auto_clip(
     })
     .await?;
 
-    println!("Replay buffer active: {}s", auto_config.buffer_seconds);
+    println!(
+        "Replay buffer active: {}s ({}s solo clips, multi-kill margin enabled)",
+        replay_buffer_seconds, auto_config.buffer_seconds
+    );
     println!("Video target: {}", auto_config.quality.log_summary());
     println!("Auto-clip armed for personal War Thunder kills.");
     println!("Press Ctrl+C to stop.");
@@ -239,8 +258,11 @@ pub async fn run_auto_clip(
                         break Err(error);
                     }
                     send_ui_event(&auto_config, AppEvent::BufferProgress {
-                        filled_secs: buffer_started_at.elapsed().as_secs_f32().min(auto_config.buffer_seconds as f32),
-                        total_secs: auto_config.buffer_seconds as f32,
+                        filled_secs: buffer_started_at
+                            .elapsed()
+                            .as_secs_f32()
+                            .min(replay_buffer_seconds as f32),
+                        total_secs: replay_buffer_seconds as f32,
                     });
                     if let Err(error) = save_ready_pending_clips(
                         buffer,
@@ -299,6 +321,7 @@ pub async fn run_auto_clip(
                     if let Some(pending_index) = pending_index_for_multi_kill(
                         &pending_clips,
                         now,
+                        detected.game_time,
                         auto_config.multi_kill_window,
                     ) {
                         let pending = &mut pending_clips[pending_index];
@@ -306,6 +329,7 @@ pub async fn run_auto_clip(
                             event,
                             detected.canonical_key,
                             now,
+                            detected.game_time,
                             detected.detected_wall_time,
                             effective_save_delay,
                             summary,
@@ -327,8 +351,10 @@ pub async fn run_auto_clip(
                         continue;
                     }
                     if !cooldown.allows(now) {
-                        debug!(?event, "[CLIP] event ignored due to cooldown");
-                        continue;
+                        debug!(
+                            ?event,
+                            "[CLIP] cooldown active, but scheduling distinct detected kill"
+                        );
                     }
 
                     let pending = schedule_pending_clip(
@@ -337,6 +363,7 @@ pub async fn run_auto_clip(
                         reason,
                         summary,
                         now,
+                        detected.game_time,
                         detected.detected_wall_time,
                         effective_save_delay,
                     );
@@ -368,6 +395,7 @@ fn schedule_pending_clip(
     reason: ClipReason,
     description: String,
     event_time: Instant,
+    event_game_time: Option<Duration>,
     event_wall_time: SystemTime,
     delay: Duration,
 ) -> PendingClip {
@@ -376,6 +404,7 @@ fn schedule_pending_clip(
         event_key,
         reason,
         event_time,
+        event_game_time,
         event_wall_time,
         delay,
         description,
@@ -415,12 +444,22 @@ fn ready_pending_indices(pending_clips: &[PendingClip], now: Instant) -> Vec<usi
 fn pending_index_for_multi_kill(
     pending_clips: &[PendingClip],
     event_time: Instant,
+    event_game_time: Option<Duration>,
     multi_kill_window: Duration,
 ) -> Option<usize> {
     pending_clips
         .iter()
         .enumerate()
         .find_map(|(index, pending)| {
+            if let (Some(event_game_time), Some(last_event_game_time)) =
+                (event_game_time, pending.last_event_game_time)
+            {
+                return event_game_time
+                    .checked_sub(last_event_game_time)
+                    .filter(|elapsed| *elapsed <= multi_kill_window)
+                    .map(|_| index);
+            }
+
             event_time
                 .checked_duration_since(pending.last_event_time)
                 .filter(|elapsed| *elapsed <= multi_kill_window)
@@ -597,23 +636,27 @@ fn collect_personal_events(
 
         let event = parse_gamechat_event(&message.text);
         let canonical_key = canonical_event_key(&event);
+        let event_key = canonical_key
+            .as_deref()
+            .map(|canonical_key| event_dedupe_key(canonical_key, &message));
         debug!(
             source,
             raw_message = %message.text,
             canonical_key = ?canonical_key,
+            event_key = ?event_key,
             ?event,
             "auto-clip parsed message"
         );
         if is_personal_kill(&event, player_name) {
-            let Some(canonical_key) = canonical_key else {
+            let Some(event_key) = event_key else {
                 debug!(source, ?event, "personal kill has no canonical key");
                 continue;
             };
             let now = Instant::now();
-            if !seen_events.insert_new(canonical_key.clone(), now) {
+            if !seen_events.insert_new(event_key.clone(), now) {
                 debug!(
                     source,
-                    canonical_key = %canonical_key,
+                    event_key = %event_key,
                     ignored_duplicate = true,
                     "duplicate canonical event ignored"
                 );
@@ -621,13 +664,52 @@ fn collect_personal_events(
             }
             events.push(DetectedEvent {
                 event,
-                canonical_key,
+                canonical_key: event_key,
                 detected_at: now,
+                game_time: parse_wt_message_time(message.time.as_deref()),
                 detected_wall_time: SystemTime::now(),
             });
         } else {
             debug!(source, message = %message.text, ?event, "ignoring non-personal auto-clip event");
         }
+    }
+}
+
+fn parse_wt_message_time(value: Option<&str>) -> Option<Duration> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let parts = value.split(':').collect::<Vec<_>>();
+    let seconds = match parts.as_slice() {
+        [seconds] => seconds.parse::<u64>().ok()?,
+        [minutes, seconds] => minutes
+            .parse::<u64>()
+            .ok()?
+            .saturating_mul(60)
+            .saturating_add(seconds.parse::<u64>().ok()?),
+        [hours, minutes, seconds] => hours
+            .parse::<u64>()
+            .ok()?
+            .saturating_mul(60 * 60)
+            .saturating_add(minutes.parse::<u64>().ok()?.saturating_mul(60))
+            .saturating_add(seconds.parse::<u64>().ok()?),
+        _ => return None,
+    };
+
+    Some(Duration::from_secs(seconds))
+}
+
+fn event_dedupe_key(canonical_key: &str, message: &ChatMessage) -> String {
+    match message
+        .time
+        .as_deref()
+        .map(str::trim)
+        .filter(|time| !time.is_empty())
+    {
+        Some(time) => format!("{canonical_key}|time:{}", normalize_key_part(time)),
+        None => canonical_key.to_owned(),
     }
 }
 
@@ -822,6 +904,14 @@ mod tests {
     }
 
     #[test]
+    fn auto_replay_buffer_keeps_extra_margin_for_multi_kills() {
+        let config = test_auto_config(5, 5);
+
+        assert_eq!(config.buffer_seconds, 25);
+        assert_eq!(replay_buffer_seconds_for_auto(&config), 85);
+    }
+
+    #[test]
     fn clip_context_uses_configured_post_event_delay_not_effective_save_delay() {
         let event = kill_with_target("[ai] MiG-15bis");
         let now = Instant::now();
@@ -831,6 +921,7 @@ mod tests {
             ClipReason::TargetDestroyed,
             "kill".to_owned(),
             now,
+            None,
             SystemTime::UNIX_EPOCH + Duration::from_secs(100),
             effective_post_event_delay(Duration::from_secs(5), 5),
         );
@@ -859,6 +950,7 @@ mod tests {
             ClipReason::TargetDestroyed,
             "kill".to_owned(),
             now,
+            None,
             SystemTime::UNIX_EPOCH,
             Duration::from_secs(5),
         );
@@ -880,6 +972,7 @@ mod tests {
             ClipReason::TargetDestroyed,
             "kill".to_owned(),
             now,
+            None,
             SystemTime::UNIX_EPOCH,
             Duration::from_secs(5),
         );
@@ -887,6 +980,7 @@ mod tests {
         assert_eq!(pending.reason, ClipReason::TargetDestroyed);
         assert_eq!(pending.first_event_time, now);
         assert_eq!(pending.last_event_time, now);
+        assert_eq!(pending.last_event_game_time, None);
         assert_eq!(pending.save_at, now + Duration::from_secs(5));
         assert_eq!(pending.events.len(), 1);
         assert_eq!(pending.descriptions, vec!["kill"]);
@@ -901,6 +995,7 @@ mod tests {
             ClipReason::TargetDestroyed,
             "kill".to_owned(),
             now,
+            None,
             SystemTime::UNIX_EPOCH,
             Duration::from_secs(5),
         );
@@ -918,6 +1013,7 @@ mod tests {
             ClipReason::TargetDestroyed,
             "kill".to_owned(),
             now,
+            None,
             SystemTime::UNIX_EPOCH,
             Duration::from_secs(5),
         );
@@ -938,6 +1034,7 @@ mod tests {
             ClipReason::TargetDestroyed,
             "first".to_owned(),
             now,
+            Some(Duration::from_secs(30)),
             SystemTime::UNIX_EPOCH,
             Duration::from_secs(5),
         );
@@ -947,6 +1044,7 @@ mod tests {
             second.clone(),
             event_key(&second),
             now + Duration::from_secs(3),
+            Some(Duration::from_secs(34)),
             SystemTime::UNIX_EPOCH + Duration::from_secs(3),
             Duration::from_secs(5),
             "second".to_owned(),
@@ -968,6 +1066,7 @@ mod tests {
             ClipReason::TargetDestroyed,
             "first".to_owned(),
             now,
+            None,
             SystemTime::UNIX_EPOCH,
             Duration::from_secs(5),
         );
@@ -978,6 +1077,7 @@ mod tests {
             second.clone(),
             event_key(&second),
             now + Duration::from_secs(1),
+            None,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1),
             Duration::from_secs(5),
             "second".to_owned(),
@@ -997,6 +1097,7 @@ mod tests {
             ClipReason::TargetDestroyed,
             "first".to_owned(),
             now,
+            None,
             SystemTime::UNIX_EPOCH,
             Duration::from_secs(5),
         );
@@ -1005,6 +1106,7 @@ mod tests {
             event.clone(),
             event_key(&event),
             now + Duration::from_secs(1),
+            None,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1),
             Duration::from_secs(5),
             "duplicate".to_owned(),
@@ -1025,6 +1127,7 @@ mod tests {
             ClipReason::TargetDestroyed,
             "first".to_owned(),
             now,
+            None,
             SystemTime::UNIX_EPOCH,
             Duration::from_secs(10),
         );
@@ -1032,7 +1135,7 @@ mod tests {
 
         assert!(later < pending.save_at);
         assert_eq!(
-            pending_index_for_multi_kill(&[pending], later, Duration::from_secs(5)),
+            pending_index_for_multi_kill(&[pending], later, None, Duration::from_secs(5)),
             None
         );
     }
@@ -1047,6 +1150,7 @@ mod tests {
             ClipReason::TargetDestroyed,
             "first".to_owned(),
             now,
+            None,
             SystemTime::UNIX_EPOCH,
             Duration::from_secs(10),
         );
@@ -1055,9 +1159,118 @@ mod tests {
             pending_index_for_multi_kill(
                 &[pending],
                 now + Duration::from_secs(4),
+                None,
                 Duration::from_secs(5)
             ),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn parse_wt_message_time_accepts_common_formats() {
+        assert_eq!(
+            parse_wt_message_time(Some("0:30")),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_wt_message_time(Some("1:03")),
+            Some(Duration::from_secs(63))
+        );
+        assert_eq!(
+            parse_wt_message_time(Some("1:02:03")),
+            Some(Duration::from_secs(3723))
+        );
+        assert_eq!(
+            parse_wt_message_time(Some("83")),
+            Some(Duration::from_secs(83))
+        );
+        assert_eq!(parse_wt_message_time(Some("")), None);
+    }
+
+    #[test]
+    fn multi_kill_window_uses_war_thunder_time_when_available() {
+        let now = Instant::now();
+        let first = kill_with_target("IT-1");
+        let pending = schedule_pending_clip(
+            first.clone(),
+            event_key(&first),
+            ClipReason::TargetDestroyed,
+            "first".to_owned(),
+            now,
+            Some(Duration::from_secs(44)),
+            SystemTime::UNIX_EPOCH,
+            Duration::from_secs(10),
+        );
+
+        assert_eq!(
+            pending_index_for_multi_kill(
+                &[pending],
+                now + Duration::from_millis(1),
+                Some(Duration::from_secs(63)),
+                Duration::from_secs(8)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rapid_backend_read_splits_multi_kill_by_war_thunder_time() {
+        let now = Instant::now();
+        let delay = Duration::from_secs(11);
+        let window = Duration::from_secs(8);
+        let kills = [
+            ("IT-1", 30),
+            ("T-62", 34),
+            ("T-55A", 40),
+            ("T-10M", 44),
+            ("T-62", 63),
+        ];
+        let mut pending_clips = Vec::new();
+
+        for (target, game_seconds) in kills {
+            let event = kill_with_target(target);
+            let detected_at = now + Duration::from_millis(game_seconds);
+            if let Some(index) = pending_index_for_multi_kill(
+                &pending_clips,
+                detected_at,
+                Some(Duration::from_secs(game_seconds)),
+                window,
+            ) {
+                pending_clips[index].add_event(
+                    event.clone(),
+                    format!("{}|time:{game_seconds}", event_key(&event)),
+                    detected_at,
+                    Some(Duration::from_secs(game_seconds)),
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(game_seconds),
+                    delay,
+                    target.to_owned(),
+                );
+            } else {
+                pending_clips.push(schedule_pending_clip(
+                    event.clone(),
+                    format!("{}|time:{game_seconds}", event_key(&event)),
+                    ClipReason::TargetDestroyed,
+                    target.to_owned(),
+                    detected_at,
+                    Some(Duration::from_secs(game_seconds)),
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(game_seconds),
+                    delay,
+                ));
+            }
+        }
+
+        assert_eq!(pending_clips.len(), 2);
+        assert_eq!(pending_clips[0].reason, ClipReason::MultiKill);
+        assert_eq!(pending_clips[0].kill_count(), 4);
+        assert_eq!(
+            pending_clips[0].last_event_game_time,
+            Some(Duration::from_secs(44))
+        );
+        assert_eq!(pending_clips[1].reason, ClipReason::TargetDestroyed);
+        assert_eq!(pending_clips[1].kill_count(), 1);
+        assert_eq!(
+            pending_clips[1].last_event_game_time,
+            Some(Duration::from_secs(63))
         );
     }
 
@@ -1075,6 +1288,7 @@ mod tests {
                 ClipReason::TargetDestroyed,
                 "next".to_owned(),
                 later,
+                None,
                 SystemTime::UNIX_EPOCH + Duration::from_secs(4),
                 Duration::from_secs(5),
             )
@@ -1092,6 +1306,7 @@ mod tests {
             ClipReason::TargetDestroyed,
             "kill".to_owned(),
             Instant::now(),
+            None,
             SystemTime::UNIX_EPOCH,
             Duration::from_secs(5),
         )];
@@ -1125,6 +1340,7 @@ mod tests {
             clip_reason_for_event(&events[0].event),
             ClipReason::TargetDestroyed
         );
+        assert_eq!(events[0].game_time, None);
     }
 
     #[test]
@@ -1152,6 +1368,77 @@ mod tests {
             vec![ChatMessage {
                 id: Some(99),
                 time: None,
+                sender: None,
+                text,
+            }],
+            &mut seen_messages,
+            &mut seen_events,
+            Some("dawson16800"),
+            &mut events,
+        );
+
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn repeated_identical_kills_with_different_message_times_are_distinct() {
+        let mut seen_messages = RecentMessageCache::new(100);
+        let mut seen_events = RecentEventCache::new(Duration::from_secs(120));
+        let mut events = Vec::new();
+        let text = "dawson16800 (F/A-18C Early) destroyed [ai] MiG-15bis".to_owned();
+
+        collect_personal_events(
+            "gamechat",
+            vec![
+                ChatMessage {
+                    id: Some(1),
+                    time: Some("0:47".to_owned()),
+                    sender: None,
+                    text: text.clone(),
+                },
+                ChatMessage {
+                    id: Some(2),
+                    time: Some("2:50".to_owned()),
+                    sender: None,
+                    text,
+                },
+            ],
+            &mut seen_messages,
+            &mut seen_events,
+            Some("dawson16800"),
+            &mut events,
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].game_time, Some(Duration::from_secs(47)));
+        assert_eq!(events[1].game_time, Some(Duration::from_secs(170)));
+    }
+
+    #[test]
+    fn same_timed_kill_from_gamechat_and_hud_is_deduped() {
+        let mut seen_messages = RecentMessageCache::new(100);
+        let mut seen_events = RecentEventCache::new(Duration::from_secs(120));
+        let mut events = Vec::new();
+        let text = "dawson16800 (F/A-18C Early) destroyed [ai] MiG-15bis".to_owned();
+
+        collect_personal_events(
+            "gamechat",
+            vec![ChatMessage {
+                id: Some(1),
+                time: Some("0:47".to_owned()),
+                sender: None,
+                text: text.clone(),
+            }],
+            &mut seen_messages,
+            &mut seen_events,
+            Some("dawson16800"),
+            &mut events,
+        );
+        collect_personal_events(
+            "hud:damage",
+            vec![ChatMessage {
+                id: Some(99),
+                time: Some("0:47".to_owned()),
                 sender: None,
                 text,
             }],

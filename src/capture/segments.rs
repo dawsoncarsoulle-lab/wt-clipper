@@ -147,13 +147,17 @@ pub fn select_segments_around_event(
 ) -> EventSegmentSelection {
     let mut segments = segments.to_vec();
     sort_segments_chronologically(&mut segments);
-    let needed = segments_needed_for_duration(duration_seconds, segment_seconds);
     let target_end = last_event_time + Duration::from_secs(post_event_seconds);
     let expected_start = first_event_time
         .checked_sub(Duration::from_secs(
             duration_seconds.saturating_sub(post_event_seconds),
         ))
         .unwrap_or(SystemTime::UNIX_EPOCH);
+    let needed = target_end
+        .duration_since(expected_start)
+        .map(|duration| duration.as_secs() + u64::from(duration.subsec_nanos() > 0))
+        .map(|seconds| segments_needed_for_duration(seconds, segment_seconds))
+        .unwrap_or_else(|_| segments_needed_for_duration(duration_seconds, segment_seconds));
 
     debug_segment_selection_inputs(
         &segments,
@@ -613,6 +617,39 @@ mod tests {
                 .map(|segment| segment.index)
                 .collect::<Vec<_>>(),
             vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn multi_kill_selection_can_exceed_single_clip_duration() {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let segments = (0..10)
+            .map(|index| ReplaySegment {
+                index,
+                path: PathBuf::from(segment_file_name(index)),
+                modified: base + Duration::from_secs((index + 1) * 5),
+            })
+            .collect::<Vec<_>>();
+
+        let selected = match select_segments_around_event(
+            &segments,
+            base + Duration::from_secs(25),
+            base + Duration::from_secs(35),
+            25,
+            5,
+            5,
+        ) {
+            EventSegmentSelection::Selected(selected) => selected,
+            other => panic!("expected long multi-kill selection, got {other:?}"),
+        };
+
+        assert_eq!(selected.len(), 7);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|segment| segment.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7]
         );
     }
 

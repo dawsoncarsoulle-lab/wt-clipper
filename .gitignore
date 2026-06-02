@@ -1,4 +1,6 @@
 /target
+/src-tauri/target/
+/serveur/fonts/
 
 
 # Added by cargo
