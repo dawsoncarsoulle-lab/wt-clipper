@@ -12,13 +12,17 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{Emitter, Manager, State};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 use chrono::Utc;
 use uuid::Uuid;
+mod export_queue;
 mod updater;
+use export_queue::{ExportSummary, PendingClipExportDto};
 use wt_clipper::{
-    app::auto::{run_auto_clip, AutoClipConfig},
+    app::auto::{
+        run_auto_clip, AutoClipCommand, AutoClipConfig,
+    },
     capture::{
         buffer::{ClipReason, ReplayBufferConfig, ReplayBufferHandle, SaveReplayOutcome},
         quality::VideoQuality,
@@ -31,9 +35,15 @@ use wt_clipper::{
 
 struct BackendState {
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
+    auto_cmd_tx: mpsc::UnboundedSender<AutoClipCommand>,
     config_path: PathBuf,
     runtime_status: Arc<Mutex<RuntimeStatus>>,
     preview_server: Arc<ClipPreviewServer>,
+}
+
+struct BackendChannels {
+    cmd_tx: mpsc::UnboundedSender<UiCommand>,
+    auto_cmd_tx: mpsc::UnboundedSender<AutoClipCommand>,
 }
 
 struct ClipPreviewServer {
@@ -267,9 +277,31 @@ async fn run_diagnostics(state: State<'_, BackendState>) -> Result<DoctorReport,
 #[tauri::command]
 fn save_manual_clip(state: State<'_, BackendState>) -> Result<(), String> {
     state
-        .cmd_tx
-        .send(UiCommand::SaveManualClip)
+        .auto_cmd_tx
+        .send(AutoClipCommand::SaveManualClip)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn export_pending_clips(state: State<'_, BackendState>) -> Result<ExportSummary, String> {
+    let (respond_to, response) = oneshot::channel();
+    state
+        .auto_cmd_tx
+        .send(AutoClipCommand::ExportPendingClips { respond_to })
+        .map_err(|error| error.to_string())?;
+    response.await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_pending_export_clips(
+    state: State<'_, BackendState>,
+) -> Result<Vec<PendingClipExportDto>, String> {
+    let (respond_to, response) = oneshot::channel();
+    state
+        .auto_cmd_tx
+        .send(AutoClipCommand::GetPendingExportClips { respond_to })
+        .map_err(|error| error.to_string())?;
+    response.await.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -301,7 +333,7 @@ fn main() {
             #[cfg(desktop)]
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
-            let cmd_tx = spawn_backend(
+            let channels = spawn_backend(
                 app.handle().clone(),
                 config,
                 config_path.clone(),
@@ -309,7 +341,8 @@ fn main() {
                 preview_server.clone(),
             );
             app.manage(BackendState {
-                cmd_tx,
+                cmd_tx: channels.cmd_tx,
+                auto_cmd_tx: channels.auto_cmd_tx,
                 config_path,
                 runtime_status,
                 preview_server,
@@ -324,6 +357,8 @@ fn main() {
             open_output_folder,
             run_diagnostics,
             save_manual_clip,
+            export_pending_clips,
+            get_pending_export_clips,
             restart_buffer,
             updater::check_for_updates,
             get_runtime_status
@@ -338,9 +373,10 @@ fn spawn_backend(
     config_path: PathBuf,
     runtime_status: Arc<Mutex<RuntimeStatus>>,
     preview_server: Arc<ClipPreviewServer>,
-) -> mpsc::UnboundedSender<UiCommand> {
+) -> BackendChannels {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (auto_cmd_tx, auto_cmd_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
@@ -403,7 +439,7 @@ fn spawn_backend(
             if let Ok(mut status) = runtime_status.lock() {
                 status.auto_clip_running = true;
             }
-            if let Err(error) = run_auto_backend(config, output_dir, event_tx.clone()).await {
+            if let Err(error) = run_auto_backend(config, output_dir, event_tx.clone(), auto_cmd_rx).await {
                 if let Ok(mut status) = runtime_status.lock() {
                     status.auto_clip_running = false;
                     status.last_error = Some(error.to_string());
@@ -416,13 +452,14 @@ fn spawn_backend(
             }
         });
     });
-    cmd_tx
+    BackendChannels { cmd_tx, auto_cmd_tx }
 }
 
 async fn run_auto_backend(
     config: AppConfig,
     output_dir: PathBuf,
     event_tx: mpsc::UnboundedSender<AppEvent>,
+    auto_cmd_rx: mpsc::UnboundedReceiver<AutoClipCommand>,
 ) -> anyhow::Result<()> {
     let client = WarThunderClient::new(config.war_thunder.clone())?;
     let quality_preset = config.clip.quality;
@@ -442,8 +479,10 @@ async fn run_auto_backend(
             post_event_delay: Duration::from_secs(config.clip.post_event_seconds),
             multi_kill_window: Duration::from_secs(config.clip.multi_kill_window_seconds),
             include_history: false,
-            target_destroyed_trigger: config.triggers.target_destroyed,
+            triggers: config.triggers.clone(),
             ui_events: Some(event_tx),
+            export_mode: config.clip.export_mode,
+            command_rx: Some(auto_cmd_rx),
         },
     )
     .await
@@ -508,7 +547,14 @@ fn emit_app_event(
                 }),
             )
         }
-        AppEvent::ClipStatusChanged { payload } => app.emit("clip-status-changed", payload),
+        AppEvent::ClipStatusChanged { payload } => {
+            let _ = app.emit("clip_status_changed", payload.clone());
+            app.emit("clip-status-changed", payload)
+        }
+        AppEvent::ExportProgressChanged { payload } => {
+            let _ = app.emit("export-progress-changed", payload.clone());
+            app.emit("export_progress_changed", payload)
+        }
         AppEvent::ClipFailed { message } => app.emit("clip-failed", json!({ "message": message })),
         AppEvent::BufferProgress {
             filled_secs,
@@ -547,6 +593,7 @@ fn tauri_event_name(event: &AppEvent) -> &'static str {
         AppEvent::KillDetected { .. } => "kill-detected",
         AppEvent::ClipSaved { .. } => "clip-saved",
         AppEvent::ClipStatusChanged { .. } => "clip-status-changed",
+        AppEvent::ExportProgressChanged { .. } => "export_progress_changed",
         AppEvent::ClipFailed { .. } => "clip-failed",
         AppEvent::BufferProgress { .. } => "buffer-progress",
         AppEvent::DiskUsage { .. } => "disk-usage",
@@ -579,6 +626,17 @@ fn log_bridge_event_received(event: &AppEvent) {
                 ?payload.status,
                 ?payload.reason,
                 "AppEvent::ClipStatusChanged received from backend"
+            )
+        }
+        AppEvent::ExportProgressChanged { payload } => {
+            debug!(
+                active = payload.active,
+                total = payload.total,
+                completed = payload.completed,
+                failed = payload.failed,
+                progress = payload.progress,
+                ?payload.current_step,
+                "AppEvent::ExportProgressChanged received from backend"
             )
         }
         AppEvent::ClipFailed { message } => {
@@ -963,7 +1021,7 @@ async fn scan_clips(
             clips.push(ClipInfo {
                 reason: clip_reason_from_name(&file_name),
                 path: path.to_path_buf(),
-                thumbnail_path: None,
+                thumbnail_path: path.with_extension("jpg").exists().then(|| path.with_extension("jpg")),
                 preview_url: preview_server.url_for_path(path),
                 file_name,
                 size_bytes,

@@ -330,6 +330,57 @@ mod tests {
     }
 
     #[test]
+    fn non_personal_target_destroyed_is_not_personal_kill() {
+        let event = parse_gamechat_event("other (MiG-15bis) destroyed [ai] F-86");
+
+        assert!(!is_personal_kill(&event, Some("dawson16800")));
+    }
+
+    #[test]
+    fn enemy_shot_down_player_name_parses_as_target_destroyed_for_death_decision() {
+        let raw = "Enemy (MiG-29) shot down dawson16800 (F/A-18C Early)";
+
+        assert_eq!(
+            parse_gamechat_event(raw),
+            WarThunderEvent::TargetDestroyed {
+                attacker: Some("Enemy".to_owned()),
+                action: "shot down".to_owned(),
+                vehicle: Some("MiG-29".to_owned()),
+                target: Some("dawson16800 (F/A-18C Early)".to_owned()),
+                raw: raw.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn player_destroyed_a_base_parses_as_destroyed_action() {
+        let raw = "dawson16800 (F/A-18C Early) destroyed a base";
+
+        assert_eq!(
+            parse_gamechat_event(raw),
+            WarThunderEvent::TargetDestroyed {
+                attacker: Some("dawson16800".to_owned()),
+                action: "destroyed".to_owned(),
+                vehicle: Some("F/A-18C Early".to_owned()),
+                target: Some("a base".to_owned()),
+                raw: raw.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn damage_messages_are_not_destroyed_events() {
+        for raw in [
+            "dawson16800 (F/A-18C Early) critically damaged Enemy",
+            "dawson16800 (F/A-18C Early) severely damaged Enemy",
+            "dawson16800 (F/A-18C Early) set afire Enemy",
+        ] {
+            let event = parse_gamechat_event(raw);
+            assert!(!is_personal_kill(&event, Some("dawson16800")));
+        }
+    }
+
+    #[test]
     fn unknown_when_message_is_not_recognized() {
         assert_eq!(
             parse_gamechat_event("Capture the point"),

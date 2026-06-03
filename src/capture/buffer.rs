@@ -14,7 +14,7 @@ use tokio::{
     sync::mpsc,
     time::{interval, MissedTickBehavior},
 };
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::{
@@ -37,6 +37,7 @@ use crate::{
         x11::resolve_x11_window_id,
     },
     cli::CaptureSource,
+    doctor::check_free_space,
     warthunder::events::WarThunderEvent,
 };
 
@@ -233,6 +234,14 @@ impl ReplayBufferHandle {
     pub fn prune(&self) -> anyhow::Result<()> {
         prune_old_segments(&self.temp_dir, self.keep_segments)?;
         check_pipeline_bus(&self.pipeline)
+    }
+
+    pub fn temp_dir(&self) -> &std::path::Path {
+        &self.temp_dir
+    }
+
+    pub fn output_dir(&self) -> Option<&std::path::Path> {
+        self.config.output_dir.as_deref()
     }
 
     pub async fn stop(self) -> anyhow::Result<()> {
@@ -439,6 +448,17 @@ fn save_replay_clip(
     let created_at = Local::now();
     let parent = resolve_clip_parent(output_dir)?;
     let paths = resolve_clip_paths(&parent, &context, created_at)?;
+    let required_bytes = estimate_required_bytes(&context);
+    check_clip_disk_space(&parent, temp_dir, required_bytes)?;
+    info!(
+        temp_dir = %temp_dir.display(),
+        output_dir = %parent.display(),
+        final_video_path = %paths.final_video_path.display(),
+        segments_found = snapshot.found_count,
+        segments_selected = selected.len(),
+        required_bytes,
+        "preparing replay clip save"
+    );
     let snapshot_dir = create_save_snapshot_dir()?;
     copy_stable_segments(&selected, &snapshot_dir, Duration::from_secs(2))?;
 
@@ -479,13 +499,87 @@ fn save_replay_clip(
             }
         }
         Err(error) => {
+            error!(
+                %error,
+                temp_dir = %temp_dir.display(),
+                output_dir = %parent.display(),
+                final_video_path = %paths.final_video_path.display(),
+                segments_found = snapshot.found_count,
+                segments_selected = selected.len(),
+                "failed to assemble final replay video"
+            );
             println!(
                 "[CLIP] failed to assemble final video, segments kept at: {}",
                 snapshot_dir.display()
             );
-            Err(error)
+            Err(error).with_context(|| {
+                format!(
+                    "failed to assemble final video at {} from {} segments",
+                    paths.final_video_path.display(),
+                    segment_paths.len()
+                )
+            })
         }
     }
+}
+
+fn estimate_required_bytes(context: &ClipContext) -> u64 {
+    let seconds = context
+        .duration_seconds
+        .saturating_add(context.post_event_seconds)
+        .saturating_add(10);
+    let bytes_per_second =
+        u64::from(context.video_quality.video_bitrate_kbps).saturating_mul(1000) / 8;
+    bytes_per_second.saturating_mul(seconds).saturating_mul(2)
+}
+
+fn check_clip_disk_space(
+    output_dir: &std::path::Path,
+    temp_dir: &std::path::Path,
+    required_bytes: u64,
+) -> anyhow::Result<()> {
+    let output = check_free_space(output_dir, required_bytes).with_context(|| {
+        format!(
+            "failed to check output directory free space: {}",
+            output_dir.display()
+        )
+    })?;
+    let temp = check_free_space(temp_dir, required_bytes).with_context(|| {
+        format!(
+            "failed to check temp directory free space: {}",
+            temp_dir.display()
+        )
+    })?;
+
+    info!(
+        output_dir = %output.path.display(),
+        output_available_bytes = output.available_bytes,
+        temp_dir = %temp.path.display(),
+        temp_available_bytes = temp.available_bytes,
+        required_bytes,
+        "clip free space check"
+    );
+
+    if output.available_bytes < required_bytes || temp.available_bytes < required_bytes {
+        error!(
+            output_dir = %output.path.display(),
+            output_available_bytes = output.available_bytes,
+            temp_dir = %temp.path.display(),
+            temp_available_bytes = temp.available_bytes,
+            required_bytes,
+            "insufficient disk space for clip creation"
+        );
+        anyhow::bail!(
+            "Espace disque insuffisant pour créer le clip: output_dir={} available_bytes={} temp_dir={} temp_available_bytes={} required_bytes={}",
+            output.path.display(),
+            output.available_bytes,
+            temp.path.display(),
+            temp.available_bytes,
+            required_bytes
+        );
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]

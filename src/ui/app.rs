@@ -184,6 +184,7 @@ impl WtClipperApp {
                 color: Theme::DEATH_RED,
             }),
             AppEvent::ClipStatusChanged { .. } => {}
+            AppEvent::ExportProgressChanged { .. } => {}
             AppEvent::BufferProgress {
                 filled_secs,
                 total_secs,

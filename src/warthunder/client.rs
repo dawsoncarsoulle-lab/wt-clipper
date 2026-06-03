@@ -315,10 +315,21 @@ fn chat_message_from_object(object: &Map<String, Value>) -> Option<ChatMessage> 
 
 fn chat_message_from_array(items: &[Value]) -> Option<ChatMessage> {
     let id = items.iter().find_map(value_as_u64);
+    let mut time = None;
     let strings = items
         .iter()
         .filter_map(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
+        .filter_map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            if time.is_none() && looks_like_time(value) {
+                time = Some(value.to_owned());
+                return None;
+            }
+            Some(value)
+        })
         .collect::<Vec<_>>();
     let text = strings.join(" ");
 
@@ -327,11 +338,7 @@ fn chat_message_from_array(items: &[Value]) -> Option<ChatMessage> {
     } else {
         Some(ChatMessage {
             id,
-            time: strings
-                .first()
-                .copied()
-                .filter(|value| looks_like_time(value))
-                .map(str::to_owned),
+            time,
             sender: None,
             text,
         })
@@ -528,6 +535,7 @@ fn friendly_error(error: &reqwest::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::warthunder::{events::WarThunderEvent, parser::parse_gamechat_event};
     use serde_json::json;
 
     use super::*;
@@ -579,6 +587,40 @@ mod tests {
         assert_eq!(
             message.stable_key_with_prefix("chat"),
             "chat:1:27|dawson16800|dawson16800 (F/A-18C Early) destroyed [ai] MiG-15bis"
+        );
+    }
+
+    #[test]
+    fn array_timecode_does_not_pollute_chat_text() {
+        let value = json!([12, "2:43", "dawson16800 (F/A-18C Early) destroyed Enemy"]);
+        let Value::Array(items) = value else {
+            panic!("expected array");
+        };
+
+        let message = chat_message_from_array(&items).expect("chat message");
+
+        assert_eq!(message.id, Some(12));
+        assert_eq!(message.time.as_deref(), Some("2:43"));
+        assert_eq!(message.text, "dawson16800 (F/A-18C Early) destroyed Enemy");
+    }
+
+    #[test]
+    fn array_timecode_message_parses_attacker_correctly() {
+        let value = json!([12, "2:43", "dawson16800 (F/A-18C Early) destroyed Enemy"]);
+        let Value::Array(items) = value else {
+            panic!("expected array");
+        };
+        let message = chat_message_from_array(&items).expect("chat message");
+
+        assert_eq!(
+            parse_gamechat_event(&message.text),
+            WarThunderEvent::TargetDestroyed {
+                attacker: Some("dawson16800".to_owned()),
+                action: "destroyed".to_owned(),
+                vehicle: Some("F/A-18C Early".to_owned()),
+                target: Some("Enemy".to_owned()),
+                raw: "dawson16800 (F/A-18C Early) destroyed Enemy".to_owned(),
+            }
         );
     }
 

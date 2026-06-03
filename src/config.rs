@@ -42,6 +42,16 @@ pub struct ClipConfig {
     pub source: CaptureSource,
     #[serde(default)]
     pub keep_segments: bool,
+    #[serde(default)]
+    pub export_mode: ClipExportMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipExportMode {
+    Instant,
+    #[default]
+    Deferred,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -60,6 +70,10 @@ pub struct WarThunderConfig {
 pub struct TriggerConfig {
     #[serde(default = "default_true")]
     pub target_destroyed: bool,
+    #[serde(default = "default_true")]
+    pub base_destroyed: bool,
+    #[serde(default)]
+    pub player_destroyed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -85,6 +99,7 @@ impl Default for ClipConfig {
             video_bitrate_kbps: video_quality.video_bitrate_kbps,
             source: CaptureSource::Window,
             keep_segments: false,
+            export_mode: ClipExportMode::Deferred,
         }
     }
 }
@@ -104,6 +119,8 @@ impl Default for TriggerConfig {
     fn default() -> Self {
         Self {
             target_destroyed: true,
+            base_destroyed: true,
+            player_destroyed: false,
         }
     }
 }
@@ -209,6 +226,7 @@ fps = 60
 video_bitrate_kbps = 20000
 source = "window"
 keep_segments = false
+export_mode = "deferred"
 
 [war_thunder]
 player_name = ""
@@ -216,6 +234,8 @@ poll_interval_ms = 300
 
 [triggers]
 target_destroyed = true
+base_destroyed = true
+player_destroyed = false
 
 [storage]
 max_clips = 100
@@ -310,6 +330,8 @@ mod tests {
         assert_eq!(config.clip.multi_kill_window_seconds, 8);
         assert_eq!(config.war_thunder.poll_interval_ms, 300);
         assert!(config.triggers.target_destroyed);
+        assert!(config.triggers.base_destroyed);
+        assert!(!config.triggers.player_destroyed);
         assert_eq!(config.storage.max_clips, 100);
     }
 
@@ -329,6 +351,8 @@ crash = true
         .unwrap();
 
         assert!(config.triggers.target_destroyed);
+        assert!(config.triggers.player_destroyed);
+        assert!(config.triggers.base_destroyed);
     }
 
     #[test]

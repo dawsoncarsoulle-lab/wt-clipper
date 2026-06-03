@@ -1,13 +1,14 @@
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
 };
 
 use chrono::Utc;
-use tokio::sync::mpsc;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::{
@@ -18,19 +19,21 @@ use crate::{
         quality::{QualityPreset, VideoQuality},
     },
     cli::CaptureSource,
-    config::WarThunderConfig,
-    ui::bridge::{AppEvent, ClipStatus, ClipStatusPayload},
+    config::{ClipExportMode, TriggerConfig, WarThunderConfig},
+    ui::bridge::{
+        AppEvent, ClipStatus, ClipStatusPayload, ExportProgressPayload, ExportProgressStep,
+    },
     warthunder::{
         client::{ChatMessage, WarThunderClient},
         events::WarThunderEvent,
-        parser::{is_personal_kill, parse_gamechat_event},
+        parser::parse_gamechat_event,
         recent::{RecentEventCache, RecentMessageCache},
     },
 };
 
 const EVENT_DEDUPE_TTL: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AutoClipConfig {
     pub buffer_seconds: u64,
     pub segment_seconds: u64,
@@ -43,8 +46,75 @@ pub struct AutoClipConfig {
     pub post_event_delay: Duration,
     pub multi_kill_window: Duration,
     pub include_history: bool,
-    pub target_destroyed_trigger: bool,
+    pub triggers: TriggerConfig,
     pub ui_events: Option<mpsc::UnboundedSender<AppEvent>>,
+    pub export_mode: ClipExportMode,
+    pub command_rx: Option<mpsc::UnboundedReceiver<AutoClipCommand>>,
+}
+
+#[derive(Debug)]
+pub enum AutoClipCommand {
+    SaveManualClip,
+    ExportPendingClips {
+        respond_to: oneshot::Sender<ExportSummary>,
+    },
+    GetPendingExportClips {
+        respond_to: oneshot::Sender<Vec<PendingClipExportDto>>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingExportStatus {
+    Pending,
+    Exporting,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingClipExport {
+    pub id: String,
+    pub reason: ClipReason,
+    pub title: String,
+    pub detected_at: SystemTime,
+    pub game_time: Option<Duration>,
+    pub start_time: SystemTime,
+    pub end_time: SystemTime,
+    pub pre_event_seconds: u64,
+    pub post_event_seconds: u64,
+    pub status: PendingExportStatus,
+    events: Vec<WarThunderEvent>,
+    player_name: Option<String>,
+    quality: VideoQuality,
+    quality_preset: QualityPreset,
+    segment_seconds: u64,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingClipExportDto {
+    pub id: String,
+    pub reason: ClipReason,
+    pub title: String,
+    pub created_at: String,
+    pub status: PendingExportStatus,
+    pub progress: Option<u8>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSummary {
+    pub total: usize,
+    pub completed: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct ExportQueue {
+    pending: Vec<PendingClipExport>,
 }
 
 #[derive(Debug)]
@@ -140,7 +210,7 @@ impl PendingClip {
         self.save_at = event_time + delay;
         self.events.push(event);
         self.descriptions.push(description);
-        if self.events.len() > 1 && self.events.iter().all(is_personal_kill_event) {
+        if self.events.len() > 1 && self.events.iter().all(is_target_destroyed_clip_event) {
             self.reason = ClipReason::MultiKill;
         }
         true
@@ -153,7 +223,7 @@ impl PendingClip {
     fn kill_count(&self) -> usize {
         self.events
             .iter()
-            .filter(|event| is_personal_kill_event(event))
+            .filter(|event| is_target_destroyed_clip_event(event))
             .count()
     }
 }
@@ -181,10 +251,375 @@ impl Cooldown {
 #[derive(Debug, Clone)]
 struct DetectedEvent {
     event: WarThunderEvent,
+    reason: ClipReason,
     canonical_key: String,
     detected_at: Instant,
     game_time: Option<Duration>,
     detected_wall_time: SystemTime,
+}
+
+impl ExportQueue {
+    pub fn add_pending_clip(&mut self, clip: PendingClipExport) {
+        info!(
+            id = %clip.id,
+            reason = ?clip.reason,
+            title = %clip.title,
+            start_time = ?clip.start_time,
+            end_time = ?clip.end_time,
+            pre_event_seconds = clip.pre_event_seconds,
+            post_event_seconds = clip.post_event_seconds,
+            "clip added to deferred export queue"
+        );
+        if let Some(existing) = self
+            .pending
+            .iter_mut()
+            .find(|pending| pending.id == clip.id)
+        {
+            *existing = clip;
+            info!(pending = self.pending_count(), "deferred export queue size");
+            return;
+        }
+        self.pending.push(clip);
+        info!(pending = self.pending_count(), "deferred export queue size");
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|clip| clip.status == PendingExportStatus::Pending)
+            .count()
+    }
+
+    pub fn pending_dtos(&self) -> Vec<PendingClipExportDto> {
+        self.pending
+            .iter()
+            .filter(|clip| {
+                matches!(
+                    clip.status,
+                    PendingExportStatus::Pending
+                        | PendingExportStatus::Exporting
+                        | PendingExportStatus::Failed
+                )
+            })
+            .map(PendingClipExport::dto)
+            .collect()
+    }
+
+    pub async fn export_pending_clips(
+        &mut self,
+        buffer: &ReplayBufferHandle,
+        auto_config: &AutoClipConfig,
+    ) -> ExportSummary {
+        let export_ids = self
+            .pending
+            .iter()
+            .filter(|clip| {
+                matches!(
+                    clip.status,
+                    PendingExportStatus::Pending | PendingExportStatus::Failed
+                )
+            })
+            .map(|clip| clip.id.clone())
+            .collect::<Vec<_>>();
+        let total = export_ids.len();
+        let mut summary = ExportSummary {
+            total,
+            completed: 0,
+            failed: 0,
+        };
+
+        info!(total, "starting deferred clip export");
+        if total > 0 {
+            if let Err(error) = preflight_export_disk_space(buffer, auto_config, total) {
+                let message = format!(
+                    "Espace disque insuffisant pour exporter les clips. Libérez de l'espace disque puis réessayez. {error}"
+                );
+                error!(%message, "deferred export preflight failed");
+                emit_export_progress(
+                    auto_config,
+                    ExportProgressPayload {
+                        active: false,
+                        total,
+                        completed: 0,
+                        failed: 0,
+                        current_clip_id: None,
+                        current_clip_title: None,
+                        current_step: ExportProgressStep::Failed,
+                        progress: 0,
+                        message,
+                    },
+                );
+                return summary;
+            }
+        }
+        emit_export_progress(
+            auto_config,
+            ExportProgressPayload {
+                active: total > 0,
+                total,
+                completed: 0,
+                failed: 0,
+                current_clip_id: None,
+                current_clip_title: None,
+                current_step: ExportProgressStep::Preparing,
+                progress: 0,
+                message: if total == 0 {
+                    "Aucun clip en attente d'export".to_owned()
+                } else {
+                    "Préparation de l'export des clips...".to_owned()
+                },
+            },
+        );
+
+        for (position, clip_id) in export_ids.into_iter().enumerate() {
+            let Some(index) = self.pending.iter().position(|clip| clip.id == clip_id) else {
+                continue;
+            };
+            self.pending[index].status = PendingExportStatus::Exporting;
+            self.pending[index].error = None;
+            let clip = self.pending[index].clone();
+            info!(
+                id = %clip.id,
+                title = %clip.title,
+                reason = ?clip.reason,
+                start_time = ?clip.start_time,
+                end_time = ?clip.end_time,
+                expected_duration_seconds = clip.duration_seconds(),
+                "exporting deferred clip"
+            );
+            send_ui_event(
+                auto_config,
+                AppEvent::ClipStatusChanged {
+                    payload: clip.status_payload(ClipStatus::Exporting, Some(0), None, None),
+                },
+            );
+
+            emit_clip_export_step(
+                auto_config,
+                &clip,
+                total,
+                summary.completed,
+                summary.failed,
+                position,
+                ExportProgressStep::Preparing,
+                0.05,
+                "Préparation du clip",
+            );
+            emit_clip_export_step(
+                auto_config,
+                &clip,
+                total,
+                summary.completed,
+                summary.failed,
+                position,
+                ExportProgressStep::Extracting,
+                0.25,
+                "Extraction des segments",
+            );
+            emit_clip_export_step(
+                auto_config,
+                &clip,
+                total,
+                summary.completed,
+                summary.failed,
+                position,
+                ExportProgressStep::Encoding,
+                0.85,
+                "Encodage du clip",
+            );
+
+            let result = buffer.save_replay(clip.clip_context()).await;
+            match result {
+                Ok(SaveReplayOutcome::Saved(replay)) => {
+                    emit_clip_export_step(
+                        auto_config,
+                        &clip,
+                        total,
+                        summary.completed,
+                        summary.failed,
+                        position,
+                        ExportProgressStep::Thumbnail,
+                        0.95,
+                        "Génération de la miniature",
+                    );
+                    emit_clip_export_step(
+                        auto_config,
+                        &clip,
+                        total,
+                        summary.completed,
+                        summary.failed,
+                        position,
+                        ExportProgressStep::Saving,
+                        1.0,
+                        "Sauvegarde du clip",
+                    );
+                    crate::capture::buffer::print_saved_replay(&replay);
+                    self.pending[index].status = PendingExportStatus::Ready;
+                    summary.completed += 1;
+                    if let Some(path) = replay.final_video_path {
+                        let thumbnail_path = generate_clip_thumbnail(&path).await;
+                        let size_bytes = std::fs::metadata(&path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        let mut payload = clip.status_payload(
+                            ClipStatus::Ready,
+                            Some(100),
+                            Some(path.clone()),
+                            None,
+                        );
+                        payload.thumbnail_path = thumbnail_path;
+                        payload.duration_seconds = Some(clip.duration_seconds());
+                        payload.size_bytes = Some(size_bytes);
+                        send_ui_event(auto_config, AppEvent::ClipStatusChanged { payload });
+                        send_ui_event(
+                            auto_config,
+                            AppEvent::ClipSaved {
+                                path,
+                                reason: clip.reason,
+                                duration_seconds: clip.duration_seconds(),
+                                size_bytes,
+                            },
+                        );
+                    }
+                }
+                Ok(SaveReplayOutcome::NotReadyYet(reason))
+                | Ok(SaveReplayOutcome::SkippedTooOld(reason)) => {
+                    summary.failed += 1;
+                    self.mark_failed(index, auto_config, &clip, reason);
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    self.mark_failed(index, auto_config, &clip, error.to_string());
+                }
+            }
+        }
+
+        info!(
+            total = summary.total,
+            completed = summary.completed,
+            failed = summary.failed,
+            "deferred export finished"
+        );
+        emit_export_progress(
+            auto_config,
+            ExportProgressPayload {
+                active: false,
+                total: summary.total,
+                completed: summary.completed,
+                failed: summary.failed,
+                current_clip_id: None,
+                current_clip_title: None,
+                current_step: if summary.failed > 0 {
+                    ExportProgressStep::Failed
+                } else {
+                    ExportProgressStep::Done
+                },
+                progress: 100,
+                message: if summary.failed > 0 {
+                    format!(
+                        "{} clips exportés, {} erreur{}",
+                        summary.completed,
+                        summary.failed,
+                        if summary.failed > 1 { "s" } else { "" }
+                    )
+                } else {
+                    "Export terminé".to_owned()
+                },
+            },
+        );
+
+        summary
+    }
+
+    fn mark_failed(
+        &mut self,
+        index: usize,
+        auto_config: &AutoClipConfig,
+        clip: &PendingClipExport,
+        message: String,
+    ) {
+        error!(
+            id = %clip.id,
+            title = %clip.title,
+            error = %message,
+            "deferred clip export failed"
+        );
+        self.pending[index].status = PendingExportStatus::Failed;
+        self.pending[index].error = Some(message.clone());
+        send_ui_event(
+            auto_config,
+            AppEvent::ClipStatusChanged {
+                payload: clip.status_payload(ClipStatus::Failed, None, None, Some(message)),
+            },
+        );
+    }
+}
+
+impl PendingClipExport {
+    fn dto(&self) -> PendingClipExportDto {
+        PendingClipExportDto {
+            id: self.id.clone(),
+            reason: self.reason,
+            title: self.title.clone(),
+            created_at: system_time_rfc3339(self.detected_at),
+            status: self.status.clone(),
+            progress: match self.status {
+                PendingExportStatus::Pending => None,
+                PendingExportStatus::Exporting => Some(0),
+                PendingExportStatus::Ready => Some(100),
+                PendingExportStatus::Failed => None,
+            },
+            error: self.error.clone(),
+        }
+    }
+
+    fn duration_seconds(&self) -> u64 {
+        self.pre_event_seconds
+            .saturating_add(self.post_event_seconds)
+            .max(1)
+    }
+
+    fn clip_context(&self) -> ClipContext {
+        ClipContext {
+            reason: self.reason,
+            event: self.events.first().cloned(),
+            events: self.events.clone(),
+            player_name: self.player_name.clone(),
+            video_quality: self.quality,
+            quality_preset: self.quality_preset,
+            duration_seconds: self.duration_seconds(),
+            post_event_seconds: self.post_event_seconds,
+            segment_seconds: self.segment_seconds,
+            first_event_time: Some(self.start_time + Duration::from_secs(self.pre_event_seconds)),
+            last_event_time: Some(
+                self.end_time
+                    .checked_sub(Duration::from_secs(self.post_event_seconds))
+                    .unwrap_or(self.end_time),
+            ),
+        }
+    }
+
+    fn status_payload(
+        &self,
+        status: ClipStatus,
+        progress: Option<u8>,
+        file_path: Option<PathBuf>,
+        error: Option<String>,
+    ) -> ClipStatusPayload {
+        ClipStatusPayload {
+            id: self.id.clone(),
+            status,
+            reason: self.reason,
+            title: self.title.clone(),
+            created_at: system_time_rfc3339(self.detected_at),
+            file_path,
+            thumbnail_path: None,
+            duration_seconds: None,
+            size_bytes: None,
+            progress,
+            error,
+        }
+    }
 }
 
 pub(crate) fn effective_post_event_delay(
@@ -206,8 +641,9 @@ fn replay_buffer_seconds_for_auto(auto_config: &AutoClipConfig) -> u64 {
 pub async fn run_auto_clip(
     client: WarThunderClient,
     warthunder_config: WarThunderConfig,
-    auto_config: AutoClipConfig,
+    mut auto_config: AutoClipConfig,
 ) -> anyhow::Result<()> {
+    let mut command_rx = auto_config.command_rx.take();
     let replay_buffer_seconds = replay_buffer_seconds_for_auto(&auto_config);
     let buffer = ReplayBufferHandle::start(ReplayBufferConfig {
         buffer_seconds: replay_buffer_seconds,
@@ -246,6 +682,7 @@ pub async fn run_auto_clip(
 
     let mut cooldown = Cooldown::new(auto_config.cooldown);
     let mut pending_clips = Vec::<PendingClip>::new();
+    let mut export_queue = ExportQueue::default();
     let mut wt_tick = interval(warthunder_config.poll_interval());
     wt_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut cleanup_tick = interval(Duration::from_secs(1));
@@ -277,6 +714,7 @@ pub async fn run_auto_clip(
                     if let Err(error) = save_ready_pending_clips(
                         buffer,
                         &mut pending_clips,
+                        &mut export_queue,
                         &mut cooldown,
                         Instant::now(),
                         player_name,
@@ -287,8 +725,35 @@ pub async fn run_auto_clip(
                     }
                 }
             }
+            command = recv_auto_command(&mut command_rx), if command_rx.is_some() => {
+                let Some(command) = command else {
+                    command_rx = None;
+                    continue;
+                };
+                let Some(buffer) = &buffer else {
+                    continue;
+                };
+                match command {
+                    AutoClipCommand::SaveManualClip => {
+                        handle_manual_clip_command(
+                            buffer,
+                            &mut export_queue,
+                            player_name,
+                            &auto_config,
+                            configured_post_event_delay,
+                        ).await;
+                    }
+                    AutoClipCommand::ExportPendingClips { respond_to } => {
+                        let summary = export_queue.export_pending_clips(buffer, &auto_config).await;
+                        let _ = respond_to.send(summary);
+                    }
+                    AutoClipCommand::GetPendingExportClips { respond_to } => {
+                        let _ = respond_to.send(export_queue.pending_dtos());
+                    }
+                }
+            }
             _ = wt_tick.tick() => {
-                let (events, wt_connected) = poll_personal_events(&client, &mut state, player_name).await;
+                let (events, wt_connected) = poll_personal_events(&client, &mut state, player_name, &auto_config.triggers).await;
                 if last_wt_connected != Some(wt_connected) {
                     send_ui_event(
                         &auto_config,
@@ -303,8 +768,8 @@ pub async fn run_auto_clip(
                 for detected in events {
                     let event = detected.event;
                     let summary = event_summary(&event);
-                    println!("[WT] kill detected: {summary}");
-                    let reason = clip_reason_for_event(&event);
+                    let reason = detected.reason;
+                    println!("[WT] event detected ({reason:?}): {summary}");
                     let (vehicle, target) = event_vehicle_target(&event);
                     send_ui_event(&auto_config, AppEvent::KillDetected {
                         reason,
@@ -325,6 +790,7 @@ pub async fn run_auto_clip(
                     }
                     if let Some(pending_index) = pending_index_for_multi_kill(
                         &pending_clips,
+                        reason,
                         now,
                         detected.game_time,
                         auto_config.multi_kill_window,
@@ -344,23 +810,44 @@ pub async fn run_auto_clip(
                                 pending.kill_count(),
                                 effective_save_delay.as_secs()
                             );
-                            send_ui_event(
-                                &auto_config,
-                                AppEvent::ClipStatusChanged {
-                                    payload: status_payload(
-                                        pending,
-                                        ClipStatus::Detected,
-                                        pending.reason,
-                                        format!(
-                                            "Multi-kill en attente: {} kills, sauvegarde dans {}s",
-                                            pending.kill_count(),
-                                            effective_save_delay.as_secs()
+                            if auto_config.export_mode == ClipExportMode::Deferred {
+                                let clip = pending_export_from_pending(
+                                    pending,
+                                    player_name,
+                                    &auto_config,
+                                    configured_post_event_delay,
+                                );
+                                export_queue.add_pending_clip(clip.clone());
+                                send_ui_event(
+                                    &auto_config,
+                                    AppEvent::ClipStatusChanged {
+                                        payload: clip.status_payload(
+                                            ClipStatus::PendingExport,
+                                            None,
+                                            None,
+                                            None,
                                         ),
-                                        Some(15),
-                                        None,
-                                    ),
-                                },
-                            );
+                                    },
+                                );
+                            } else {
+                                send_ui_event(
+                                    &auto_config,
+                                    AppEvent::ClipStatusChanged {
+                                        payload: status_payload(
+                                            pending,
+                                            ClipStatus::Detected,
+                                            pending.reason,
+                                            format!(
+                                                "Multi-kill en attente : {} kills, sauvegarde dans {}s",
+                                                pending.kill_count(),
+                                                effective_save_delay.as_secs()
+                                            ),
+                                            Some(15),
+                                            None,
+                                        ),
+                                    },
+                                );
+                            }
                             debug!(
                                 first_event_time = ?pending.first_event_wall_time,
                                 last_event_time = ?pending.last_event_wall_time,
@@ -389,26 +876,54 @@ pub async fn run_auto_clip(
                         detected.detected_wall_time,
                         effective_save_delay,
                     );
-                    println!(
-                        "[CLIP] scheduled replay save in {}s...",
-                        effective_save_delay.as_secs()
-                    );
-                    send_ui_event(
-                        &auto_config,
-                        AppEvent::ClipStatusChanged {
-                            payload: status_payload(
-                                &pending,
-                                ClipStatus::Detected,
-                                reason,
-                                format!(
-                                    "Clip programmé: {summary} (sauvegarde dans {}s)",
-                                    effective_save_delay.as_secs()
+                    if auto_config.export_mode == ClipExportMode::Deferred {
+                        println!(
+                            "[CLIP] scheduled deferred export in {}s...",
+                            effective_save_delay.as_secs()
+                        );
+                    } else {
+                        println!(
+                            "[CLIP] scheduled replay save in {}s...",
+                            effective_save_delay.as_secs()
+                        );
+                    }
+                    if auto_config.export_mode == ClipExportMode::Deferred {
+                        let clip = pending_export_from_pending(
+                            &pending,
+                            player_name,
+                            &auto_config,
+                            configured_post_event_delay,
+                        );
+                        export_queue.add_pending_clip(clip.clone());
+                        send_ui_event(
+                            &auto_config,
+                            AppEvent::ClipStatusChanged {
+                                payload: clip.status_payload(
+                                    ClipStatus::PendingExport,
+                                    None,
+                                    None,
+                                    None,
                                 ),
-                                Some(10),
-                                None,
-                            ),
-                        },
-                    );
+                            },
+                        );
+                    } else {
+                        send_ui_event(
+                            &auto_config,
+                            AppEvent::ClipStatusChanged {
+                                payload: status_payload(
+                                    &pending,
+                                    ClipStatus::Detected,
+                                    reason,
+                                    format!(
+                                        "Clip programmé: {summary} (sauvegarde dans {}s)",
+                                        effective_save_delay.as_secs()
+                                    ),
+                                    Some(10),
+                                    None,
+                                ),
+                            },
+                        );
+                    }
                     pending_clips.push(pending);
                 }
             }
@@ -494,6 +1009,81 @@ fn status_payload(
     }
 }
 
+fn pending_export_from_pending(
+    pending: &PendingClip,
+    player_name: Option<&str>,
+    auto_config: &AutoClipConfig,
+    configured_post_event_delay: Duration,
+) -> PendingClipExport {
+    let pre_event_seconds = auto_config
+        .buffer_seconds
+        .saturating_sub(configured_post_event_delay.as_secs());
+    let post_event_seconds = configured_post_event_delay.as_secs();
+    let event_start = pending
+        .first_event_wall_time
+        .checked_sub(Duration::from_secs(pre_event_seconds))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let event_end = pending.last_event_wall_time + Duration::from_secs(post_event_seconds);
+    PendingClipExport {
+        id: pending.clip_id.clone(),
+        reason: pending.reason,
+        title: pending_export_title(pending.reason, pending.kill_count()),
+        detected_at: pending.first_event_wall_time,
+        game_time: pending.last_event_game_time,
+        start_time: event_start,
+        end_time: event_end,
+        pre_event_seconds,
+        post_event_seconds,
+        status: PendingExportStatus::Pending,
+        events: pending.events.clone(),
+        player_name: player_name.map(str::to_owned),
+        quality: auto_config.quality,
+        quality_preset: auto_config.quality_preset,
+        segment_seconds: auto_config.segment_seconds,
+        error: None,
+    }
+}
+
+fn pending_manual_export(
+    player_name: Option<&str>,
+    auto_config: &AutoClipConfig,
+) -> PendingClipExport {
+    let detected_at = SystemTime::now();
+    let pre_event_seconds = auto_config.buffer_seconds.max(1);
+    let start_time = detected_at
+        .checked_sub(Duration::from_secs(pre_event_seconds))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    PendingClipExport {
+        id: format!("clip_{}", Uuid::new_v4()),
+        reason: ClipReason::Manual,
+        title: "Clip manuel".to_owned(),
+        detected_at,
+        game_time: None,
+        start_time,
+        end_time: detected_at,
+        pre_event_seconds,
+        post_event_seconds: 0,
+        status: PendingExportStatus::Pending,
+        events: Vec::new(),
+        player_name: player_name.map(str::to_owned),
+        quality: auto_config.quality,
+        quality_preset: auto_config.quality_preset,
+        segment_seconds: auto_config.segment_seconds,
+        error: None,
+    }
+}
+
+fn pending_export_title(reason: ClipReason, kill_count: usize) -> String {
+    match reason {
+        ClipReason::TargetDestroyed => "Cible détruite".to_owned(),
+        ClipReason::BaseDestroyed => "Base détruite".to_owned(),
+        ClipReason::PlayerDestroyed => "Joueur détruit".to_owned(),
+        ClipReason::MultiKill => format!("Multi-kill — {} kills", kill_count.max(2)),
+        ClipReason::Manual => "Clip manuel".to_owned(),
+        ClipReason::Unknown => "Clip".to_owned(),
+    }
+}
+
 fn ready_pending_indices(pending_clips: &[PendingClip], now: Instant) -> Vec<usize> {
     pending_clips
         .iter()
@@ -504,14 +1094,27 @@ fn ready_pending_indices(pending_clips: &[PendingClip], now: Instant) -> Vec<usi
 
 fn pending_index_for_multi_kill(
     pending_clips: &[PendingClip],
+    reason: ClipReason,
     event_time: Instant,
     event_game_time: Option<Duration>,
     multi_kill_window: Duration,
 ) -> Option<usize> {
+    if reason != ClipReason::TargetDestroyed {
+        return None;
+    }
+
     pending_clips
         .iter()
         .enumerate()
         .find_map(|(index, pending)| {
+            if !matches!(
+                pending.reason,
+                ClipReason::TargetDestroyed | ClipReason::MultiKill
+            ) || !pending.events.iter().all(is_target_destroyed_clip_event)
+            {
+                return None;
+            }
+
             if let (Some(event_game_time), Some(last_event_game_time)) =
                 (event_game_time, pending.last_event_game_time)
             {
@@ -531,6 +1134,7 @@ fn pending_index_for_multi_kill(
 async fn save_ready_pending_clips(
     buffer: &ReplayBufferHandle,
     pending_clips: &mut Vec<PendingClip>,
+    export_queue: &mut ExportQueue,
     cooldown: &mut Cooldown,
     now: Instant,
     player_name: Option<&str>,
@@ -556,6 +1160,23 @@ async fn save_ready_pending_clips(
             auto_config,
             configured_post_event_delay,
         );
+        if auto_config.export_mode == ClipExportMode::Deferred {
+            let clip = pending_export_from_pending(
+                &pending,
+                player_name,
+                auto_config,
+                configured_post_event_delay,
+            );
+            send_ui_event(
+                auto_config,
+                AppEvent::ClipStatusChanged {
+                    payload: clip.status_payload(ClipStatus::PendingExport, None, None, None),
+                },
+            );
+            export_queue.add_pending_clip(clip);
+            cooldown.record_save(now);
+            continue;
+        }
         send_ui_event(
             auto_config,
             AppEvent::ClipStatusChanged {
@@ -632,6 +1253,7 @@ async fn save_ready_pending_clips(
             }
             Ok(SaveReplayOutcome::SkippedTooOld(reason)) => {
                 println!("[CLIP] skipped pending replay save: {reason}");
+                let (title, detail) = clip_failure_messages(&reason);
                 send_ui_event(
                     auto_config,
                     AppEvent::ClipStatusChanged {
@@ -639,22 +1261,18 @@ async fn save_ready_pending_clips(
                             &pending,
                             ClipStatus::Failed,
                             pending.reason,
-                            "Erreur pendant la création du clip".to_owned(),
+                            title.clone(),
                             None,
-                            Some(reason.clone()),
+                            Some(detail.clone()),
                         ),
                     },
                 );
-                send_ui_event(
-                    auto_config,
-                    AppEvent::ClipFailed {
-                        message: format!("Clip ignoré: {reason}"),
-                    },
-                );
+                send_ui_event(auto_config, AppEvent::ClipFailed { message: detail });
                 cooldown.record_save(now);
             }
             Err(error) => {
                 let message = error.to_string();
+                let (title, detail) = clip_failure_messages(&message);
                 send_ui_event(
                     auto_config,
                     AppEvent::ClipStatusChanged {
@@ -662,23 +1280,37 @@ async fn save_ready_pending_clips(
                             &pending,
                             ClipStatus::Failed,
                             pending.reason,
-                            "Erreur pendant la création du clip".to_owned(),
+                            title,
                             None,
-                            Some(message.clone()),
+                            Some(detail.clone()),
                         ),
                     },
                 );
-                send_ui_event(
-                    auto_config,
-                    AppEvent::ClipFailed {
-                        message: format!("Clip: {message}"),
-                    },
-                );
+                send_ui_event(auto_config, AppEvent::ClipFailed { message: detail });
                 cooldown.record_save(now);
             }
         }
     }
     Ok(())
+}
+
+fn clip_failure_messages(message: &str) -> (String, String) {
+    if is_disk_space_error(message) {
+        ("Espace disque insuffisant".to_owned(), message.to_owned())
+    } else {
+        (
+            "Erreur pendant la création du clip".to_owned(),
+            message.to_owned(),
+        )
+    }
+}
+
+fn is_disk_space_error(message: &str) -> bool {
+    let message = message.to_lowercase();
+    message.contains("no space left on device")
+        || message.contains("enospc")
+        || message.contains("not enough space")
+        || message.contains("espace disque insuffisant")
 }
 
 fn requeue_pending_clip(
@@ -688,6 +1320,120 @@ fn requeue_pending_clip(
 ) {
     pending.save_at = now + Duration::from_secs(1);
     pending_clips.push(pending);
+}
+
+async fn recv_auto_command(
+    command_rx: &mut Option<mpsc::UnboundedReceiver<AutoClipCommand>>,
+) -> Option<AutoClipCommand> {
+    match command_rx {
+        Some(command_rx) => command_rx.recv().await,
+        None => std::future::pending::<Option<AutoClipCommand>>().await,
+    }
+}
+
+async fn handle_manual_clip_command(
+    buffer: &ReplayBufferHandle,
+    export_queue: &mut ExportQueue,
+    player_name: Option<&str>,
+    auto_config: &AutoClipConfig,
+    _configured_post_event_delay: Duration,
+) {
+    if auto_config.export_mode == ClipExportMode::Deferred {
+        let clip = pending_manual_export(player_name, auto_config);
+        send_ui_event(
+            auto_config,
+            AppEvent::ClipStatusChanged {
+                payload: clip.status_payload(ClipStatus::PendingExport, None, None, None),
+            },
+        );
+        export_queue.add_pending_clip(clip);
+        return;
+    }
+
+    let mut status = ClipStatusPayload {
+        id: format!("clip_{}", Uuid::new_v4()),
+        status: ClipStatus::Recording,
+        reason: ClipReason::Manual,
+        title: "Capture en cours...".to_owned(),
+        created_at: Utc::now().to_rfc3339(),
+        file_path: None,
+        thumbnail_path: None,
+        duration_seconds: None,
+        size_bytes: None,
+        progress: Some(35),
+        error: None,
+    };
+    let created_at = status.created_at.clone();
+    send_ui_event(
+        auto_config,
+        AppEvent::ClipStatusChanged {
+            payload: status.clone(),
+        },
+    );
+    status.status = ClipStatus::Encoding;
+    status.title = "Encodage du clip...".to_owned();
+    status.progress = Some(72);
+    send_ui_event(
+        auto_config,
+        AppEvent::ClipStatusChanged {
+            payload: status.clone(),
+        },
+    );
+
+    match buffer.save_replay(buffer.manual_clip_context()).await {
+        Ok(SaveReplayOutcome::Saved(replay)) => {
+            if let Some(path) = replay.final_video_path {
+                let size_bytes = std::fs::metadata(&path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                status.status = ClipStatus::Ready;
+                status.title = "Clip prêt".to_owned();
+                status.created_at = created_at;
+                status.file_path = Some(path.clone());
+                status.duration_seconds = Some(auto_config.buffer_seconds);
+                status.size_bytes = Some(size_bytes);
+                status.progress = Some(100);
+                send_ui_event(auto_config, AppEvent::ClipStatusChanged { payload: status });
+                send_ui_event(
+                    auto_config,
+                    AppEvent::ClipSaved {
+                        path,
+                        reason: ClipReason::Manual,
+                        duration_seconds: auto_config.buffer_seconds,
+                        size_bytes,
+                    },
+                );
+            }
+        }
+        Ok(SaveReplayOutcome::NotReadyYet(reason))
+        | Ok(SaveReplayOutcome::SkippedTooOld(reason)) => {
+            status.status = ClipStatus::Failed;
+            status.title = "Erreur pendant la création du clip".to_owned();
+            status.progress = None;
+            status.error = Some(reason.clone());
+            send_ui_event(auto_config, AppEvent::ClipStatusChanged { payload: status });
+            send_ui_event(
+                auto_config,
+                AppEvent::ClipFailed {
+                    message: format!("Clip manuel: {reason}"),
+                },
+            );
+        }
+        Err(error) => {
+            let message = error.to_string();
+            status.status = ClipStatus::Failed;
+            status.title = "Erreur pendant la création du clip".to_owned();
+            status.progress = None;
+            status.error = Some(message.clone());
+            send_ui_event(auto_config, AppEvent::ClipStatusChanged { payload: status });
+            send_ui_event(
+                auto_config,
+                AppEvent::ClipFailed {
+                    message: format!("Clip manuel: {message}"),
+                },
+            );
+        }
+    }
 }
 
 async fn bootstrap(client: &WarThunderClient, state: &mut AutoWatchState) {
@@ -708,6 +1454,7 @@ async fn poll_personal_events(
     client: &WarThunderClient,
     state: &mut AutoWatchState,
     player_name: Option<&str>,
+    triggers: &TriggerConfig,
 ) -> (Vec<DetectedEvent>, bool) {
     let mut events = Vec::new();
     let mut successful_polls = 0usize;
@@ -722,6 +1469,7 @@ async fn poll_personal_events(
                 &mut state.seen_messages,
                 &mut state.seen_events,
                 player_name,
+                triggers,
                 &mut events,
             );
         }
@@ -742,6 +1490,7 @@ async fn poll_personal_events(
                 &mut state.seen_messages,
                 &mut state.seen_events,
                 player_name,
+                triggers,
                 &mut events,
             );
             collect_personal_events(
@@ -750,6 +1499,7 @@ async fn poll_personal_events(
                 &mut state.seen_messages,
                 &mut state.seen_events,
                 player_name,
+                triggers,
                 &mut events,
             );
         }
@@ -765,6 +1515,7 @@ fn collect_personal_events(
     seen_messages: &mut RecentMessageCache,
     seen_events: &mut RecentEventCache,
     player_name: Option<&str>,
+    triggers: &TriggerConfig,
     events: &mut Vec<DetectedEvent>,
 ) {
     for message in messages {
@@ -797,9 +1548,9 @@ fn collect_personal_events(
             ?event,
             "auto-clip parsed message"
         );
-        if is_personal_kill(&event, player_name) {
+        if let Some(reason) = should_clip_event(&event, player_name, triggers) {
             let Some(event_key) = event_key else {
-                debug!(source, ?event, "personal kill has no canonical key");
+                debug!(source, ?event, "clip event has no canonical key");
                 continue;
             };
             let now = Instant::now();
@@ -814,19 +1565,23 @@ fn collect_personal_events(
             }
             events.push(DetectedEvent {
                 event,
+                reason,
                 canonical_key: event_key,
                 detected_at: now,
                 game_time: parse_wt_message_time(message.time.as_deref()),
                 detected_wall_time: SystemTime::now(),
             });
         } else {
-            debug!(source, message = %message.text, ?event, "ignoring non-personal auto-clip event");
+            debug!(source, message = %message.text, ?event, "ignoring disabled or non-matching auto-clip event");
         }
     }
 }
 
 fn raw_message_dedupe_key(source: &str, message: &ChatMessage) -> Option<String> {
-    message.id.map(|id| format!("{source}:{id}"))
+    Some(match message.id {
+        Some(id) => format!("{source}:{id}"),
+        None => message.stable_key_with_prefix(source),
+    })
 }
 
 fn parse_wt_message_time(value: Option<&str>) -> Option<Duration> {
@@ -879,19 +1634,26 @@ fn remember_messages(
     }
 }
 
-fn clip_reason_for_event(event: &WarThunderEvent) -> ClipReason {
-    match event {
-        WarThunderEvent::TargetDestroyed { action, .. } if is_clip_action(action) => {
-            ClipReason::TargetDestroyed
-        }
-        WarThunderEvent::TargetDestroyed { .. } => ClipReason::Unknown,
-        WarThunderEvent::PlayerDestroyed { .. } => ClipReason::PlayerDestroyed,
-        WarThunderEvent::BaseDestroyed { .. } => ClipReason::BaseDestroyed,
-        WarThunderEvent::Unknown(_) => ClipReason::Unknown,
-        WarThunderEvent::CriticalHit { .. } | WarThunderEvent::SevereDamage { .. } => {
-            ClipReason::Unknown
-        }
+pub(crate) fn should_clip_event(
+    event: &WarThunderEvent,
+    player_name: Option<&str>,
+    triggers: &TriggerConfig,
+) -> Option<ClipReason> {
+    let player_name = player_name.map(str::trim).filter(|name| !name.is_empty());
+
+    if triggers.player_destroyed && is_player_destroyed_event(event, player_name) {
+        return Some(ClipReason::PlayerDestroyed);
     }
+
+    if triggers.base_destroyed && is_base_destroyed_event(event) {
+        return Some(ClipReason::BaseDestroyed);
+    }
+
+    if triggers.target_destroyed && is_target_destroyed_event(event, player_name) {
+        return Some(ClipReason::TargetDestroyed);
+    }
+
+    None
 }
 
 fn canonical_event_key(event: &WarThunderEvent) -> Option<String> {
@@ -941,11 +1703,96 @@ fn is_clip_action(action: &str) -> bool {
     matches!(action, "destroyed" | "shot down")
 }
 
-fn is_personal_kill_event(event: &WarThunderEvent) -> bool {
+fn is_target_destroyed_clip_event(event: &WarThunderEvent) -> bool {
     matches!(
         event,
         WarThunderEvent::TargetDestroyed { action, .. } if is_clip_action(action)
     )
+}
+
+fn is_target_destroyed_event(event: &WarThunderEvent, player_name: Option<&str>) -> bool {
+    let Some(player_name) = player_name else {
+        return false;
+    };
+    match event {
+        WarThunderEvent::TargetDestroyed {
+            attacker: Some(attacker),
+            action,
+            target,
+            ..
+        } => {
+            is_clip_action(action)
+                && same_player(attacker, player_name)
+                && !target_contains_player(target.as_deref(), player_name)
+                && !target_is_base(target.as_deref())
+        }
+        _ => false,
+    }
+}
+
+fn is_base_destroyed_event(event: &WarThunderEvent) -> bool {
+    match event {
+        WarThunderEvent::BaseDestroyed { raw } => raw_mentions_base_destroyed(raw),
+        WarThunderEvent::TargetDestroyed {
+            action,
+            target,
+            raw,
+            ..
+        } => {
+            action == "destroyed"
+                && (target_is_base(target.as_deref()) || raw_mentions_base_destroyed(raw))
+        }
+        WarThunderEvent::Unknown(raw) => raw_mentions_base_destroyed(raw),
+        _ => false,
+    }
+}
+
+fn is_player_destroyed_event(event: &WarThunderEvent, player_name: Option<&str>) -> bool {
+    match event {
+        WarThunderEvent::PlayerDestroyed { raw } => raw_mentions_player_destroyed(raw),
+        WarThunderEvent::TargetDestroyed { action, target, .. } => {
+            is_clip_action(action)
+                && player_name.is_some_and(|player_name| {
+                    target_contains_player(target.as_deref(), player_name)
+                })
+        }
+        WarThunderEvent::Unknown(raw) => raw_mentions_player_destroyed(raw),
+        _ => false,
+    }
+}
+
+fn same_player(value: &str, player_name: &str) -> bool {
+    normalize_key_part(value) == normalize_key_part(player_name)
+}
+
+fn target_contains_player(target: Option<&str>, player_name: &str) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    normalize_key_part(target).contains(&normalize_key_part(player_name))
+}
+
+fn target_is_base(target: Option<&str>) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    let target = normalize_key_part(target);
+    target == "a base" || target.contains("base")
+}
+
+fn raw_mentions_base_destroyed(raw: &str) -> bool {
+    let raw = normalize_key_part(raw);
+    raw.contains("base destroyed")
+        || raw.contains("enemy base destroyed")
+        || raw.contains("destroyed a base")
+        || raw.contains("destroyed enemy base")
+}
+
+fn raw_mentions_player_destroyed(raw: &str) -> bool {
+    let raw = normalize_key_part(raw);
+    raw.contains("you have been destroyed")
+        || raw.contains("vehicle destroyed")
+        || raw.contains("player destroyed")
 }
 
 fn event_summary(event: &WarThunderEvent) -> String {
@@ -980,6 +1827,109 @@ fn event_vehicle_target(event: &WarThunderEvent) -> (Option<String>, Option<Stri
     }
 }
 
+fn emit_clip_export_step(
+    auto_config: &AutoClipConfig,
+    clip: &PendingClipExport,
+    total: usize,
+    completed: usize,
+    failed: usize,
+    position: usize,
+    current_step: ExportProgressStep,
+    clip_progress: f32,
+    label: &str,
+) {
+    let progress = if total == 0 {
+        100
+    } else {
+        (((completed as f32 + clip_progress) / total as f32) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8
+    };
+    emit_export_progress(
+        auto_config,
+        ExportProgressPayload {
+            active: true,
+            total,
+            completed,
+            failed,
+            current_clip_id: Some(clip.id.clone()),
+            current_clip_title: Some(clip.title.clone()),
+            current_step,
+            progress,
+            message: format!("{label} {} / {}...", position + 1, total),
+        },
+    );
+}
+
+fn preflight_export_disk_space(
+    buffer: &ReplayBufferHandle,
+    auto_config: &AutoClipConfig,
+    total: usize,
+) -> anyhow::Result<()> {
+    let bytes_per_second =
+        u64::from(auto_config.quality.video_bitrate_kbps).saturating_mul(1000) / 8;
+    let per_clip = bytes_per_second
+        .saturating_mul(auto_config.buffer_seconds.saturating_add(10))
+        .saturating_mul(2);
+    let required_bytes = per_clip.saturating_mul(total as u64);
+    let output_dir = buffer
+        .output_dir()
+        .or(auto_config.output_dir.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("output directory unavailable"))?;
+    let output = crate::doctor::check_free_space(output_dir, required_bytes)?;
+    let temp = crate::doctor::check_free_space(buffer.temp_dir(), required_bytes)?;
+    info!(
+        output_dir = %output.path.display(),
+        output_available_bytes = output.available_bytes,
+        temp_dir = %temp.path.display(),
+        temp_available_bytes = temp.available_bytes,
+        required_bytes,
+        total,
+        "deferred export free space check"
+    );
+    if output.available_bytes < required_bytes || temp.available_bytes < required_bytes {
+        anyhow::bail!(
+            "output_available_bytes={} temp_available_bytes={} required_bytes={}",
+            output.available_bytes,
+            temp.available_bytes,
+            required_bytes
+        );
+    }
+    Ok(())
+}
+
+async fn generate_clip_thumbnail(path: &Path) -> Option<PathBuf> {
+    let video_path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let thumbnail_path = video_path.with_extension("jpg");
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-y", "-i"])
+            .arg(&video_path)
+            .args(["-vframes", "1", "-s", "640x360"])
+            .arg(&thumbnail_path)
+            .output()
+            .ok()?;
+        if output.status.success() && thumbnail_path.exists() {
+            Some(thumbnail_path)
+        } else {
+            debug!(
+                path = %video_path.display(),
+                status = ?output.status.code(),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "failed to generate clip thumbnail"
+            );
+            None
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn emit_export_progress(auto_config: &AutoClipConfig, payload: ExportProgressPayload) {
+    send_ui_event(auto_config, AppEvent::ExportProgressChanged { payload });
+}
+
 fn send_ui_event(auto_config: &AutoClipConfig, event: AppEvent) {
     if let Some(sender) = &auto_config.ui_events {
         debug!(?event, "queueing AppEvent from auto backend");
@@ -989,6 +1939,10 @@ fn send_ui_event(auto_config: &AutoClipConfig, event: AppEvent) {
     } else {
         debug!(?event, "no ui_events channel configured for AppEvent");
     }
+}
+
+fn system_time_rfc3339(time: SystemTime) -> String {
+    chrono::DateTime::<Utc>::from(time).to_rfc3339()
 }
 
 #[cfg(test)]
@@ -1015,6 +1969,26 @@ mod tests {
         }
     }
 
+    fn base_destroyed() -> WarThunderEvent {
+        WarThunderEvent::TargetDestroyed {
+            attacker: Some("dawson16800".to_owned()),
+            action: "destroyed".to_owned(),
+            vehicle: Some("F/A-18C Early".to_owned()),
+            target: Some("a base".to_owned()),
+            raw: "dawson16800 (F/A-18C Early) destroyed a base".to_owned(),
+        }
+    }
+
+    fn player_destroyed_by_enemy() -> WarThunderEvent {
+        WarThunderEvent::TargetDestroyed {
+            attacker: Some("Enemy".to_owned()),
+            action: "shot down".to_owned(),
+            vehicle: Some("MiG-29".to_owned()),
+            target: Some("dawson16800 (F/A-18C Early)".to_owned()),
+            raw: "Enemy (MiG-29) shot down dawson16800 (F/A-18C Early)".to_owned(),
+        }
+    }
+
     fn event_key(event: &WarThunderEvent) -> String {
         canonical_event_key(event).unwrap()
     }
@@ -1032,8 +2006,10 @@ mod tests {
             post_event_delay: Duration::from_secs(post_event_seconds),
             multi_kill_window: Duration::from_secs(5),
             include_history: false,
-            target_destroyed_trigger: true,
+            triggers: TriggerConfig::default(),
             ui_events: None,
+            export_mode: ClipExportMode::Instant,
+            command_rx: None,
         }
     }
 
@@ -1057,6 +2033,43 @@ mod tests {
         assert_eq!(
             effective_post_event_delay(Duration::from_secs(1), 2),
             Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn should_clip_event_returns_target_destroyed_for_personal_kill() {
+        assert_eq!(
+            should_clip_event(
+                &kill("dawson16800"),
+                Some("dawson16800"),
+                &TriggerConfig::default()
+            ),
+            Some(ClipReason::TargetDestroyed)
+        );
+    }
+
+    #[test]
+    fn should_clip_event_returns_base_destroyed_for_destroyed_a_base() {
+        assert_eq!(
+            should_clip_event(
+                &base_destroyed(),
+                Some("dawson16800"),
+                &TriggerConfig::default()
+            ),
+            Some(ClipReason::BaseDestroyed)
+        );
+    }
+
+    #[test]
+    fn should_clip_event_returns_player_destroyed_when_player_is_target() {
+        let triggers = TriggerConfig {
+            player_destroyed: true,
+            ..TriggerConfig::default()
+        };
+
+        assert_eq!(
+            should_clip_event(&player_destroyed_by_enemy(), Some("dawson16800"), &triggers),
+            Some(ClipReason::PlayerDestroyed)
         );
     }
 
@@ -1292,7 +2305,13 @@ mod tests {
 
         assert!(later < pending.save_at);
         assert_eq!(
-            pending_index_for_multi_kill(&[pending], later, None, Duration::from_secs(5)),
+            pending_index_for_multi_kill(
+                &[pending],
+                ClipReason::TargetDestroyed,
+                later,
+                None,
+                Duration::from_secs(5)
+            ),
             None
         );
     }
@@ -1315,11 +2334,66 @@ mod tests {
         assert_eq!(
             pending_index_for_multi_kill(
                 &[pending],
+                ClipReason::TargetDestroyed,
                 now + Duration::from_secs(4),
                 None,
                 Duration::from_secs(5)
             ),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn base_destroyed_inside_window_does_not_use_target_pending_clip() {
+        let now = Instant::now();
+        let first = kill_with_target("[ai] MiG-15bis");
+        let pending = schedule_pending_clip(
+            first.clone(),
+            event_key(&first),
+            ClipReason::TargetDestroyed,
+            "first".to_owned(),
+            now,
+            None,
+            SystemTime::UNIX_EPOCH,
+            Duration::from_secs(10),
+        );
+
+        assert_eq!(
+            pending_index_for_multi_kill(
+                &[pending],
+                ClipReason::BaseDestroyed,
+                now + Duration::from_secs(2),
+                None,
+                Duration::from_secs(5)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn player_destroyed_inside_window_does_not_use_target_pending_clip() {
+        let now = Instant::now();
+        let first = kill_with_target("[ai] MiG-15bis");
+        let pending = schedule_pending_clip(
+            first.clone(),
+            event_key(&first),
+            ClipReason::TargetDestroyed,
+            "first".to_owned(),
+            now,
+            None,
+            SystemTime::UNIX_EPOCH,
+            Duration::from_secs(10),
+        );
+
+        assert_eq!(
+            pending_index_for_multi_kill(
+                &[pending],
+                ClipReason::PlayerDestroyed,
+                now + Duration::from_secs(2),
+                None,
+                Duration::from_secs(5)
+            ),
+            None
         );
     }
 
@@ -1362,6 +2436,7 @@ mod tests {
         assert_eq!(
             pending_index_for_multi_kill(
                 &[pending],
+                ClipReason::TargetDestroyed,
                 now + Duration::from_millis(1),
                 Some(Duration::from_secs(63)),
                 Duration::from_secs(8)
@@ -1389,6 +2464,7 @@ mod tests {
             let detected_at = now + Duration::from_millis(game_seconds);
             if let Some(index) = pending_index_for_multi_kill(
                 &pending_clips,
+                ClipReason::TargetDestroyed,
                 detected_at,
                 Some(Duration::from_secs(game_seconds)),
                 window,
@@ -1489,14 +2565,12 @@ mod tests {
             &mut seen,
             &mut seen_events,
             Some("dawson16800"),
+            &TriggerConfig::default(),
             &mut events,
         );
 
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            clip_reason_for_event(&events[0].event),
-            ClipReason::TargetDestroyed
-        );
+        assert_eq!(events[0].reason, ClipReason::TargetDestroyed);
         assert_eq!(events[0].game_time, None);
     }
 
@@ -1518,6 +2592,7 @@ mod tests {
             &mut seen_messages,
             &mut seen_events,
             Some("dawson16800"),
+            &TriggerConfig::default(),
             &mut events,
         );
         collect_personal_events(
@@ -1531,6 +2606,7 @@ mod tests {
             &mut seen_messages,
             &mut seen_events,
             Some("dawson16800"),
+            &TriggerConfig::default(),
             &mut events,
         );
 
@@ -1563,6 +2639,7 @@ mod tests {
             &mut seen_messages,
             &mut seen_events,
             Some("dawson16800"),
+            &TriggerConfig::default(),
             &mut events,
         );
 
@@ -1589,6 +2666,7 @@ mod tests {
             &mut seen_messages,
             &mut seen_events,
             Some("dawson16800"),
+            &TriggerConfig::default(),
             &mut events,
         );
         collect_personal_events(
@@ -1602,6 +2680,7 @@ mod tests {
             &mut seen_messages,
             &mut seen_events,
             Some("dawson16800"),
+            &TriggerConfig::default(),
             &mut events,
         );
 
@@ -1634,6 +2713,7 @@ mod tests {
             &mut seen_messages,
             &mut seen_events,
             Some("dawson16800"),
+            &TriggerConfig::default(),
             &mut events,
         );
 
@@ -1641,7 +2721,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_message_dedupe_only_uses_real_war_thunder_ids() {
+    fn raw_message_dedupe_uses_id_or_stable_content_key() {
         let with_id = ChatMessage {
             id: Some(42),
             time: None,
@@ -1659,7 +2739,10 @@ mod tests {
             raw_message_dedupe_key("hud:damage", &with_id),
             Some("hud:damage:42".to_owned())
         );
-        assert_eq!(raw_message_dedupe_key("hud:damage", &without_id), None);
+        assert_eq!(
+            raw_message_dedupe_key("hud:damage", &without_id),
+            Some("hud:damage:dawson16800 (F/A-18C Early) destroyed [ai] MiG-15bis".to_owned())
+        );
     }
 
     #[test]
@@ -1701,10 +2784,95 @@ mod tests {
             &mut seen_messages,
             &mut seen_events,
             Some("dawson16800"),
+            &TriggerConfig::default(),
             &mut events,
         );
 
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn different_targets_with_same_message_time_are_distinct_events() {
+        let mut seen_messages = RecentMessageCache::new(100);
+        let mut seen_events = RecentEventCache::new(Duration::from_secs(120));
+        let mut events = Vec::new();
+
+        collect_personal_events(
+            "hud:damage",
+            vec![
+                ChatMessage {
+                    id: Some(1),
+                    time: Some("1:12".to_owned()),
+                    sender: None,
+                    text: "dawson16800 (F/A-18C Early) destroyed [ai] MiG-15bis".to_owned(),
+                },
+                ChatMessage {
+                    id: Some(2),
+                    time: Some("1:12".to_owned()),
+                    sender: None,
+                    text: "dawson16800 (F/A-18C Early) destroyed IT-1".to_owned(),
+                },
+            ],
+            &mut seen_messages,
+            &mut seen_events,
+            Some("dawson16800"),
+            &TriggerConfig::default(),
+            &mut events,
+        );
+
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn auto_collects_base_destroyed_as_base_reason() {
+        let mut seen = RecentMessageCache::new(100);
+        let mut seen_events = RecentEventCache::new(Duration::from_secs(120));
+        let mut events = Vec::new();
+        collect_personal_events(
+            "hud:damage",
+            vec![ChatMessage {
+                id: Some(1),
+                time: Some("2:43".to_owned()),
+                sender: None,
+                text: "dawson16800 (F/A-18C Early) destroyed a base".to_owned(),
+            }],
+            &mut seen,
+            &mut seen_events,
+            Some("dawson16800"),
+            &TriggerConfig::default(),
+            &mut events,
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, ClipReason::BaseDestroyed);
+    }
+
+    #[test]
+    fn auto_collects_player_destroyed_when_trigger_enabled() {
+        let mut seen = RecentMessageCache::new(100);
+        let mut seen_events = RecentEventCache::new(Duration::from_secs(120));
+        let mut events = Vec::new();
+        let triggers = TriggerConfig {
+            player_destroyed: true,
+            ..TriggerConfig::default()
+        };
+        collect_personal_events(
+            "hud:damage",
+            vec![ChatMessage {
+                id: Some(1),
+                time: Some("2:43".to_owned()),
+                sender: None,
+                text: "Enemy (MiG-29) shot down dawson16800 (F/A-18C Early)".to_owned(),
+            }],
+            &mut seen,
+            &mut seen_events,
+            Some("dawson16800"),
+            &triggers,
+            &mut events,
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, ClipReason::PlayerDestroyed);
     }
 
     #[test]
@@ -1723,6 +2891,7 @@ mod tests {
             &mut seen,
             &mut seen_events,
             Some("dawson16800"),
+            &TriggerConfig::default(),
             &mut events,
         );
 
@@ -1749,8 +2918,94 @@ mod tests {
     #[test]
     fn target_destroyed_reason_slug() {
         assert_eq!(
-            clip_reason_for_event(&kill("dawson16800")).slug(),
+            should_clip_event(
+                &kill("dawson16800"),
+                Some("dawson16800"),
+                &TriggerConfig::default()
+            )
+            .unwrap()
+            .slug(),
             "target-destroyed"
         );
+    }
+
+    #[test]
+    fn deferred_target_destroyed_adds_pending_export_without_saving() {
+        let config = test_auto_config(5, 2);
+        let event_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let pending = PendingClip::new(
+            kill("dawson16800"),
+            "kill-1".to_owned(),
+            ClipReason::TargetDestroyed,
+            Instant::now(),
+            Some(Duration::from_secs(120)),
+            event_time,
+            Duration::from_secs(1),
+            "Cible détruite".to_owned(),
+        );
+
+        let clip = pending_export_from_pending(
+            &pending,
+            Some("dawson16800"),
+            &config,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(clip.reason, ClipReason::TargetDestroyed);
+        assert_eq!(clip.status, PendingExportStatus::Pending);
+        assert_eq!(clip.pre_event_seconds, 20);
+        assert_eq!(clip.post_event_seconds, 5);
+        assert_eq!(clip.start_time, event_time - Duration::from_secs(20));
+        assert_eq!(clip.end_time, event_time + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn manual_clip_in_deferred_mode_adds_pending_export() {
+        let mut config = test_auto_config(5, 2);
+        config.export_mode = ClipExportMode::Deferred;
+
+        let clip = pending_manual_export(Some("dawson16800"), &config);
+
+        assert_eq!(clip.reason, ClipReason::Manual);
+        assert_eq!(clip.status, PendingExportStatus::Pending);
+        assert_eq!(clip.pre_event_seconds, config.buffer_seconds);
+        assert_eq!(clip.post_event_seconds, 0);
+        assert_eq!(clip.title, "Clip manuel");
+    }
+
+    #[test]
+    fn multi_kill_creates_one_pending_export_with_multi_title() {
+        let config = test_auto_config(5, 2);
+        let event_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut pending = PendingClip::new(
+            kill("dawson16800"),
+            "kill-1".to_owned(),
+            ClipReason::TargetDestroyed,
+            Instant::now(),
+            Some(Duration::from_secs(120)),
+            event_time,
+            Duration::from_secs(1),
+            "Kill 1".to_owned(),
+        );
+        assert!(pending.add_event(
+            kill_with_target("[ai] MiG-21"),
+            "kill-2".to_owned(),
+            Instant::now() + Duration::from_secs(2),
+            Some(Duration::from_secs(122)),
+            event_time + Duration::from_secs(2),
+            Duration::from_secs(1),
+            "Kill 2".to_owned(),
+        ));
+
+        let clip = pending_export_from_pending(
+            &pending,
+            Some("dawson16800"),
+            &config,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(clip.reason, ClipReason::MultiKill);
+        assert_eq!(clip.events.len(), 2);
+        assert_eq!(clip.title, "Multi-kill — 2 kills");
     }
 }

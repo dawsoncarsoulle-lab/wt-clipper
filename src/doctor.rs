@@ -18,6 +18,9 @@ use crate::{
     cli::CaptureSource,
 };
 
+const ONE_GIB: u64 = 1024 * 1024 * 1024;
+const FIVE_GIB: u64 = 5 * ONE_GIB;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DoctorStatus {
@@ -38,6 +41,14 @@ pub struct DoctorCheck {
 pub struct DoctorReport {
     pub checks: Vec<DoctorCheck>,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreeSpaceReport {
+    pub path: PathBuf,
+    pub available_bytes: u64,
+    pub required_bytes: u64,
+    pub status: DoctorStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,13 +78,41 @@ pub async fn build_report(output_dir: Option<PathBuf>) -> DoctorReport {
     checks.push(check_x11_window(session_kind));
     checks.push(check_audio_source());
     checks.push(check_war_thunder_localhost().await);
-    checks.push(check_writable_dir(
-        "Output dir writable",
-        output_dir.map(Ok).unwrap_or_else(default_output_dir),
-    ));
+    let output_dir = output_dir.map(Ok).unwrap_or_else(default_output_dir);
+    match output_dir {
+        Ok(output_dir) => {
+            checks.push(check_writable_dir(
+                "Output dir writable",
+                Ok(output_dir.clone()),
+            ));
+            checks.push(check_free_space_for_doctor(
+                "Output dir free space",
+                Ok(output_dir),
+                FIVE_GIB,
+            ));
+        }
+        Err(error) => {
+            let message = error.to_string();
+            checks.push(DoctorCheck::error(
+                "Output dir writable",
+                format!("could not resolve directory: {message}"),
+                Some("set HOME or pass an explicit output directory"),
+            ));
+            checks.push(DoctorCheck::error(
+                "Output dir free space",
+                format!("could not resolve directory: {message}"),
+                Some("set HOME or pass an explicit output directory"),
+            ));
+        }
+    }
     checks.push(check_writable_dir(
         "Temp dir writable",
         Ok(std::env::temp_dir().join("wt-clipper-buffer")),
+    ));
+    checks.push(check_free_space_for_doctor(
+        "Temp dir free space",
+        Ok(std::env::temp_dir().join("wt-clipper-buffer")),
+        FIVE_GIB,
     ));
 
     let summary = summary_for_checks(&checks);
@@ -362,6 +401,77 @@ fn check_writable_dir(name: &str, dir: anyhow::Result<PathBuf>) -> DoctorCheck {
             format!("{} ({error})", dir.display()),
             Some("check directory permissions"),
         ),
+    }
+}
+
+pub fn check_free_space(path: &Path, required_bytes: u64) -> anyhow::Result<FreeSpaceReport> {
+    fs::create_dir_all(path)?;
+    let available_bytes = fs2::available_space(path)?;
+    let status = if available_bytes < ONE_GIB || available_bytes < required_bytes {
+        DoctorStatus::Error
+    } else if available_bytes < FIVE_GIB {
+        DoctorStatus::Warn
+    } else {
+        DoctorStatus::Ok
+    };
+    Ok(FreeSpaceReport {
+        path: path.to_path_buf(),
+        available_bytes,
+        required_bytes,
+        status,
+    })
+}
+
+fn check_free_space_for_doctor(
+    name: &str,
+    dir: anyhow::Result<PathBuf>,
+    required_bytes: u64,
+) -> DoctorCheck {
+    let dir = match dir {
+        Ok(dir) => dir,
+        Err(error) => {
+            return DoctorCheck::error(
+                name,
+                format!("could not resolve directory: {error}"),
+                Some("set HOME or pass an explicit output directory"),
+            )
+        }
+    };
+
+    match check_free_space(&dir, required_bytes) {
+        Ok(report) => {
+            let message = format!(
+                "{} free at {}",
+                format_bytes(report.available_bytes),
+                report.path.display()
+            );
+            match report.status {
+                DoctorStatus::Ok => DoctorCheck::ok(name, message),
+                DoctorStatus::Warn => DoctorCheck::warn(
+                    name,
+                    message,
+                    Some("keep more than 5 GiB free for reliable clip creation"),
+                ),
+                DoctorStatus::Error => DoctorCheck::error(
+                    name,
+                    message,
+                    Some("free disk space before recording or choose another output directory"),
+                ),
+            }
+        }
+        Err(error) => DoctorCheck::error(
+            name,
+            format!("{} ({error})", dir.display()),
+            Some("check directory permissions and mounted filesystem state"),
+        ),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= ONE_GIB {
+        format!("{:.1} GiB", bytes as f64 / ONE_GIB as f64)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 

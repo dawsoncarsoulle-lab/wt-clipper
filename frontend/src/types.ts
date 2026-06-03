@@ -11,8 +11,12 @@ export type ClipStatus =
   | "recording"
   | "encoding"
   | "saving"
+  | "pending_export"
+  | "exporting"
   | "ready"
   | "failed";
+
+export type ExportMode = "instant" | "deferred";
 
 export type ClipInfo = {
   path: string;
@@ -54,6 +58,43 @@ export type GalleryClipItem = {
   error?: string;
 };
 
+export type PendingClipExportDto = {
+  id: string;
+  status: "pending" | "exporting" | "ready" | "failed";
+  reason: ClipReason;
+  title: string;
+  createdAt: string;
+  progress?: number | null;
+  error?: string | null;
+};
+
+export type ExportProgressStep =
+  | "preparing"
+  | "extracting"
+  | "encoding"
+  | "thumbnail"
+  | "saving"
+  | "done"
+  | "failed";
+
+export type ExportProgressPayload = {
+  active: boolean;
+  total: number;
+  completed: number;
+  failed: number;
+  currentClipId?: string | null;
+  currentClipTitle?: string | null;
+  currentStep: ExportProgressStep;
+  progress: number;
+  message: string;
+};
+
+export type ExportSummary = {
+  total: number;
+  completed: number;
+  failed: number;
+};
+
 export type AppConfig = {
   clip: {
     seconds: number;
@@ -66,6 +107,7 @@ export type AppConfig = {
     video_bitrate_kbps: number;
     source: "screen" | "window";
     keep_segments: boolean;
+    export_mode: ExportMode;
   };
   war_thunder: {
     base_url: string;
@@ -75,6 +117,8 @@ export type AppConfig = {
   };
   triggers: {
     target_destroyed: boolean;
+    base_destroyed: boolean;
+    player_destroyed: boolean;
   };
   storage: {
     max_clips: number;

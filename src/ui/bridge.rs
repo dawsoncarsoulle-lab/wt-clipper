@@ -12,8 +12,37 @@ pub enum ClipStatus {
     Recording,
     Encoding,
     Saving,
+    #[serde(rename = "pending_export")]
+    PendingExport,
+    Exporting,
     Ready,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportProgressStep {
+    Preparing,
+    Extracting,
+    Encoding,
+    Thumbnail,
+    Saving,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportProgressPayload {
+    pub active: bool,
+    pub total: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub current_clip_id: Option<String>,
+    pub current_clip_title: Option<String>,
+    pub current_step: ExportProgressStep,
+    pub progress: u8,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +80,9 @@ pub enum AppEvent {
     },
     ClipStatusChanged {
         payload: ClipStatusPayload,
+    },
+    ExportProgressChanged {
+        payload: ExportProgressPayload,
     },
     ClipFailed {
         message: String,

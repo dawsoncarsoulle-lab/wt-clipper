@@ -5,7 +5,9 @@ import type {
   ClipStatusChangedPayload,
   DoctorReport,
   EventEntry,
+  ExportProgressPayload,
   GalleryClipItem,
+  PendingClipExportDto,
 } from "./types";
 
 type AppState = {
@@ -22,12 +24,15 @@ type AppState = {
   config: AppConfig | null;
   diagnostics: DoctorReport | null;
   diagnosticsRunning: boolean;
+  exportProgress: ExportProgressPayload | null;
   events: EventEntry[];
   toast: string | null;
   setActiveView: (view: AppState["activeView"]) => void;
   setConfig: (config: AppConfig) => void;
   setClips: (clips: ClipInfo[]) => void;
   updateClipStatus: (payload: ClipStatusChangedPayload) => void;
+  setPendingExportClips: (clips: PendingClipExportDto[]) => void;
+  setExportProgress: (payload: ExportProgressPayload | null) => void;
   setDiagnostics: (report: DoctorReport | null) => void;
   setDiagnosticsRunning: (running: boolean) => void;
   setWtConnected: (connected: boolean) => void;
@@ -53,6 +58,7 @@ export const useAppStore = create<AppState>((set) => ({
   config: null,
   diagnostics: null,
   diagnosticsRunning: false,
+  exportProgress: null,
   events: [],
   toast: null,
   setActiveView: (activeView) => set({ activeView }),
@@ -100,6 +106,27 @@ export const useAppStore = create<AppState>((set) => ({
       const others = state.processingClips.filter((clip) => clip.id !== payload.id);
       return { processingClips: [item, ...others] };
     }),
+  setPendingExportClips: (clips) =>
+    set((state) => {
+      const items = clips.map((clip): GalleryClipItem => ({
+        id: clip.id,
+        status:
+          clip.status === "pending"
+            ? "pending_export"
+            : clip.status === "exporting"
+              ? "exporting"
+              : clip.status,
+        reason: clip.reason,
+        createdAt: clip.createdAt,
+        title: clip.title,
+        progress: clip.progress ?? undefined,
+        error: clip.error ?? undefined,
+      }));
+      const itemIds = new Set(items.map((item) => item.id));
+      const others = state.processingClips.filter((clip) => !itemIds.has(clip.id));
+      return { processingClips: [...items, ...others] };
+    }),
+  setExportProgress: (exportProgress) => set({ exportProgress }),
   addEvent: (event) =>
     set((state) => ({
       sessionKills:

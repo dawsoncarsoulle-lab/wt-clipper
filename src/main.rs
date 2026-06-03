@@ -143,8 +143,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     ),
                     multi_kill_window: Duration::from_secs(config.clip.multi_kill_window_seconds),
                     include_history,
-                    target_destroyed_trigger: config.triggers.target_destroyed,
+                    triggers: config.triggers.clone(),
                     ui_events: None,
+                    export_mode: config.clip.export_mode,
+                    command_rx: None,
                 },
             )
             .await
@@ -298,8 +300,10 @@ fn spawn_gui_runtime(
                     post_event_delay: Duration::from_secs(config.clip.post_event_seconds),
                     multi_kill_window: Duration::from_secs(config.clip.multi_kill_window_seconds),
                     include_history: false,
-                    target_destroyed_trigger: config.triggers.target_destroyed,
+                    triggers: config.triggers.clone(),
                     ui_events: Some(event_tx.clone()),
+                    export_mode: config.clip.export_mode,
+                    command_rx: None,
                 },
             );
 

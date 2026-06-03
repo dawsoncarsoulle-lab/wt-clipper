@@ -11,6 +11,7 @@ import {
   Clapperboard,
   Clock3,
   Cpu,
+  Download,
   FolderOpen,
   Gauge,
   HardDrive,
@@ -32,7 +33,14 @@ import {
 } from "lucide-react";
 import { useAppStore } from "./store";
 import type { AppConfig, ClipInfo, ClipReason, DoctorReport, RuntimeStatus } from "./types";
-import type { ClipStatus, ClipStatusChangedPayload, GalleryClipItem } from "./types";
+import type {
+  ClipStatus,
+  ClipStatusChangedPayload,
+  ExportProgressPayload,
+  ExportSummary,
+  GalleryClipItem,
+  PendingClipExportDto,
+} from "./types";
 import brandLogo from "./assets/brand/WT_clipper_brand.png";
 
 const nav = [
@@ -114,11 +122,17 @@ export function App() {
         store.updateClipStatus(event.payload);
         if (event.payload.status === "detected") {
           store.showToast("Clip détecté — création en cours...");
+        } else if (event.payload.status === "pending_export") {
+          store.showToast("Clip en attente d'export");
         } else if (event.payload.status === "ready") {
           store.showToast("Clip prêt");
         } else if (event.payload.status === "failed") {
           store.showToast("Erreur pendant la création du clip");
         }
+      }),
+      listen<ExportProgressPayload>("export_progress_changed", (event) => {
+        console.info("[FRONTEND] received export_progress_changed", event.payload);
+        store.setExportProgress(event.payload);
       }),
       listen<{ message: string }>("clip-failed", (event) => {
         console.info("[FRONTEND] received clip-failed", event.payload);
@@ -152,6 +166,7 @@ export function App() {
       store.setConfig(config);
       store.setDiagnostics(diagnostics);
       await refreshClips();
+      await refreshPendingExportClips();
       await refreshRuntimeStatus();
     } catch (error) {
       store.showToast(String(error));
@@ -161,6 +176,12 @@ export function App() {
   async function refreshClips() {
     const clips = await invoke<ClipInfo[]>("load_clips");
     store.setClips(clips);
+    return clips;
+  }
+
+  async function refreshPendingExportClips() {
+    const clips = await invoke<PendingClipExportDto[]>("get_pending_export_clips");
+    store.setPendingExportClips(clips);
     return clips;
   }
 
@@ -225,6 +246,7 @@ export function App() {
         )}
       </AnimatePresence>
       <ProcessingPopup />
+      <ExportProgressModal />
     </div>
   );
 }
@@ -386,7 +408,10 @@ function Dashboard() {
 function ProcessingPopup() {
   const { processingClips } = useAppStore();
   const visibleClips = processingClips.filter(
-    (clip) => clip.status !== "ready" || clip.filePath == null,
+    (clip) =>
+      ["detected", "recording", "encoding", "saving", "exporting", "failed"].includes(
+        clip.status,
+      ) && (clip.status !== "ready" || clip.filePath == null),
   );
 
   if (visibleClips.length === 0) {
@@ -440,12 +465,101 @@ function ProcessingPopup() {
                 <span>{clip.status === "failed" ? "Erreur" : "En cours"}</span>
               </div>
               {clip.status === "failed" && clip.error && (
-                <p className="mt-2 max-h-10 overflow-hidden text-xs text-[#ffb7aa]">{clip.error}</p>
+                <p className="mt-2 break-words text-xs text-[#ffb7aa]">{clip.error}</p>
               )}
             </div>
           ))}
         </div>
       </motion.aside>
+    </AnimatePresence>
+  );
+}
+
+function ExportProgressModal() {
+  const { exportProgress, setExportProgress, setActiveView } = useAppStore();
+  if (!exportProgress) return null;
+  const progressState = exportProgress;
+
+  const finished = !progressState.active;
+  const hasErrors = progressState.failed > 0;
+
+  function close() {
+    if (
+      progressState.active &&
+      !window.confirm("Un export est en cours. Fermer cette fenêtre ne stoppe pas l'export. Continuer ?")
+    ) {
+      return;
+    }
+    setExportProgress(null);
+  }
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        className="modal-backdrop"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+      >
+        <motion.section
+          className="export-modal"
+          initial={{ opacity: 0, y: 18, scale: 0.98 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: 18, scale: 0.98 }}
+        >
+          <div className="flex items-start justify-between gap-5">
+            <div>
+              <div className="text-xs uppercase tracking-wide text-zinc-500">
+                {finished ? "Export terminé" : "Export des clips en cours"}
+              </div>
+              <h2 className="mt-1 text-xl font-black text-white">
+                {finished
+                  ? hasErrors
+                    ? `${progressState.completed} clips exportés, ${progressState.failed} erreur`
+                    : "Export terminé"
+                  : `Clip ${Math.min(progressState.completed + 1, progressState.total)} / ${progressState.total}`}
+              </h2>
+            </div>
+            <button className="icon-button" onClick={close} disabled={progressState.active}>
+              <XCircle className="h-4 w-4" />
+            </button>
+          </div>
+          <div className="mt-5 rounded-md border border-white/10 bg-white/[0.035] p-4">
+            <div className="text-sm font-bold text-white">
+              {progressState.currentClipTitle ?? progressState.message}
+            </div>
+            <div className="mt-1 text-xs uppercase text-zinc-500">{progressState.currentStep}</div>
+            <div className="mt-4 h-3 overflow-hidden rounded-full bg-white/10">
+              <div className="processing-progress" style={{ width: `${progressState.progress}%` }} />
+            </div>
+            <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
+              <span>
+                {progressState.completed} terminés · {progressState.failed} erreurs
+              </span>
+              <span>{Math.round(progressState.progress)}%</span>
+            </div>
+          </div>
+          {!finished && (
+            <p className="mt-4 text-sm text-[#ffd0c3]">Ne fermez pas l'application pendant l'export.</p>
+          )}
+          {finished && hasErrors && (
+            <p className="mt-4 text-sm text-[#ffb7aa]">
+              Libérez de l'espace disque puis réessayez si l'erreur vient du stockage.
+            </p>
+          )}
+          {finished && (
+            <div className="mt-5 flex justify-end gap-2">
+              <button className="ghost-button" onClick={() => setActiveView("clips")}>
+                <Clapperboard className="h-4 w-4" />
+                Ouvrir la galerie
+              </button>
+              <button className="primary-action w-fit px-5" onClick={close}>
+                Fermer
+              </button>
+            </div>
+          )}
+        </motion.section>
+      </motion.div>
     </AnimatePresence>
   );
 }
@@ -470,7 +584,7 @@ function Clips() {
     const readyPaths = new Set(clips.map((clip) => clip.path));
     const processing = processingClips.filter((clip) => !clip.filePath || !readyPaths.has(clip.filePath));
     const ready = clips.map(clipToGalleryItem);
-    return [...processing, ...ready].filter((clip) => {
+    return [...processing, ...ready].sort(compareGalleryItems).filter((clip) => {
       const haystack = `${clip.title} ${clip.filePath ?? ""}`.toLowerCase();
       const matchesQuery = haystack.includes(query.toLowerCase());
       const matchesFilter = filter === "all" || clip.reason === filter;
@@ -478,8 +592,9 @@ function Clips() {
     });
   }, [clips, processingClips, query, filter]);
   const activeProcessingCount = processingClips.filter((clip) =>
-    ["detected", "recording", "encoding", "saving"].includes(clip.status),
+    ["detected", "recording", "encoding", "saving", "exporting"].includes(clip.status),
   ).length;
+  const pendingExportCount = processingClips.filter((clip) => clip.status === "pending_export").length;
 
   async function refresh() {
     const next = await invoke<ClipInfo[]>("load_clips");
@@ -492,6 +607,17 @@ function Clips() {
     showToast("Clip supprimé");
   }
 
+  async function exportNow() {
+    showToast("Export des clips en attente...");
+    const summary = await invoke<ExportSummary>("export_pending_clips");
+    await refresh();
+    if (summary.failed > 0) {
+      showToast(`${summary.completed} clips exportés, ${summary.failed} erreur`);
+    } else {
+      showToast("Export terminé");
+    }
+  }
+
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between">
@@ -500,6 +626,12 @@ function Clips() {
           <p className="text-sm text-zinc-500">{galleryItems.length} clips affichés</p>
         </div>
         <div className="flex gap-2">
+          {pendingExportCount > 0 && (
+            <button className="primary-action w-fit px-5" onClick={() => void exportNow()}>
+              <Download className="h-4 w-4" />
+              Exporter maintenant
+            </button>
+          )}
           <button className="ghost-button" onClick={() => void refresh()}>
             <RefreshCcw className="h-4 w-4" />
             Rafraîchir
@@ -526,6 +658,12 @@ function Clips() {
       {activeProcessingCount > 0 && (
         <div className="processing-banner">
           {activeProcessingCount} clip{activeProcessingCount > 1 ? "s" : ""} en cours de traitement
+        </div>
+      )}
+      {pendingExportCount > 0 && (
+        <div className="processing-banner pending-export-banner">
+          {pendingExportCount} clip{pendingExportCount > 1 ? "s" : ""} en attente d'export
+          <button onClick={() => void exportNow()}>Exporter maintenant</button>
         </div>
       )}
       {galleryItems.length === 0 ? (
@@ -565,6 +703,17 @@ function clipToGalleryItem(clip: ClipInfo): GalleryClipItem {
   };
 }
 
+function compareGalleryItems(a: GalleryClipItem, b: GalleryClipItem) {
+  const rank = (status: ClipStatus) => {
+    if (status === "pending_export") return 0;
+    if (status === "exporting") return 1;
+    if (status === "failed") return 2;
+    if (status === "ready") return 4;
+    return 3;
+  };
+  return rank(a.status) - rank(b.status) || secondsAgo(a.createdAt) - secondsAgo(b.createdAt);
+}
+
 function galleryItemToClipInfo(clip: GalleryClipItem): ClipInfo {
   return {
     path: clip.filePath ?? "",
@@ -580,34 +729,59 @@ function galleryItemToClipInfo(clip: GalleryClipItem): ClipInfo {
 
 function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
   const failed = clip.status === "failed";
+  const pending = clip.status === "pending_export";
+  const exporting = clip.status === "exporting";
   const progress = clip.progress ?? (failed ? 0 : 48);
+  async function exportNow() {
+    await invoke<ExportSummary>("export_pending_clips");
+  }
   return (
     <motion.article whileHover={{ y: -4 }} className={`clip-card processing-card ${failed ? "failed" : ""}`}>
       <div className="clip-thumb processing-thumb">
         <div className="processing-skeleton" />
         <div className="processing-loader">
-          {failed ? <AlertTriangle className="h-7 w-7 text-[#ff8d7a]" /> : <RefreshCcw className="h-7 w-7 animate-spin text-ember" />}
+          {failed ? (
+            <AlertTriangle className="h-7 w-7 text-[#ff8d7a]" />
+          ) : pending ? (
+            <Clock3 className="h-7 w-7 text-amberline" />
+          ) : (
+            <RefreshCcw className={`h-7 w-7 text-ember ${exporting ? "animate-spin" : ""}`} />
+          )}
         </div>
         <span className={`reason reason-${clip.reason}`}>{reasonLabel[clip.reason]}</span>
       </div>
       <div className="p-3">
-        <div className="truncate text-sm font-bold text-white">{processingReasonLabel[clip.reason]}</div>
+        <div className="truncate text-sm font-bold text-white">{clip.title || processingReasonLabel[clip.reason]}</div>
         <div className="mt-1 text-sm text-zinc-400">{getClipStatusLabel(clip.status)}</div>
-        <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
-          <div
-            className={`processing-progress ${clip.progress == null && !failed ? "indeterminate" : ""}`}
-            style={{ width: `${Math.max(4, Math.min(100, progress))}%` }}
-          />
-        </div>
-        <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
-          <span>{relativeCreatedAt(clip.createdAt)}</span>
-          {!failed && <span>{Math.round(progress)}%</span>}
-        </div>
+        {!pending && (
+          <>
+            <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
+              <div
+                className={`processing-progress ${clip.progress == null && !failed ? "indeterminate" : ""}`}
+                style={{ width: `${Math.max(4, Math.min(100, progress))}%` }}
+              />
+            </div>
+            <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
+              <span>{relativeCreatedAt(clip.createdAt)}</span>
+              {!failed && <span>{Math.round(progress)}%</span>}
+            </div>
+          </>
+        )}
+        {pending && (
+          <button className="delete-button mt-3" onClick={() => void exportNow()}>
+            <Download className="h-3.5 w-3.5" />
+            Exporter maintenant
+          </button>
+        )}
         {failed && (
-          <details className="mt-3 rounded-md border border-[#ff8d7a]/25 bg-[#351711]/45 px-3 py-2 text-xs text-[#ffb7aa]">
-            <summary className="cursor-pointer font-bold text-[#ffd0c7]">Voir détails</summary>
+          <div className="mt-3 rounded-md border border-[#ff8d7a]/25 bg-[#351711]/45 px-3 py-2 text-xs text-[#ffb7aa]">
+            <div className="font-bold text-[#ffd0c7]">Détails</div>
             <p className="mt-2 break-words">{clip.error ?? "Erreur pendant la création du clip"}</p>
-          </details>
+            <button className="delete-button mt-3" onClick={() => void exportNow()}>
+              <RefreshCcw className="h-3.5 w-3.5" />
+              Réessayer
+            </button>
+          </div>
         )}
       </div>
     </motion.article>
@@ -624,6 +798,10 @@ function getClipStatusLabel(status: ClipStatus): string {
       return "Encodage du clip...";
     case "saving":
       return "Sauvegarde...";
+    case "pending_export":
+      return "En attente d'export";
+    case "exporting":
+      return "Export en cours...";
     case "ready":
       return "Prêt";
     case "failed":
@@ -787,6 +965,18 @@ function Configuration() {
             <option value="high">high</option>
           </select>
         </Field>
+        <Field label="Mode d'export">
+          <select
+            value={draft.clip.export_mode}
+            onChange={(e) => updateClip("export_mode", e.target.value as AppConfig["clip"]["export_mode"])}
+          >
+            <option value="deferred">Différé recommandé</option>
+            <option value="instant">Instantané</option>
+          </select>
+          <p className="field-help">
+            Le mode différé garde les clips en attente pendant la partie puis les exporte manuellement. Il réduit la charge pendant le gameplay.
+          </p>
+        </Field>
         <Field label="fps">
           <input type="number" value={draft.clip.fps} onChange={(e) => updateClip("fps", Number(e.target.value))} />
         </Field>
@@ -798,8 +988,28 @@ function Configuration() {
         <h2 className="mb-3 text-lg font-bold text-white">Triggers</h2>
         <div className="trigger-grid">
           <label className="trigger-toggle">
-            <input type="checkbox" checked readOnly />
-            <span>target_destroyed</span>
+            <input
+              type="checkbox"
+              checked={draft.triggers.target_destroyed}
+              onChange={(event) => updateTrigger("target_destroyed", event.target.checked)}
+            />
+            <span>Cible détruite</span>
+          </label>
+          <label className="trigger-toggle">
+            <input
+              type="checkbox"
+              checked={draft.triggers.base_destroyed}
+              onChange={(event) => updateTrigger("base_destroyed", event.target.checked)}
+            />
+            <span>Base détruite</span>
+          </label>
+          <label className="trigger-toggle">
+            <input
+              type="checkbox"
+              checked={draft.triggers.player_destroyed}
+              onChange={(event) => updateTrigger("player_destroyed", event.target.checked)}
+            />
+            <span>Joueur détruit</span>
           </label>
         </div>
       </div>

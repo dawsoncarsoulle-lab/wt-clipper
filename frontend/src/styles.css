@@ -269,6 +269,17 @@ select {
   font-weight: 800;
 }
 
+.pending-export-banner {
+  justify-content: space-between;
+}
+
+.pending-export-banner button {
+  border-left: 1px solid rgba(255,255,255,.12);
+  padding-left: 10px;
+  color: white;
+  font-weight: 900;
+}
+
 .processing-card {
   border-color: rgba(255, 90, 47, .22);
 }
@@ -349,6 +360,25 @@ select {
 .processing-progress.indeterminate {
   width: 42% !important;
   animation: progress-slide 1.1s ease-in-out infinite;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  background: rgba(4, 7, 12, .72);
+  backdrop-filter: blur(10px);
+}
+
+.export-modal {
+  width: min(520px, calc(100vw - 48px));
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 8px;
+  background: rgba(17,23,34,.98);
+  box-shadow: 0 24px 80px rgba(0,0,0,.44);
+  padding: 22px;
 }
 
 .clip-overlay {
@@ -455,6 +485,13 @@ select {
 .field select:disabled {
   cursor: not-allowed;
   opacity: .55;
+}
+
+.field-help {
+  margin: 0;
+  color: #8b95a7;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .field select option {
