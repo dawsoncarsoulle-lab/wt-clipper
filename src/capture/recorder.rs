@@ -11,7 +11,12 @@ use gstreamer as gst;
 use tracing::info;
 
 use crate::{
-    capture::{portal::PortalScreencastSession, quality::VideoQuality, x11::resolve_x11_window_id},
+    capture::{
+        audio::{resolve_system_audio_source, AudioCaptureSource},
+        portal::PortalScreencastSession,
+        quality::VideoQuality,
+        x11::resolve_x11_window_id,
+    },
     cli::CaptureSource,
 };
 
@@ -35,6 +40,12 @@ pub async fn record(request: RecordingRequest) -> anyhow::Result<()> {
 
     gst::init().context("failed to initialize GStreamer")?;
     info!(video = %request.quality.log_summary(), "recording video target");
+    let audio_source = resolve_system_audio_source();
+    if let Some(audio_source) = &audio_source {
+        info!(device = %audio_source.device, "recording system audio");
+    } else {
+        info!("recording without audio");
+    }
 
     let mut portal_session = None;
     let backend = choose_backend(&std::env::var("XDG_SESSION_TYPE").unwrap_or_default());
@@ -56,6 +67,7 @@ pub async fn record(request: RecordingRequest) -> anyhow::Result<()> {
                 request.source,
                 &request.output_path,
                 request.quality,
+                audio_source.as_ref(),
             )?
         }
         CaptureBackend::ManualPipeWirePath(path) => pipeline_description(
@@ -63,12 +75,14 @@ pub async fn record(request: RecordingRequest) -> anyhow::Result<()> {
             request.source,
             &request.output_path,
             request.quality,
+            audio_source.as_ref(),
         )?,
         CaptureBackend::ManualPipeWireTarget(target) => pipeline_description(
             PipelineSource::PipeWireTarget(target),
             request.source,
             &request.output_path,
             request.quality,
+            audio_source.as_ref(),
         )?,
         CaptureBackend::PortalPipeWire => {
             let session = PortalScreencastSession::start(request.source).await?;
@@ -80,6 +94,7 @@ pub async fn record(request: RecordingRequest) -> anyhow::Result<()> {
                 request.source,
                 &request.output_path,
                 request.quality,
+                audio_source.as_ref(),
             )?;
             portal_session = Some(session);
             description
@@ -217,6 +232,7 @@ pub(crate) fn pipeline_description(
     capture_source: CaptureSource,
     output_path: &Path,
     quality: VideoQuality,
+    audio_source: Option<&AudioCaptureSource>,
 ) -> anyhow::Result<String> {
     let location = escape_gst_string(&output_path.to_string_lossy());
     let raw_caps = quality.raw_video_caps();
@@ -225,25 +241,65 @@ pub(crate) fn pipeline_description(
     match source {
         PipelineSource::X11 { window_id } => {
             let source_chain = x11_source_chain(capture_source, window_id)?;
-            Ok(format!(
-                "{source_chain} ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! webmmux ! filesink location=\"{location}\""
+            Ok(recording_mux_pipeline(
+                &source_chain,
+                &raw_caps,
+                &encoder,
+                &location,
+                audio_source,
             ))
         }
         PipelineSource::PipeWirePath(path) => {
             let path = escape_gst_string(&path);
-            Ok(format!(
-                "pipewiresrc path=\"{path}\" do-timestamp=true ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! webmmux ! filesink location=\"{location}\""
+            let source_chain = format!("pipewiresrc path=\"{path}\" do-timestamp=true");
+            Ok(recording_mux_pipeline(
+                &source_chain,
+                &raw_caps,
+                &encoder,
+                &location,
+                audio_source,
             ))
         }
         PipelineSource::PipeWireTarget(target) => {
             let target = escape_gst_string(&target);
-            Ok(format!(
-                "pipewiresrc target-object=\"{target}\" do-timestamp=true ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! webmmux ! filesink location=\"{location}\""
+            let source_chain = format!("pipewiresrc target-object=\"{target}\" do-timestamp=true");
+            Ok(recording_mux_pipeline(
+                &source_chain,
+                &raw_caps,
+                &encoder,
+                &location,
+                audio_source,
             ))
         }
-        PipelineSource::PipeWirePortal { fd, node_id } => Ok(format!(
-            "pipewiresrc fd={fd} path={node_id} do-timestamp=true ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! webmmux ! filesink location=\"{location}\""
-        )),
+        PipelineSource::PipeWirePortal { fd, node_id } => {
+            let source_chain = format!("pipewiresrc fd={fd} path={node_id} do-timestamp=true");
+            Ok(recording_mux_pipeline(
+                &source_chain,
+                &raw_caps,
+                &encoder,
+                &location,
+                audio_source,
+            ))
+        }
+    }
+}
+
+fn recording_mux_pipeline(
+    video_source_chain: &str,
+    raw_caps: &str,
+    encoder: &str,
+    location: &str,
+    audio_source: Option<&AudioCaptureSource>,
+) -> String {
+    let video_chain =
+        format!("{video_source_chain} ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder}");
+    if let Some(audio_source) = audio_source {
+        let audio_chain = audio_source.source_chain();
+        format!(
+            "webmmux name=mux ! filesink location=\"{location}\" {video_chain} ! queue ! mux. {audio_chain} ! queue ! mux."
+        )
+    } else {
+        format!("{video_chain} ! webmmux ! filesink location=\"{location}\"")
     }
 }
 
@@ -321,6 +377,7 @@ mod tests {
             CaptureSource::Screen,
             Path::new("/tmp/out.webm"),
             VideoQuality::default(),
+            None,
         )
         .unwrap();
 
@@ -340,6 +397,7 @@ mod tests {
             CaptureSource::Screen,
             Path::new("/tmp/out.webm"),
             VideoQuality::default(),
+            None,
         )
         .unwrap();
 
@@ -357,6 +415,7 @@ mod tests {
             CaptureSource::Window,
             Path::new("/tmp/out.webm"),
             VideoQuality::default(),
+            None,
         )
         .unwrap();
 
@@ -372,10 +431,30 @@ mod tests {
             CaptureSource::Window,
             Path::new("/tmp/out.webm"),
             VideoQuality::default(),
+            None,
         )
         .unwrap_err()
         .to_string();
 
         assert!(error.contains("no X11 window id"));
+    }
+
+    #[test]
+    fn recording_pipeline_can_mux_system_audio() {
+        let audio = AudioCaptureSource {
+            device: "alsa_output.test.monitor".to_owned(),
+        };
+        let pipeline = pipeline_description(
+            PipelineSource::PipeWirePortal { fd: 8, node_id: 99 },
+            CaptureSource::Screen,
+            Path::new("/tmp/out.webm"),
+            VideoQuality::default(),
+            Some(&audio),
+        )
+        .unwrap();
+
+        assert!(pipeline.contains("webmmux name=mux"));
+        assert!(pipeline.contains("pulsesrc device=\"alsa_output.test.monitor\""));
+        assert!(pipeline.contains("opusenc bitrate=128000"));
     }
 }

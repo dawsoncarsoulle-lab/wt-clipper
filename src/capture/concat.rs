@@ -6,9 +6,10 @@ use std::{
 use anyhow::Context;
 use gst::prelude::*;
 use gstreamer as gst;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::capture::{
+    audio::resolve_system_audio_source,
     quality::VideoQuality,
     recorder::{encode_location, wait_for_eos_or_error},
 };
@@ -34,25 +35,49 @@ pub fn concatenate_segments_to_webm(
         "concat target bitrate: {} bps",
         quality.bitrate_bps()
     );
-    let pipeline_description = concat_pipeline_description(&segments, &output_path, quality);
-    debug!(
-        pipeline = %pipeline_description,
-        "final concat pipeline"
-    );
+    let mut result = None;
+    if resolve_system_audio_source().is_some() {
+        let audio_pipeline =
+            concat_pipeline_description_with_audio(&segments, &output_path, quality);
+        debug!(pipeline = %audio_pipeline, "final audio/video concat pipeline");
+        match run_concat_description(&audio_pipeline, &output_path) {
+            Ok(()) => result = Some(Ok(())),
+            Err(error) => {
+                warn!(%error, "audio/video concat failed; retrying video-only concat");
+                if let Err(remove_error) = fs::remove_file(&output_path) {
+                    debug!(%remove_error, path = %output_path.display(), "failed to remove partial concat output");
+                }
+            }
+        }
+    }
+
+    if result.is_none() {
+        let pipeline_description = concat_pipeline_description(&segments, &output_path, quality);
+        debug!(
+            pipeline = %pipeline_description,
+            "final video-only concat pipeline"
+        );
+        result = Some(run_concat_description(&pipeline_description, &output_path));
+    }
+
+    result.expect("concat result is always set")?;
+    Ok(output_path)
+}
+
+fn run_concat_description(pipeline_description: &str, output_path: &Path) -> anyhow::Result<()> {
     let element =
-        gst::parse::launch(&pipeline_description).context("failed to build concat pipeline")?;
+        gst::parse::launch(pipeline_description).context("failed to build concat pipeline")?;
     let pipeline = element
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow::anyhow!("GStreamer concat description did not create a pipeline"))?;
 
-    let result = run_concat_pipeline(&pipeline, &output_path);
+    let result = run_concat_pipeline(&pipeline, output_path);
     if let Err(error) = pipeline.set_state(gst::State::Null) {
         if result.is_ok() {
             return Err(error).context("failed to stop concat pipeline");
         }
     }
-    result?;
-    Ok(output_path)
+    result
 }
 
 pub(crate) fn valid_segments(segments: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
@@ -155,6 +180,28 @@ pub(crate) fn concat_pipeline_description(
     pipeline
 }
 
+pub(crate) fn concat_pipeline_description_with_audio(
+    segments: &[PathBuf],
+    output_path: &Path,
+    quality: VideoQuality,
+) -> String {
+    let output = encode_location(output_path);
+    let raw_caps = quality.raw_video_caps();
+    let encoder = quality.vp8enc_settings();
+    let mut pipeline = format!(
+        "webmmux name=mux ! filesink location=\"{output}\" concat name=vc ! videoconvert ! videorate ! {raw_caps} ! {encoder} ! queue ! mux. concat name=ac ! audioconvert ! audioresample ! opusenc bitrate=128000 ! queue ! mux."
+    );
+
+    for (index, segment) in segments.iter().enumerate() {
+        let location = encode_location(segment);
+        pipeline.push_str(&format!(
+            " filesrc location=\"{location}\" ! decodebin name=d{index} d{index}. ! queue ! video/x-raw ! vc. d{index}. ! queue ! audio/x-raw ! ac."
+        ));
+    }
+
+    pipeline
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +264,24 @@ mod tests {
         );
 
         assert!(pipeline.contains("target-bitrate=20000000"));
+    }
+
+    #[test]
+    fn audio_concat_pipeline_uses_separate_video_and_audio_concats() {
+        let pipeline = concat_pipeline_description_with_audio(
+            &[
+                PathBuf::from("/tmp/session/segment-000000.webm"),
+                PathBuf::from("/tmp/session/segment-000001.webm"),
+            ],
+            Path::new("/tmp/out.webm"),
+            VideoQuality::default(),
+        );
+
+        assert!(pipeline.contains("concat name=vc"));
+        assert!(pipeline.contains("concat name=ac"));
+        assert!(pipeline.contains("decodebin name=d0"));
+        assert!(pipeline.contains("opusenc bitrate=128000"));
+        assert!(pipeline.contains("webmmux name=mux"));
     }
 
     #[test]

@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::{
     capture::{
+        audio::{resolve_system_audio_source, AudioCaptureSource},
         concat::concatenate_segments_to_webm,
         output::{default_output_dir, slugify_filename_part},
         portal::PortalScreencastSession,
@@ -136,6 +137,12 @@ impl ReplayBufferHandle {
 
         gst::init().context("failed to initialize GStreamer")?;
         info!(video = %config.quality.log_summary(), "replay buffer video target");
+        let audio_source = resolve_system_audio_source();
+        if let Some(audio_source) = &audio_source {
+            info!(device = %audio_source.device, "replay buffer system audio target");
+        } else {
+            info!("replay buffer running without audio");
+        }
 
         let temp_dir = std::env::temp_dir()
             .join("wt-clipper-buffer")
@@ -181,6 +188,7 @@ impl ReplayBufferHandle {
             Duration::from_secs(config.segment_seconds),
             keep_segments,
             config.quality,
+            audio_source.as_ref(),
         )?;
         info!(pipeline = %pipeline_description, "starting replay buffer pipeline");
 
@@ -945,6 +953,7 @@ pub(crate) fn buffer_pipeline_description(
     segment_duration: Duration,
     keep_segments: usize,
     quality: VideoQuality,
+    audio_source: Option<&AudioCaptureSource>,
 ) -> anyhow::Result<String> {
     let source_chain = match source {
         PipelineSource::X11 { window_id } => x11_source_chain(capture_source, window_id)?,
@@ -972,9 +981,18 @@ pub(crate) fn buffer_pipeline_description(
         target_bitrate = quality.bitrate_bps(),
         "segment target-bitrate"
     );
-    Ok(format!(
-        "{source_chain} ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! splitmuxsink async-finalize=true muxer-factory=webmmux max-size-time={max_size_time} max-files={keep_segments} send-keyframe-requests=true location=\"{location}\""
-    ))
+    let video_chain =
+        format!("{source_chain} ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder}");
+    if let Some(audio_source) = audio_source {
+        let audio_chain = audio_source.source_chain();
+        Ok(format!(
+            "splitmuxsink name=muxer async-finalize=true muxer-factory=webmmux max-size-time={max_size_time} max-files={keep_segments} send-keyframe-requests=true location=\"{location}\" {video_chain} ! queue ! muxer.video {audio_chain} ! queue ! muxer.audio_0"
+        ))
+    } else {
+        Ok(format!(
+            "{video_chain} ! splitmuxsink async-finalize=true muxer-factory=webmmux max-size-time={max_size_time} max-files={keep_segments} send-keyframe-requests=true location=\"{location}\""
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -992,6 +1010,7 @@ mod tests {
             Duration::from_secs(2),
             7,
             VideoQuality::default(),
+            None,
         )
         .unwrap();
 
@@ -1017,6 +1036,7 @@ mod tests {
             Duration::from_secs(5),
             7,
             VideoQuality::default(),
+            None,
         )
         .unwrap();
 
@@ -1034,11 +1054,33 @@ mod tests {
             Duration::from_secs(5),
             7,
             VideoQuality::default(),
+            None,
         )
         .unwrap_err()
         .to_string();
 
         assert!(error.contains("no X11 window id"));
+    }
+
+    #[test]
+    fn splitmux_pipeline_can_record_system_audio() {
+        let audio = AudioCaptureSource {
+            device: "alsa_output.test.monitor".to_owned(),
+        };
+        let pipeline = buffer_pipeline_description(
+            PipelineSource::PipeWirePortal { fd: 8, node_id: 99 },
+            CaptureSource::Screen,
+            Path::new("/tmp/session/segment-%06d.webm").to_path_buf(),
+            Duration::from_secs(5),
+            7,
+            VideoQuality::default(),
+            Some(&audio),
+        )
+        .unwrap();
+
+        assert!(pipeline.contains("splitmuxsink name=muxer"));
+        assert!(pipeline.contains("pulsesrc device=\"alsa_output.test.monitor\""));
+        assert!(pipeline.contains("opusenc bitrate=128000"));
     }
 
     #[test]
