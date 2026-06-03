@@ -34,7 +34,20 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["deb", "rpm"],
-    "icon": []
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkzQTU2MDRDNjAzNEU2NTAKUldSUTVqUmdUR0NsazhFcW5mOFVLVWpINTZoZUptRXZLRCtzZDI3SU91NmJ2TWJEdFNhVE56Tk4K",
+      "endpoints": [
+        "https://github.com/dawsoncarsoulle-lab/wt-clipper/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import { useAppStore } from "./store";
 import type { AppConfig, ClipInfo, ClipReason, DoctorReport, RuntimeStatus } from "./types";
+import brandLogo from "./assets/brand/WT_clipper_brand.png";
 
 const nav = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -202,9 +203,11 @@ function Sidebar() {
   return (
     <aside className="z-10 flex w-[248px] shrink-0 flex-col border-r border-line bg-[#0b0e14]/92 px-4 py-5">
       <div className="mb-7 flex items-center gap-3 px-2">
-        <div className="grid h-11 w-11 place-items-center rounded-lg border border-ember/35 bg-ember/12 shadow-glow">
-          <Zap className="h-5 w-5 text-ember" />
-        </div>
+        <img
+          src={brandLogo}
+          alt="WT Clipper"
+          className="h-11 w-11 rounded-lg border border-ember/35 bg-[#0b0e14] object-cover shadow-glow"
+        />
         <div>
           <div className="text-[17px] font-black tracking-wide text-white">WT CLIPPER</div>
           <div className="text-xs font-medium uppercase text-zinc-500">combat recorder</div>
@@ -508,6 +511,7 @@ function ClipCard({ clip, onDelete }: { clip: ClipInfo; onDelete: () => void }) 
 function Configuration() {
   const { config, setConfig, showToast } = useAppStore();
   const [draft, setDraft] = useState<AppConfig | null>(config);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   useEffect(() => setDraft(config), [config]);
   if (!draft) return <Empty label="Configuration en chargement" />;
 
@@ -528,6 +532,22 @@ function Configuration() {
     showToast("Configuration sauvegardée");
   }
 
+  async function checkForUpdates() {
+    if (checkingUpdate) return;
+    setCheckingUpdate(true);
+    showToast("Recherche de mise à jour...");
+    try {
+      const result = await invoke<{ available: boolean }>("check_for_updates");
+      if (!result.available) {
+        showToast("Aucune mise à jour disponible");
+      }
+    } catch (error) {
+      showToast(`Mise à jour: ${String(error)}`);
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between">
@@ -535,10 +555,16 @@ function Configuration() {
           <h1 className="text-2xl font-black text-white">Configuration</h1>
           <p className="text-sm text-zinc-500">Capture, qualité, triggers et profil joueur</p>
         </div>
-        <button className="primary-action w-fit px-5" onClick={() => void save()}>
-          <Save className="h-4 w-4" />
-          Sauvegarder
-        </button>
+        <div className="flex items-center gap-2">
+          <button className="ghost-button w-fit px-5" onClick={() => void checkForUpdates()} disabled={checkingUpdate}>
+            <RefreshCcw className={`h-4 w-4 ${checkingUpdate ? "animate-spin" : ""}`} />
+            Vérifier les mises à jour
+          </button>
+          <button className="primary-action w-fit px-5" onClick={() => void save()}>
+            <Save className="h-4 w-4" />
+            Sauvegarder
+          </button>
+        </div>
       </div>
       <div className="settings-grid">
         <Field label="player_name">

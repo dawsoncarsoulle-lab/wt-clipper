@@ -83,6 +83,7 @@ Run:
 
 ```bash
 npm run build
+TAURI_SIGNING_PRIVATE_KEY="$(cat /path/to/wt-clipper-updater.key)" TAURI_SIGNING_PRIVATE_KEY_PASSWORD= cargo tauri build
 ```
 
 Expected default outputs under:
@@ -95,8 +96,11 @@ Check:
 
 - [ ] `.deb` exists, if Tauri generated it.
 - [ ] `.rpm` exists, if Tauri generated it.
+- [ ] `.deb.sig` exists when updater signing is enabled.
+- [ ] `.rpm.sig` exists when updater signing is enabled.
 - [ ] App installs or runs on a clean-ish session.
 - [ ] Packaged app can access GStreamer, portals, War Thunder localhost, and audio monitor.
+- [ ] Updater key is present in the build environment and matches the `pubkey` in `src-tauri/tauri.conf.json`.
 
 AppImage is intentionally not part of the default bundle targets yet. Track it separately:
 
@@ -108,6 +112,7 @@ AppImage is intentionally not part of the default bundle targets yet. Track it s
 Prepare:
 
 - [ ] Linux package files.
+- [ ] `latest.json` for the updater endpoint.
 - [ ] `README.md`.
 - [ ] `LICENSE`.
 - [ ] Three screenshots:
@@ -119,6 +124,7 @@ Prepare:
   - [ ] App receives event.
   - [ ] Clip saved.
   - [ ] Clip playback includes audio.
+- [ ] Release notes mention the updater endpoint and the fact that updates are delivered through GitHub Releases.
 
 ## 8. Public Release Text
 

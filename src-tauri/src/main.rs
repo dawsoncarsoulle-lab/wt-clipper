@@ -14,6 +14,7 @@ use serde_json::json;
 use tauri::{Emitter, Manager, State};
 use tokio::sync::mpsc;
 use tracing::debug;
+use tauri_plugin_updater::UpdaterExt;
 use wt_clipper::{
     app::auto::{run_auto_clip, AutoClipConfig},
     capture::{
@@ -195,6 +196,12 @@ struct RuntimeEvent {
     description: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheckResult {
+    available: bool,
+}
+
 impl RuntimeStatus {
     fn from_config(config: &AppConfig) -> Self {
         Self {
@@ -278,6 +285,30 @@ fn restart_buffer(state: State<'_, BackendState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateCheckResult, String> {
+    let updater = app.updater().map_err(|error| error.to_string())?;
+    match updater.check().await.map_err(|error| error.to_string())? {
+        Some(update) => {
+            debug!("update available, downloading and installing");
+            update
+                .download_and_install(
+                    |chunk_length, content_length| {
+                        debug!(chunk_length, ?content_length, "update download progress");
+                    },
+                    || {
+                        debug!("update download finished");
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            debug!("update installed, restarting application");
+            app.restart()
+        }
+        None => Ok(UpdateCheckResult { available: false }),
+    }
+}
+
+#[tauri::command]
 fn get_runtime_status(state: State<'_, BackendState>) -> Result<RuntimeStatus, String> {
     state
         .runtime_status
@@ -295,6 +326,9 @@ fn main() {
             let config = AppConfig::load(Some(&config_path)).unwrap_or_default();
             let runtime_status = Arc::new(Mutex::new(RuntimeStatus::from_config(&config)));
             let preview_server = Arc::new(ClipPreviewServer::start()?);
+            #[cfg(desktop)]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
             let cmd_tx = spawn_backend(
                 app.handle().clone(),
                 config,
@@ -319,6 +353,7 @@ fn main() {
             run_diagnostics,
             save_manual_clip,
             restart_buffer,
+            check_for_updates,
             get_runtime_status
         ])
         .run(tauri::generate_context!())

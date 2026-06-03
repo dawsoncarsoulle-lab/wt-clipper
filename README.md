@@ -219,7 +219,8 @@ npm run build
 ```
 
 Tauri outputs are generated under `src-tauri/target/release/bundle/`.
-The default bundle targets are currently `.deb` and `.rpm`. AppImage is tracked as a follow-up release task.
+The default bundle targets are currently `.deb` and `.rpm`.
+Updater support uses the signed release artifacts plus a `latest.json` file published on GitHub Releases.
 
 See [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) before publishing a build.
 
