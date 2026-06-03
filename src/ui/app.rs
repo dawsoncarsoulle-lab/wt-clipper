@@ -152,6 +152,7 @@ impl WtClipperApp {
                             .with_extension("jpg")
                             .exists()
                             .then(|| path.with_extension("jpg")),
+                        preview_url: None,
                         file_name,
                         reason,
                         size_bytes,

@@ -60,6 +60,7 @@ pub struct Bridge {
 pub struct ClipInfo {
     pub path: PathBuf,
     pub thumbnail_path: Option<PathBuf>,
+    pub preview_url: Option<String>,
     pub file_name: String,
     pub reason: ClipReason,
     pub size_bytes: u64,

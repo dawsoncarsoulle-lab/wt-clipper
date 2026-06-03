@@ -435,6 +435,7 @@ async fn scan_clips(output_dir: PathBuf) -> anyhow::Result<(Vec<ClipInfo>, u64)>
                     .with_extension("jpg")
                     .exists()
                     .then(|| path.with_extension("jpg")),
+                preview_url: None,
                 file_name,
                 size_bytes,
                 duration_seconds: 0,

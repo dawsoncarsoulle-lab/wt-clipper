@@ -24,7 +24,8 @@ use crate::{
         portal::PortalScreencastSession,
         quality::{QualityPreset, VideoQuality},
         recorder::{
-            choose_backend, encode_location, wait_for_eos_or_error, CaptureBackend, PipelineSource,
+            choose_backend, encode_location, wait_for_eos_or_error, x11_source_chain,
+            CaptureBackend, PipelineSource,
         },
         segments::{
             prune_old_segments, segment_file_name, segment_location_pattern, segments_to_keep,
@@ -32,6 +33,7 @@ use crate::{
             snapshot_stable_segments, wait_until_segment_stable, EventSegmentSelection,
             ReplaySegment,
         },
+        x11::resolve_x11_window_id,
     },
     cli::CaptureSource,
     warthunder::events::WarThunderEvent,
@@ -145,7 +147,20 @@ impl ReplayBufferHandle {
         let mut portal_session = None;
         let backend = choose_backend(&std::env::var("XDG_SESSION_TYPE").unwrap_or_default());
         let source = match backend {
-            CaptureBackend::X11 => PipelineSource::X11,
+            CaptureBackend::X11 => {
+                let window = resolve_x11_window_id(config.source)?;
+                if let Some(window) = &window {
+                    info!(
+                        xid = %format!("{:#x}", window.id),
+                        title = ?window.title,
+                        class = ?window.class,
+                        "capturing X11 window for replay buffer"
+                    );
+                }
+                PipelineSource::X11 {
+                    window_id: window.map(|window| window.id),
+                }
+            }
             CaptureBackend::ManualPipeWirePath(path) => PipelineSource::PipeWirePath(path),
             CaptureBackend::ManualPipeWireTarget(target) => PipelineSource::PipeWireTarget(target),
             CaptureBackend::PortalPipeWire => {
@@ -932,14 +947,7 @@ pub(crate) fn buffer_pipeline_description(
     quality: VideoQuality,
 ) -> anyhow::Result<String> {
     let source_chain = match source {
-        PipelineSource::X11 => {
-            if capture_source == CaptureSource::Window {
-                anyhow::bail!(
-                    "--source window is only supported through the Wayland portal for now"
-                );
-            }
-            "ximagesrc use-damage=0 show-pointer=true".to_owned()
-        }
+        PipelineSource::X11 { window_id } => x11_source_chain(capture_source, window_id)?,
         PipelineSource::PipeWirePath(path) => {
             format!(
                 "pipewiresrc path=\"{}\" do-timestamp=true",
@@ -996,6 +1004,41 @@ mod tests {
         assert!(pipeline.contains("muxer-factory=webmmux"));
         assert!(pipeline.contains("max-size-time=2000000000"));
         assert!(pipeline.contains("max-files=7"));
+    }
+
+    #[test]
+    fn x11_window_request_uses_resolved_window_buffer_pipeline() {
+        let pipeline = buffer_pipeline_description(
+            PipelineSource::X11 {
+                window_id: Some(0x3a00007),
+            },
+            CaptureSource::Window,
+            Path::new("/tmp/session/segment-%06d.webm").to_path_buf(),
+            Duration::from_secs(5),
+            7,
+            VideoQuality::default(),
+        )
+        .unwrap();
+
+        assert!(pipeline.contains("ximagesrc"));
+        assert!(pipeline.contains("xid=60817415"));
+        assert!(pipeline.contains("splitmuxsink"));
+    }
+
+    #[test]
+    fn x11_window_request_without_window_id_errors_for_buffer_pipeline() {
+        let error = buffer_pipeline_description(
+            PipelineSource::X11 { window_id: None },
+            CaptureSource::Window,
+            Path::new("/tmp/session/segment-%06d.webm").to_path_buf(),
+            Duration::from_secs(5),
+            7,
+            VideoQuality::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("no X11 window id"));
     }
 
     #[test]

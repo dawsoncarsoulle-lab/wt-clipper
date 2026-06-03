@@ -11,7 +11,7 @@ use gstreamer as gst;
 use tracing::info;
 
 use crate::{
-    capture::{portal::PortalScreencastSession, quality::VideoQuality},
+    capture::{portal::PortalScreencastSession, quality::VideoQuality, x11::resolve_x11_window_id},
     cli::CaptureSource,
 };
 
@@ -39,12 +39,25 @@ pub async fn record(request: RecordingRequest) -> anyhow::Result<()> {
     let mut portal_session = None;
     let backend = choose_backend(&std::env::var("XDG_SESSION_TYPE").unwrap_or_default());
     let pipeline_description = match backend {
-        CaptureBackend::X11 => pipeline_description(
-            PipelineSource::X11,
-            request.source,
-            &request.output_path,
-            request.quality,
-        )?,
+        CaptureBackend::X11 => {
+            let window = resolve_x11_window_id(request.source)?;
+            if let Some(window) = &window {
+                info!(
+                    xid = %format!("{:#x}", window.id),
+                    title = ?window.title,
+                    class = ?window.class,
+                    "capturing X11 window"
+                );
+            }
+            pipeline_description(
+                PipelineSource::X11 {
+                    window_id: window.map(|window| window.id),
+                },
+                request.source,
+                &request.output_path,
+                request.quality,
+            )?
+        }
         CaptureBackend::ManualPipeWirePath(path) => pipeline_description(
             PipelineSource::PipeWirePath(path),
             request.source,
@@ -193,7 +206,7 @@ pub(crate) fn choose_backend(session_type: &str) -> CaptureBackend {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PipelineSource {
-    X11,
+    X11 { window_id: Option<u32> },
     PipeWirePath(String),
     PipeWireTarget(String),
     PipeWirePortal { fd: i32, node_id: u32 },
@@ -210,12 +223,10 @@ pub(crate) fn pipeline_description(
     let encoder = quality.vp8enc_settings();
 
     match source {
-        PipelineSource::X11 => {
-            if capture_source == CaptureSource::Window {
-                anyhow::bail!("--source window is only supported through the Wayland portal for now");
-            }
+        PipelineSource::X11 { window_id } => {
+            let source_chain = x11_source_chain(capture_source, window_id)?;
             Ok(format!(
-                "ximagesrc use-damage=0 show-pointer=true ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! webmmux ! filesink location=\"{location}\""
+                "{source_chain} ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! webmmux ! filesink location=\"{location}\""
             ))
         }
         PipelineSource::PipeWirePath(path) => {
@@ -233,6 +244,25 @@ pub(crate) fn pipeline_description(
         PipelineSource::PipeWirePortal { fd, node_id } => Ok(format!(
             "pipewiresrc fd={fd} path={node_id} do-timestamp=true ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder} ! webmmux ! filesink location=\"{location}\""
         )),
+    }
+}
+
+pub(crate) fn x11_source_chain(
+    capture_source: CaptureSource,
+    window_id: Option<u32>,
+) -> anyhow::Result<String> {
+    match capture_source {
+        CaptureSource::Screen => {
+            Ok("ximagesrc use-damage=0 do-timestamp=true show-pointer=true".to_owned())
+        }
+        CaptureSource::Window => {
+            let window_id = window_id.ok_or_else(|| {
+                anyhow::anyhow!("window capture requested on X11 but no X11 window id was resolved")
+            })?;
+            Ok(format!(
+                "ximagesrc use-damage=0 do-timestamp=true show-pointer=true xid={window_id}"
+            ))
+        }
     }
 }
 
@@ -306,7 +336,7 @@ mod tests {
     #[test]
     fn builds_x11_pipeline() {
         let pipeline = pipeline_description(
-            PipelineSource::X11,
+            PipelineSource::X11 { window_id: None },
             CaptureSource::Screen,
             Path::new("/tmp/out.webm"),
             VideoQuality::default(),
@@ -316,5 +346,36 @@ mod tests {
         assert!(pipeline.contains("ximagesrc"));
         assert!(pipeline.contains("vp8enc"));
         assert!(pipeline.contains("target-bitrate=20000000"));
+    }
+
+    #[test]
+    fn x11_window_request_uses_resolved_window_pipeline() {
+        let pipeline = pipeline_description(
+            PipelineSource::X11 {
+                window_id: Some(0x3a00007),
+            },
+            CaptureSource::Window,
+            Path::new("/tmp/out.webm"),
+            VideoQuality::default(),
+        )
+        .unwrap();
+
+        assert!(pipeline.contains("ximagesrc"));
+        assert!(pipeline.contains("xid=60817415"));
+        assert!(pipeline.contains("filesink location=\"/tmp/out.webm\""));
+    }
+
+    #[test]
+    fn x11_window_request_without_window_id_errors() {
+        let error = pipeline_description(
+            PipelineSource::X11 { window_id: None },
+            CaptureSource::Window,
+            Path::new("/tmp/out.webm"),
+            VideoQuality::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("no X11 window id"));
     }
 }

@@ -431,23 +431,57 @@ function Clips() {
 }
 
 function ClipCard({ clip, onDelete }: { clip: ClipInfo; onDelete: () => void }) {
-  const [imageFailed, setImageFailed] = useState(false);
-  const thumb = clip.thumbnailPath ? convertFileSrc(clip.thumbnailPath) : null;
-  const showImage = Boolean(thumb) && !imageFailed;
+  const [videoFailed, setVideoFailed] = useState(false);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const videoSrc = clip.previewUrl ?? convertFileSrc(clip.path);
 
   useEffect(() => {
-    setImageFailed(false);
-  }, [clip.thumbnailPath]);
+    setVideoFailed(false);
+  }, [videoSrc]);
+
+  const playPreview = () => {
+    const video = videoRef.current;
+    if (!video || videoFailed) return;
+
+    video.muted = true;
+    video.play().catch((error) => {
+      console.info("[FRONTEND] clip preview autoplay failed", error);
+    });
+  };
+
+  const pausePreview = () => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    video.pause();
+    video.currentTime = 0;
+  };
 
   return (
-    <motion.article whileHover={{ y: -4 }} className="clip-card">
+    <motion.article
+      whileHover={{ y: -4 }}
+      className="clip-card"
+      onMouseEnter={playPreview}
+      onMouseLeave={pausePreview}
+      onFocus={playPreview}
+      onBlur={pausePreview}
+    >
       <div className="clip-thumb">
-        {showImage && thumb ? (
-          <img src={thumb} alt="" onError={() => setImageFailed(true)} />
+        {!videoFailed ? (
+          <video
+            ref={videoRef}
+            muted
+            playsInline
+            preload="metadata"
+            loop
+            onError={() => setVideoFailed(true)}
+          >
+            <source src={videoSrc} type="video/webm" />
+          </video>
         ) : (
           <div className="clip-thumb-fallback">
             <Video className="h-9 w-9 text-ember" />
-            <span>Aperçu indisponible</span>
+            <span>Vidéo indisponible</span>
           </div>
         )}
         <div className="clip-overlay" />

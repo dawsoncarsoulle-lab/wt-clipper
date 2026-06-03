@@ -262,10 +262,12 @@ select {
   background: linear-gradient(135deg, #171d28, #090b10);
 }
 
-.clip-thumb img {
+.clip-thumb img,
+.clip-thumb video {
   height: 100%;
   width: 100%;
   object-fit: cover;
+  display: block;
 }
 
 .clip-thumb-fallback {

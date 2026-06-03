@@ -7801,6 +7801,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+ "x11rb",
 ]
 
 [[package]]

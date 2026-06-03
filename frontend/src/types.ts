@@ -8,6 +8,7 @@ export type ClipReason =
 export type ClipInfo = {
   path: string;
   thumbnailPath?: string | null;
+  previewUrl?: string | null;
   fileName: string;
   reason: ClipReason;
   sizeBytes: number;

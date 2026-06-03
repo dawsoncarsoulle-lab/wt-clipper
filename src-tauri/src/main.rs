@@ -1,6 +1,11 @@
 use std::{
+    collections::HashMap,
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -25,6 +30,148 @@ struct BackendState {
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
     config_path: PathBuf,
     runtime_status: Arc<Mutex<RuntimeStatus>>,
+    preview_server: Arc<ClipPreviewServer>,
+}
+
+struct ClipPreviewServer {
+    base_url: String,
+    clips: Arc<Mutex<HashMap<String, PathBuf>>>,
+}
+
+impl ClipPreviewServer {
+    fn start() -> anyhow::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let clips = Arc::new(Mutex::new(HashMap::new()));
+        let server_clips = clips.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().filter_map(Result::ok) {
+                let clips = server_clips.clone();
+                thread::spawn(move || handle_preview_request(stream, clips));
+            }
+        });
+        Ok(Self { base_url, clips })
+    }
+
+    fn url_for_path(&self, path: &Path) -> Option<String> {
+        let canonical = path.canonicalize().ok()?;
+        let id = preview_clip_id(&canonical);
+        if let Ok(mut clips) = self.clips.lock() {
+            clips.insert(id.clone(), canonical);
+        }
+        Some(format!("{}/{}.webm", self.base_url, id))
+    }
+}
+
+fn preview_clip_id(path: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn handle_preview_request(mut stream: TcpStream, clips: Arc<Mutex<HashMap<String, PathBuf>>>) {
+    let mut request = [0_u8; 4096];
+    let Ok(read) = stream.read(&mut request) else {
+        return;
+    };
+    let request = String::from_utf8_lossy(&request[..read]);
+    let Some(first_line) = request.lines().next() else {
+        return;
+    };
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+    if method != "GET" && method != "HEAD" {
+        write_http_status(&mut stream, "405 Method Not Allowed");
+        return;
+    }
+
+    let Some(id) = path
+        .trim_start_matches('/')
+        .strip_suffix(".webm")
+        .filter(|id| !id.is_empty())
+    else {
+        write_http_status(&mut stream, "404 Not Found");
+        return;
+    };
+    let clip_path = match clips.lock().ok().and_then(|clips| clips.get(id).cloned()) {
+        Some(path) => path,
+        None => {
+            write_http_status(&mut stream, "404 Not Found");
+            return;
+        }
+    };
+    let Ok(mut file) = File::open(&clip_path) else {
+        write_http_status(&mut stream, "404 Not Found");
+        return;
+    };
+    let Ok(size) = file.metadata().map(|metadata| metadata.len()) else {
+        write_http_status(&mut stream, "500 Internal Server Error");
+        return;
+    };
+
+    let range = request
+        .lines()
+        .find_map(|line| line.strip_prefix("Range: bytes="))
+        .and_then(|range| parse_byte_range(range, size));
+    let (status, start, end) = match range {
+        Some((start, end)) => ("206 Partial Content", start, end),
+        None => ("200 OK", 0, size.saturating_sub(1)),
+    };
+    let length = end.saturating_sub(start).saturating_add(1);
+    let content_range = if status.starts_with("206") {
+        format!("Content-Range: bytes {start}-{end}/{size}\r\n")
+    } else {
+        String::new()
+    };
+    let headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: video/webm\r\nAccept-Ranges: bytes\r\n{content_range}Content-Length: {length}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(headers.as_bytes()).is_err() || method == "HEAD" {
+        return;
+    }
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    let mut remaining = length;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = remaining.min(buffer.len() as u64) as usize;
+        let Ok(read) = file.read(&mut buffer[..limit]) else {
+            return;
+        };
+        if read == 0 || stream.write_all(&buffer[..read]).is_err() {
+            return;
+        }
+        remaining = remaining.saturating_sub(read as u64);
+    }
+}
+
+fn parse_byte_range(range: &str, size: u64) -> Option<(u64, u64)> {
+    if size == 0 {
+        return None;
+    }
+    let (start, end) = range.split_once('-')?;
+    let start = if start.is_empty() {
+        size.saturating_sub(end.parse::<u64>().ok()?)
+    } else {
+        start.parse::<u64>().ok()?
+    };
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>().ok()?.min(size - 1)
+    };
+    (start <= end && start < size).then_some((start, end))
+}
+
+fn write_http_status(stream: &mut TcpStream, status: &str) {
+    let _ = stream.write_all(
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    );
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +230,9 @@ async fn load_clips(state: State<'_, BackendState>) -> Result<Vec<ClipInfo>, Str
         .clip
         .output_dir_path()
         .map_err(|error| error.to_string())?;
-    let (clips, _) = scan_clips(output_dir).await.map_err(|error| error.to_string())?;
+    let (clips, _) = scan_clips(output_dir, state.preview_server.clone())
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(clips)
 }
 
@@ -145,16 +294,19 @@ fn main() {
                 .unwrap_or_else(default_config_path);
             let config = AppConfig::load(Some(&config_path)).unwrap_or_default();
             let runtime_status = Arc::new(Mutex::new(RuntimeStatus::from_config(&config)));
+            let preview_server = Arc::new(ClipPreviewServer::start()?);
             let cmd_tx = spawn_backend(
                 app.handle().clone(),
                 config,
                 config_path.clone(),
                 runtime_status.clone(),
+                preview_server.clone(),
             );
             app.manage(BackendState {
                 cmd_tx,
                 config_path,
                 runtime_status,
+                preview_server,
             });
             Ok(())
         })
@@ -178,6 +330,7 @@ fn spawn_backend(
     config: AppConfig,
     config_path: PathBuf,
     runtime_status: Arc<Mutex<RuntimeStatus>>,
+    preview_server: Arc<ClipPreviewServer>,
 ) -> mpsc::UnboundedSender<UiCommand> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -188,6 +341,7 @@ fn spawn_backend(
                 emit_app_event(
                     &app,
                     &runtime_status,
+                    &preview_server,
                     AppEvent::ClipFailed {
                         message: format!("Tokio runtime: {error}"),
                     },
@@ -203,6 +357,7 @@ fn spawn_backend(
                     emit_app_event(
                         &app,
                         &runtime_status,
+                        &preview_server,
                         AppEvent::ClipFailed {
                             message: format!("Output dir: {error}"),
                         },
@@ -213,14 +368,29 @@ fn spawn_backend(
 
             let forward_app = app.clone();
             let forward_runtime_status = runtime_status.clone();
+            let forward_preview_server = preview_server.clone();
             tokio::spawn(async move {
-                forward_events(forward_app, forward_runtime_status, event_rx).await;
+                forward_events(
+                    forward_app,
+                    forward_runtime_status,
+                    forward_preview_server,
+                    event_rx,
+                )
+                .await;
             });
 
             let command_events = event_tx.clone();
             let command_output_dir = output_dir.clone();
+            let command_preview_server = preview_server.clone();
             tokio::spawn(async move {
-                command_loop(cmd_rx, command_events, command_output_dir, config_path).await;
+                command_loop(
+                    cmd_rx,
+                    command_events,
+                    command_output_dir,
+                    config_path,
+                    command_preview_server,
+                )
+                .await;
             });
 
             if let Ok(mut status) = runtime_status.lock() {
@@ -275,16 +445,18 @@ async fn run_auto_backend(
 async fn forward_events(
     app: tauri::AppHandle,
     runtime_status: Arc<Mutex<RuntimeStatus>>,
+    preview_server: Arc<ClipPreviewServer>,
     mut event_rx: mpsc::UnboundedReceiver<AppEvent>,
 ) {
     while let Some(event) = event_rx.recv().await {
-        emit_app_event(&app, &runtime_status, event);
+        emit_app_event(&app, &runtime_status, &preview_server, event);
     }
 }
 
 fn emit_app_event(
     app: &tauri::AppHandle,
     runtime_status: &Arc<Mutex<RuntimeStatus>>,
+    preview_server: &Arc<ClipPreviewServer>,
     event: AppEvent,
 ) {
     update_runtime_status(runtime_status, &event);
@@ -314,12 +486,13 @@ fn emit_app_event(
             duration_seconds,
             size_bytes,
         } => {
-            let thumbnail_path = ensure_thumbnail(&path);
+            let preview_url = preview_server.url_for_path(&path);
             app.emit(
                 "clip-saved",
                 json!({
                     "path": path,
-                    "thumbnailPath": thumbnail_path,
+                    "thumbnailPath": null,
+                    "previewUrl": preview_url,
                     "fileName": path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
                     "reason": reason,
                     "durationSeconds": duration_seconds,
@@ -478,14 +651,16 @@ async fn command_loop(
     event_tx: mpsc::UnboundedSender<AppEvent>,
     output_dir: PathBuf,
     config_path: PathBuf,
+    preview_server: Arc<ClipPreviewServer>,
 ) {
     while let Some(command) = cmd_rx.recv().await {
         match command {
             UiCommand::LoadClips => {
                 let output_dir = output_dir.clone();
                 let event_tx = event_tx.clone();
+                let preview_server = preview_server.clone();
                 tokio::spawn(async move {
-                    match scan_clips(output_dir).await {
+                    match scan_clips(output_dir, preview_server).await {
                         Ok((clips, total_bytes)) => {
                             let _ = event_tx.send(AppEvent::ClipsLoaded { clips, total_bytes });
                         }
@@ -508,6 +683,7 @@ async fn command_loop(
             UiCommand::DeleteClip(path) => {
                 let reload_dir = output_dir.clone();
                 let reload_events = event_tx.clone();
+                let preview_server = preview_server.clone();
                 tokio::task::spawn_blocking(move || delete_clip_files(&path))
                     .await
                     .ok();
@@ -515,7 +691,7 @@ async fn command_loop(
                     message: "Clip supprimé".to_owned(),
                 });
                 tokio::spawn(async move {
-                    match scan_clips(reload_dir).await {
+                    match scan_clips(reload_dir, preview_server).await {
                         Ok((clips, total_bytes)) => {
                             let _ = reload_events.send(AppEvent::ClipsLoaded { clips, total_bytes });
                         }
@@ -620,7 +796,10 @@ async fn save_standalone_manual_clip(
     handle.stop().await
 }
 
-async fn scan_clips(output_dir: PathBuf) -> anyhow::Result<(Vec<ClipInfo>, u64)> {
+async fn scan_clips(
+    output_dir: PathBuf,
+    preview_server: Arc<ClipPreviewServer>,
+) -> anyhow::Result<(Vec<ClipInfo>, u64)> {
     tokio::task::spawn_blocking(move || {
         let mut clips = Vec::new();
         let mut total_bytes = 0_u64;
@@ -654,11 +833,11 @@ async fn scan_clips(output_dir: PathBuf) -> anyhow::Result<(Vec<ClipInfo>, u64)>
                 .and_then(|name| name.to_str())
                 .map(str::to_owned)
                 .unwrap_or_else(|| path.display().to_string());
-            let thumbnail_path = ensure_thumbnail(path);
             clips.push(ClipInfo {
                 reason: clip_reason_from_name(&file_name),
                 path: path.to_path_buf(),
-                thumbnail_path,
+                thumbnail_path: None,
+                preview_url: preview_server.url_for_path(path),
                 file_name,
                 size_bytes,
                 duration_seconds: 0,
@@ -714,34 +893,4 @@ fn write_config(path: &Path, config: &AppConfig) -> anyhow::Result<()> {
 fn resolve_configured_video_quality(config: &ClipConfig) -> anyhow::Result<VideoQuality> {
     let base = config.quality.video_quality();
     VideoQuality::new(config.fps, config.video_bitrate_kbps, base.encoder_cpu_used)
-}
-
-fn ensure_thumbnail(path: &Path) -> Option<PathBuf> {
-    let thumbnail_path = path.with_extension("jpg");
-    if thumbnail_path.exists() {
-        return Some(thumbnail_path);
-    }
-
-    match std::process::Command::new("ffmpeg")
-        .args(["-y", "-i"])
-        .arg(path)
-        .args(["-vframes", "1", "-s", "640x360"])
-        .arg(&thumbnail_path)
-        .output()
-    {
-        Ok(output) if output.status.success() && thumbnail_path.exists() => Some(thumbnail_path),
-        Ok(output) => {
-            debug!(
-                status = %output.status,
-                path = %path.display(),
-                stderr = %String::from_utf8_lossy(&output.stderr),
-                "failed to generate clip thumbnail"
-            );
-            None
-        }
-        Err(error) => {
-            debug!(%error, path = %path.display(), "failed to run ffmpeg for clip thumbnail");
-            None
-        }
-    }
 }
