@@ -4,7 +4,7 @@ WT Clipper is a Linux desktop clip recorder for War Thunder. It keeps a rolling 
 
 It is not affiliated with, endorsed by, or sponsored by Gaijin Entertainment or War Thunder.
 
-> TODO image: add a wide screenshot of the Dashboard while War Thunder is connected, buffer at 100%, and recent events visible. Suggested path: `docs/images/dashboard-connected.png`.
+<img src="docs/images/dashboard-connected.png" alt="dashboard-connected" width="80%">
 
 ## Features
 
@@ -19,13 +19,13 @@ It is not affiliated with, endorsed by, or sponsored by Gaijin Entertainment or 
 - Diagnostics page for capture, GStreamer, audio, War Thunder localhost, and writable directories.
 - MIT licensed.
 
-> TODO image: add a screenshot of the Clips library showing video previews. Suggested path: `docs/images/library-previews.png`.
+<img src="docs/images/library-previews.png" alt="dashboard-connected" width="80%">
 
-> TODO image: add a screenshot of the Diagnostics page with all checks OK. Suggested path: `docs/images/diagnostics-ok.png`.
+<img src="docs/images/diagnostics-ok.png" alt="dashboard-connected" width="80%">
 
 ## Current Status
 
-WT Clipper is usable, but still early. It has been developed and tested primarily on Pop!_OS with COSMIC and GNOME/X11. Treat releases before `1.0.0` as test builds.
+WT Clipper is usable, but still early. It has been developed and tested primarily on Pop!\_OS with COSMIC and GNOME/X11. Treat releases before `1.0.0` as test builds.
 
 Known focus areas before a public release:
 
@@ -44,7 +44,7 @@ Known focus areas before a public release:
 - For Wayland/COSMIC: `xdg-desktop-portal` and a desktop portal backend.
 - For X11: X11 session and `ximagesrc`.
 
-Useful Ubuntu/Pop!_OS packages:
+Useful Ubuntu/Pop!\_OS packages:
 
 ```bash
 sudo apt install \
