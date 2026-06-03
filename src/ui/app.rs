@@ -183,6 +183,7 @@ impl WtClipperApp {
                 ttl: 5.0,
                 color: Theme::DEATH_RED,
             }),
+            AppEvent::ClipStatusChanged { .. } => {}
             AppEvent::BufferProgress {
                 filled_secs,
                 total_secs,
@@ -449,7 +450,12 @@ impl WtClipperApp {
                 .contains(&self.search.to_ascii_lowercase());
         let filter_matches = match self.filter {
             ClipFilter::All => true,
-            ClipFilter::Kills => clip.reason == ClipReason::TargetDestroyed,
+            ClipFilter::Kills => {
+                matches!(
+                    clip.reason,
+                    ClipReason::TargetDestroyed | ClipReason::BaseDestroyed
+                )
+            }
             ClipFilter::MultiKills => clip.reason == ClipReason::MultiKill,
             ClipFilter::Deaths => clip.reason == ClipReason::PlayerDestroyed,
         };
@@ -793,6 +799,7 @@ fn clip_row(
 fn reason_label(reason: ClipReason) -> &'static str {
     match reason {
         ClipReason::TargetDestroyed => "KILL",
+        ClipReason::BaseDestroyed => "BASE",
         ClipReason::PlayerDestroyed => "MORT",
         ClipReason::MultiKill => "MULTI",
         ClipReason::Manual => "MANUAL",
@@ -802,7 +809,9 @@ fn reason_label(reason: ClipReason) -> &'static str {
 
 fn reason_color(reason: ClipReason) -> Color32 {
     match reason {
-        ClipReason::TargetDestroyed | ClipReason::Manual => Theme::KILL_GREEN,
+        ClipReason::TargetDestroyed | ClipReason::BaseDestroyed | ClipReason::Manual => {
+            Theme::KILL_GREEN
+        }
         ClipReason::MultiKill => Theme::MULTI_PURPLE,
         ClipReason::PlayerDestroyed => Theme::DEATH_RED,
         ClipReason::Unknown => Theme::TEXT_MUTED,

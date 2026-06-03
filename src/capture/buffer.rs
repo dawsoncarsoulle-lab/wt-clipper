@@ -69,6 +69,7 @@ pub enum SaveReplayOutcome {
 #[serde(rename_all = "kebab-case")]
 pub enum ClipReason {
     TargetDestroyed,
+    BaseDestroyed,
     PlayerDestroyed,
     MultiKill,
     Manual,
@@ -79,6 +80,7 @@ impl ClipReason {
     pub fn slug(self) -> &'static str {
         match self {
             Self::TargetDestroyed => "target-destroyed",
+            Self::BaseDestroyed => "base-destroyed",
             Self::PlayerDestroyed => "player-destroyed",
             Self::MultiKill => "multi-kill",
             Self::Manual => "manual",
@@ -89,6 +91,7 @@ impl ClipReason {
     fn file_prefix(self) -> &'static str {
         match self {
             Self::TargetDestroyed => "kill",
+            Self::BaseDestroyed => "base",
             Self::PlayerDestroyed => "death",
             Self::MultiKill => "multi-kill",
             Self::Manual => "manual",
@@ -1086,6 +1089,7 @@ mod tests {
     #[test]
     fn clip_reason_slug() {
         assert_eq!(ClipReason::TargetDestroyed.slug(), "target-destroyed");
+        assert_eq!(ClipReason::BaseDestroyed.slug(), "base-destroyed");
         assert_eq!(ClipReason::PlayerDestroyed.slug(), "player-destroyed");
         assert_eq!(ClipReason::MultiKill.slug(), "multi-kill");
         assert_eq!(ClipReason::Manual.slug(), "manual");
@@ -1218,7 +1222,7 @@ mod tests {
         let json = serde_json::to_value(&metadata).unwrap();
 
         assert_eq!(json["created_by"], "wt-clipper");
-        assert_eq!(json["version"], "0.1.0");
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(json["reason"], "target-destroyed");
         assert_eq!(json["player_name"], "dawson16800");
         assert_eq!(json["attacker"], "dawson16800");

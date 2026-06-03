@@ -1,9 +1,18 @@
 export type ClipReason =
   | "target-destroyed"
+  | "base-destroyed"
   | "player-destroyed"
   | "multi-kill"
   | "manual"
   | "unknown";
+
+export type ClipStatus =
+  | "detected"
+  | "recording"
+  | "encoding"
+  | "saving"
+  | "ready"
+  | "failed";
 
 export type ClipInfo = {
   path: string;
@@ -14,6 +23,35 @@ export type ClipInfo = {
   sizeBytes: number;
   durationSeconds: number;
   modifiedSecsAgo: number;
+};
+
+export type ClipStatusChangedPayload = {
+  id: string;
+  status: ClipStatus;
+  reason: ClipReason;
+  title: string;
+  createdAt: string;
+  filePath?: string | null;
+  thumbnailPath?: string | null;
+  durationSeconds?: number | null;
+  sizeBytes?: number | null;
+  progress?: number | null;
+  error?: string | null;
+};
+
+export type GalleryClipItem = {
+  id: string;
+  status: ClipStatus;
+  reason: ClipReason;
+  createdAt: string;
+  title: string;
+  filePath?: string;
+  thumbnailPath?: string;
+  previewUrl?: string;
+  durationSeconds?: number;
+  sizeBytes?: number;
+  progress?: number;
+  error?: string;
 };
 
 export type AppConfig = {
@@ -37,11 +75,6 @@ export type AppConfig = {
   };
   triggers: {
     target_destroyed: boolean;
-    player_destroyed: boolean;
-    critical_hit: boolean;
-    severe_damage: boolean;
-    set_afire: boolean;
-    crash: boolean;
   };
   storage: {
     max_clips: number;

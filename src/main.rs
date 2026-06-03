@@ -451,6 +451,8 @@ async fn scan_clips(output_dir: PathBuf) -> anyhow::Result<(Vec<ClipInfo>, u64)>
 fn clip_reason_from_name(name: &str) -> wt_clipper::capture::buffer::ClipReason {
     if name.starts_with("multi-kill") {
         wt_clipper::capture::buffer::ClipReason::MultiKill
+    } else if name.starts_with("base") {
+        wt_clipper::capture::buffer::ClipReason::BaseDestroyed
     } else if name.starts_with("kill") {
         wt_clipper::capture::buffer::ClipReason::TargetDestroyed
     } else if name.starts_with("death") {

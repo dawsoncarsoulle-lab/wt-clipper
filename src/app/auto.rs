@@ -4,9 +4,11 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use chrono::Utc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info};
+use uuid::Uuid;
 
 use crate::{
     capture::{
@@ -17,7 +19,7 @@ use crate::{
     },
     cli::CaptureSource,
     config::WarThunderConfig,
-    ui::bridge::AppEvent,
+    ui::bridge::{AppEvent, ClipStatus, ClipStatusPayload},
     warthunder::{
         client::{ChatMessage, WarThunderClient},
         events::WarThunderEvent,
@@ -25,6 +27,8 @@ use crate::{
         recent::{RecentEventCache, RecentMessageCache},
     },
 };
+
+const EVENT_DEDUPE_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct AutoClipConfig {
@@ -59,7 +63,9 @@ impl AutoWatchState {
             last_evt_msg_id: 0,
             last_dmg_msg_id: 0,
             seen_messages: RecentMessageCache::new(1000),
-            seen_events: RecentEventCache::new(Duration::from_secs(120)),
+            // War Thunder can expose the same kill through multiple localhost endpoints.
+            // Keep this short so repeated identical kills are not suppressed for minutes.
+            seen_events: RecentEventCache::new(EVENT_DEDUPE_TTL),
         }
     }
 }
@@ -72,6 +78,8 @@ struct Cooldown {
 
 #[derive(Debug, Clone)]
 struct PendingClip {
+    clip_id: String,
+    created_at: String,
     reason: ClipReason,
     first_event_time: Instant,
     last_event_time: Instant,
@@ -98,6 +106,8 @@ impl PendingClip {
         let mut event_keys = HashSet::new();
         event_keys.insert(event_key);
         Self {
+            clip_id: format!("clip_{}", Uuid::new_v4()),
+            created_at: Utc::now().to_rfc3339(),
             reason,
             first_event_time: event_time,
             last_event_time: event_time,
@@ -302,11 +312,6 @@ pub async fn run_auto_clip(
                         target,
                         description: summary.clone(),
                     });
-                    if reason == ClipReason::TargetDestroyed && !auto_config.target_destroyed_trigger
-                    {
-                        debug!(?event, "[CLIP] target_destroyed trigger disabled");
-                        continue;
-                    }
                     let now = detected.detected_at;
                     if pending_clips
                         .iter()
@@ -339,6 +344,23 @@ pub async fn run_auto_clip(
                                 pending.kill_count(),
                                 effective_save_delay.as_secs()
                             );
+                            send_ui_event(
+                                &auto_config,
+                                AppEvent::ClipStatusChanged {
+                                    payload: status_payload(
+                                        pending,
+                                        ClipStatus::Detected,
+                                        pending.reason,
+                                        format!(
+                                            "Multi-kill en attente: {} kills, sauvegarde dans {}s",
+                                            pending.kill_count(),
+                                            effective_save_delay.as_secs()
+                                        ),
+                                        Some(15),
+                                        None,
+                                    ),
+                                },
+                            );
                             debug!(
                                 first_event_time = ?pending.first_event_wall_time,
                                 last_event_time = ?pending.last_event_wall_time,
@@ -361,7 +383,7 @@ pub async fn run_auto_clip(
                         event,
                         detected.canonical_key,
                         reason,
-                        summary,
+                        summary.clone(),
                         now,
                         detected.game_time,
                         detected.detected_wall_time,
@@ -370,6 +392,22 @@ pub async fn run_auto_clip(
                     println!(
                         "[CLIP] scheduled replay save in {}s...",
                         effective_save_delay.as_secs()
+                    );
+                    send_ui_event(
+                        &auto_config,
+                        AppEvent::ClipStatusChanged {
+                            payload: status_payload(
+                                &pending,
+                                ClipStatus::Detected,
+                                reason,
+                                format!(
+                                    "Clip programmé: {summary} (sauvegarde dans {}s)",
+                                    effective_save_delay.as_secs()
+                                ),
+                                Some(10),
+                                None,
+                            ),
+                        },
                     );
                     pending_clips.push(pending);
                 }
@@ -430,6 +468,29 @@ fn clip_context_for_pending(
         segment_seconds: auto_config.segment_seconds,
         first_event_time: Some(pending.first_event_wall_time),
         last_event_time: Some(pending.last_event_wall_time),
+    }
+}
+
+fn status_payload(
+    pending: &PendingClip,
+    status: ClipStatus,
+    reason: ClipReason,
+    title: String,
+    progress: Option<u8>,
+    error: Option<String>,
+) -> ClipStatusPayload {
+    ClipStatusPayload {
+        id: pending.clip_id.clone(),
+        status,
+        reason,
+        title,
+        created_at: pending.created_at.clone(),
+        file_path: None,
+        thumbnail_path: None,
+        duration_seconds: None,
+        size_bytes: None,
+        progress,
+        error,
     }
 }
 
@@ -495,13 +556,64 @@ async fn save_ready_pending_clips(
             auto_config,
             configured_post_event_delay,
         );
-        match buffer.save_replay(context).await? {
-            SaveReplayOutcome::Saved(replay) => {
+        send_ui_event(
+            auto_config,
+            AppEvent::ClipStatusChanged {
+                payload: status_payload(
+                    &pending,
+                    ClipStatus::Recording,
+                    pending.reason,
+                    "Capture en cours...".to_owned(),
+                    Some(35),
+                    None,
+                ),
+            },
+        );
+        send_ui_event(
+            auto_config,
+            AppEvent::ClipStatusChanged {
+                payload: status_payload(
+                    &pending,
+                    ClipStatus::Encoding,
+                    pending.reason,
+                    "Encodage du clip...".to_owned(),
+                    Some(72),
+                    None,
+                ),
+            },
+        );
+        match buffer.save_replay(context).await {
+            Ok(SaveReplayOutcome::Saved(replay)) => {
+                send_ui_event(
+                    auto_config,
+                    AppEvent::ClipStatusChanged {
+                        payload: status_payload(
+                            &pending,
+                            ClipStatus::Saving,
+                            pending.reason,
+                            "Sauvegarde du clip...".to_owned(),
+                            Some(92),
+                            None,
+                        ),
+                    },
+                );
                 crate::capture::buffer::print_saved_replay(&replay);
                 if let Some(path) = replay.final_video_path.clone() {
                     let size_bytes = std::fs::metadata(&path)
                         .map(|metadata| metadata.len())
                         .unwrap_or(0);
+                    let mut ready = status_payload(
+                        &pending,
+                        ClipStatus::Ready,
+                        pending.reason,
+                        "Clip prêt".to_owned(),
+                        Some(100),
+                        None,
+                    );
+                    ready.file_path = Some(path.clone());
+                    ready.duration_seconds = Some(auto_config.buffer_seconds);
+                    ready.size_bytes = Some(size_bytes);
+                    send_ui_event(auto_config, AppEvent::ClipStatusChanged { payload: ready });
                     send_ui_event(
                         auto_config,
                         AppEvent::ClipSaved {
@@ -514,16 +626,52 @@ async fn save_ready_pending_clips(
                 }
                 cooldown.record_save(now);
             }
-            SaveReplayOutcome::NotReadyYet(reason) => {
+            Ok(SaveReplayOutcome::NotReadyYet(reason)) => {
                 println!("[CLIP] retrying pending replay save in 1s: {reason}");
                 requeue_pending_clip(pending_clips, pending, now);
             }
-            SaveReplayOutcome::SkippedTooOld(reason) => {
+            Ok(SaveReplayOutcome::SkippedTooOld(reason)) => {
                 println!("[CLIP] skipped pending replay save: {reason}");
+                send_ui_event(
+                    auto_config,
+                    AppEvent::ClipStatusChanged {
+                        payload: status_payload(
+                            &pending,
+                            ClipStatus::Failed,
+                            pending.reason,
+                            "Erreur pendant la création du clip".to_owned(),
+                            None,
+                            Some(reason.clone()),
+                        ),
+                    },
+                );
                 send_ui_event(
                     auto_config,
                     AppEvent::ClipFailed {
                         message: format!("Clip ignoré: {reason}"),
+                    },
+                );
+                cooldown.record_save(now);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                send_ui_event(
+                    auto_config,
+                    AppEvent::ClipStatusChanged {
+                        payload: status_payload(
+                            &pending,
+                            ClipStatus::Failed,
+                            pending.reason,
+                            "Erreur pendant la création du clip".to_owned(),
+                            None,
+                            Some(message.clone()),
+                        ),
+                    },
+                );
+                send_ui_event(
+                    auto_config,
+                    AppEvent::ClipFailed {
+                        message: format!("Clip: {message}"),
                     },
                 );
                 cooldown.record_save(now);
@@ -620,19 +768,21 @@ fn collect_personal_events(
     events: &mut Vec<DetectedEvent>,
 ) {
     for message in messages {
-        let key = message.stable_key_with_prefix(source);
+        let key = raw_message_dedupe_key(source, &message);
         debug!(
             source,
             message_id = ?message.id,
             raw_message = %message.text,
-            raw_key = %key,
+            raw_key = ?key,
             "auto-clip message received"
         );
-        if seen_messages.contains(&key) {
-            debug!(source, raw_key = %key, ignored_duplicate = true, "duplicate raw message ignored");
-            continue;
+        if let Some(key) = key {
+            if seen_messages.contains(&key) {
+                debug!(source, raw_key = %key, ignored_duplicate = true, "duplicate raw message ignored");
+                continue;
+            }
+            seen_messages.insert(key);
         }
-        seen_messages.insert(key);
 
         let event = parse_gamechat_event(&message.text);
         let canonical_key = canonical_event_key(&event);
@@ -673,6 +823,10 @@ fn collect_personal_events(
             debug!(source, message = %message.text, ?event, "ignoring non-personal auto-clip event");
         }
     }
+}
+
+fn raw_message_dedupe_key(source: &str, message: &ChatMessage) -> Option<String> {
+    message.id.map(|id| format!("{source}:{id}"))
 }
 
 fn parse_wt_message_time(value: Option<&str>) -> Option<Duration> {
@@ -719,7 +873,9 @@ fn remember_messages(
     seen_messages: &mut RecentMessageCache,
 ) {
     for message in messages {
-        seen_messages.insert(message.stable_key_with_prefix(source));
+        if let Some(key) = raw_message_dedupe_key(source, &message) {
+            seen_messages.insert(key);
+        }
     }
 }
 
@@ -730,10 +886,11 @@ fn clip_reason_for_event(event: &WarThunderEvent) -> ClipReason {
         }
         WarThunderEvent::TargetDestroyed { .. } => ClipReason::Unknown,
         WarThunderEvent::PlayerDestroyed { .. } => ClipReason::PlayerDestroyed,
+        WarThunderEvent::BaseDestroyed { .. } => ClipReason::BaseDestroyed,
         WarThunderEvent::Unknown(_) => ClipReason::Unknown,
-        WarThunderEvent::CriticalHit { .. }
-        | WarThunderEvent::SevereDamage { .. }
-        | WarThunderEvent::BaseDestroyed { .. } => ClipReason::Unknown,
+        WarThunderEvent::CriticalHit { .. } | WarThunderEvent::SevereDamage { .. } => {
+            ClipReason::Unknown
+        }
     }
 }
 
@@ -1481,6 +1638,42 @@ mod tests {
         );
 
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn raw_message_dedupe_only_uses_real_war_thunder_ids() {
+        let with_id = ChatMessage {
+            id: Some(42),
+            time: None,
+            sender: None,
+            text: "dawson16800 (F/A-18C Early) destroyed [ai] MiG-15bis".to_owned(),
+        };
+        let without_id = ChatMessage {
+            id: None,
+            time: None,
+            sender: None,
+            text: "dawson16800 (F/A-18C Early) destroyed [ai] MiG-15bis".to_owned(),
+        };
+
+        assert_eq!(
+            raw_message_dedupe_key("hud:damage", &with_id),
+            Some("hud:damage:42".to_owned())
+        );
+        assert_eq!(raw_message_dedupe_key("hud:damage", &without_id), None);
+    }
+
+    #[test]
+    fn production_event_dedupe_expires_quickly_for_repeated_identical_kills() {
+        let mut state = AutoWatchState::new();
+        let now = Instant::now();
+
+        assert!(state
+            .seen_events
+            .insert_new("same-canonical-kill".to_owned(), now));
+        assert!(state.seen_events.insert_new(
+            "same-canonical-kill".to_owned(),
+            now + EVENT_DEDUPE_TTL + Duration::from_millis(1)
+        ));
     }
 
     #[test]

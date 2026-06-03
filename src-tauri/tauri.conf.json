@@ -44,7 +44,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkzQTU2MDRDNjAzNEU2NTAKUldSUTVqUmdUR0NsazhFcW5mOFVLVWpINTZoZUptRXZLRCtzZDI3SU91NmJ2TWJEdFNhVE56Tk4K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI5OEQ4MTk2RjNFRjE2QzgKUldUSUZ1L3psb0dOS2IrYUxubk55N2R4QjFNc0RDb3lNYlF1NXROdTdGVDJZZEpZMlNxS3h4Yy8K",
       "endpoints": [
         "https://github.com/dawsoncarsoulle-lab/wt-clipper/releases/latest/download/latest.json"
       ]

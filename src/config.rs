@@ -60,16 +60,6 @@ pub struct WarThunderConfig {
 pub struct TriggerConfig {
     #[serde(default = "default_true")]
     pub target_destroyed: bool,
-    #[serde(default)]
-    pub player_destroyed: bool,
-    #[serde(default)]
-    pub critical_hit: bool,
-    #[serde(default)]
-    pub severe_damage: bool,
-    #[serde(default)]
-    pub set_afire: bool,
-    #[serde(default)]
-    pub crash: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -114,11 +104,6 @@ impl Default for TriggerConfig {
     fn default() -> Self {
         Self {
             target_destroyed: true,
-            player_destroyed: false,
-            critical_hit: false,
-            severe_damage: false,
-            set_afire: false,
-            crash: false,
         }
     }
 }
@@ -231,11 +216,6 @@ poll_interval_ms = 300
 
 [triggers]
 target_destroyed = true
-player_destroyed = false
-critical_hit = false
-severe_damage = false
-set_afire = false
-crash = false
 
 [storage]
 max_clips = 100
@@ -331,6 +311,24 @@ mod tests {
         assert_eq!(config.war_thunder.poll_interval_ms, 300);
         assert!(config.triggers.target_destroyed);
         assert_eq!(config.storage.max_clips, 100);
+    }
+
+    #[test]
+    fn ignores_removed_trigger_fields_from_old_configs() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[triggers]
+target_destroyed = true
+player_destroyed = true
+critical_hit = true
+severe_damage = true
+set_afire = true
+crash = true
+"#,
+        )
+        .unwrap();
+
+        assert!(config.triggers.target_destroyed);
     }
 
     #[test]

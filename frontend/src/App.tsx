@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import { useAppStore } from "./store";
 import type { AppConfig, ClipInfo, ClipReason, DoctorReport, RuntimeStatus } from "./types";
+import type { ClipStatus, ClipStatusChangedPayload, GalleryClipItem } from "./types";
 import brandLogo from "./assets/brand/WT_clipper_brand.png";
 
 const nav = [
@@ -43,10 +44,20 @@ const nav = [
 
 const reasonLabel: Record<ClipReason, string> = {
   "target-destroyed": "KILL",
+  "base-destroyed": "BASE",
   "player-destroyed": "DEATH",
   "multi-kill": "MULTI",
   manual: "MANUAL",
   unknown: "CLIP",
+};
+
+const processingReasonLabel: Record<ClipReason, string> = {
+  "target-destroyed": "Cible détruite",
+  "base-destroyed": "Base détruite",
+  "player-destroyed": "Joueur détruit",
+  "multi-kill": "Multi-kill",
+  manual: "Clip manuel",
+  unknown: "Clip",
 };
 
 export function App() {
@@ -88,12 +99,26 @@ export function App() {
       listen<ClipInfo>("clip-saved", (event) => {
         console.info("[FRONTEND] received clip-saved", event.payload);
         store.addClip(event.payload);
+        void refreshClips().catch((error) => {
+          console.info("[FRONTEND] refresh after clip-saved failed", error);
+        });
         store.addEvent({
           kind: event.payload.reason,
           title: "Clip sauvegardé",
           detail: event.payload.fileName,
         });
         store.showToast("Clip sauvegardé");
+      }),
+      listen<ClipStatusChangedPayload>("clip-status-changed", (event) => {
+        console.info("[FRONTEND] received clip-status-changed", event.payload);
+        store.updateClipStatus(event.payload);
+        if (event.payload.status === "detected") {
+          store.showToast("Clip détecté — création en cours...");
+        } else if (event.payload.status === "ready") {
+          store.showToast("Clip prêt");
+        } else if (event.payload.status === "failed") {
+          store.showToast("Erreur pendant la création du clip");
+        }
       }),
       listen<{ message: string }>("clip-failed", (event) => {
         console.info("[FRONTEND] received clip-failed", event.payload);
@@ -120,18 +145,23 @@ export function App() {
 
   async function bootstrap() {
     try {
-      const [config, clips, diagnostics] = await Promise.all([
+      const [config, diagnostics] = await Promise.all([
         invoke<AppConfig>("get_config"),
-        invoke<ClipInfo[]>("load_clips"),
         invoke<DoctorReport>("run_diagnostics"),
       ]);
       store.setConfig(config);
-      store.setClips(clips);
       store.setDiagnostics(diagnostics);
+      await refreshClips();
       await refreshRuntimeStatus();
     } catch (error) {
       store.showToast(String(error));
     }
+  }
+
+  async function refreshClips() {
+    const clips = await invoke<ClipInfo[]>("load_clips");
+    store.setClips(clips);
+    return clips;
   }
 
   async function refreshRuntimeStatus() {
@@ -194,6 +224,7 @@ export function App() {
           </motion.div>
         )}
       </AnimatePresence>
+      <ProcessingPopup />
     </div>
   );
 }
@@ -352,6 +383,73 @@ function Dashboard() {
   );
 }
 
+function ProcessingPopup() {
+  const { processingClips } = useAppStore();
+  const visibleClips = processingClips.filter(
+    (clip) => clip.status !== "ready" || clip.filePath == null,
+  );
+
+  if (visibleClips.length === 0) {
+    return null;
+  }
+
+  return (
+    <AnimatePresence>
+      <motion.aside
+        initial={{ opacity: 0, y: 16, scale: 0.98 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: 16, scale: 0.98 }}
+        transition={{ duration: 0.18 }}
+        className="fixed right-6 top-[84px] z-40 w-[360px] rounded-lg border border-line bg-[#111722]/96 p-4 shadow-premium backdrop-blur"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-xs uppercase tracking-wide text-zinc-500">Upload en cours</div>
+            <div className="mt-1 text-base font-bold text-white">
+              {visibleClips.length} clip{visibleClips.length > 1 ? "s" : ""} en traitement
+            </div>
+          </div>
+          <RefreshCcw className="mt-0.5 h-4 w-4 animate-spin text-ember" />
+        </div>
+        <div className="mt-4 space-y-3">
+          {visibleClips.slice(0, 3).map((clip) => (
+            <div key={clip.id} className="rounded-md border border-white/10 bg-white/[0.035] p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-bold text-white">{clip.title}</div>
+                  <div className="mt-1 text-xs text-zinc-400">{processingReasonLabel[clip.reason]}</div>
+                </div>
+                <span className={`reason reason-${clip.reason}`}>{getClipStatusLabel(clip.status)}</span>
+              </div>
+              <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
+                <div
+                  className={`processing-progress ${clip.progress == null && clip.status !== "failed" ? "indeterminate" : ""}`}
+                  style={{
+                    width: `${Math.max(
+                      6,
+                      Math.min(
+                        100,
+                        clip.progress ?? (clip.status === "failed" ? 100 : 42),
+                      ),
+                    )}%`,
+                  }}
+                />
+              </div>
+              <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
+                <span>{relativeCreatedAt(clip.createdAt)}</span>
+                <span>{clip.status === "failed" ? "Erreur" : "En cours"}</span>
+              </div>
+              {clip.status === "failed" && clip.error && (
+                <p className="mt-2 max-h-10 overflow-hidden text-xs text-[#ffb7aa]">{clip.error}</p>
+              )}
+            </div>
+          ))}
+        </div>
+      </motion.aside>
+    </AnimatePresence>
+  );
+}
+
 function Metric({ icon: Icon, label, value }: { icon: typeof Zap; label: string; value: string | number }) {
   return (
     <div className="metric-panel">
@@ -365,18 +463,23 @@ function Metric({ icon: Icon, label, value }: { icon: typeof Zap; label: string;
 }
 
 function Clips() {
-  const { clips, setClips, showToast } = useAppStore();
+  const { clips, processingClips, setClips, showToast } = useAppStore();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | ClipReason>("all");
-  const visible = useMemo(
-    () =>
-      clips.filter((clip) => {
-        const matchesQuery = clip.fileName.toLowerCase().includes(query.toLowerCase());
-        const matchesFilter = filter === "all" || clip.reason === filter;
-        return matchesQuery && matchesFilter;
-      }),
-    [clips, query, filter],
-  );
+  const galleryItems = useMemo(() => {
+    const readyPaths = new Set(clips.map((clip) => clip.path));
+    const processing = processingClips.filter((clip) => !clip.filePath || !readyPaths.has(clip.filePath));
+    const ready = clips.map(clipToGalleryItem);
+    return [...processing, ...ready].filter((clip) => {
+      const haystack = `${clip.title} ${clip.filePath ?? ""}`.toLowerCase();
+      const matchesQuery = haystack.includes(query.toLowerCase());
+      const matchesFilter = filter === "all" || clip.reason === filter;
+      return matchesQuery && matchesFilter;
+    });
+  }, [clips, processingClips, query, filter]);
+  const activeProcessingCount = processingClips.filter((clip) =>
+    ["detected", "recording", "encoding", "saving"].includes(clip.status),
+  ).length;
 
   async function refresh() {
     const next = await invoke<ClipInfo[]>("load_clips");
@@ -394,7 +497,7 @@ function Clips() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-black text-white">Bibliothèque</h1>
-          <p className="text-sm text-zinc-500">{visible.length} clips affichés</p>
+          <p className="text-sm text-zinc-500">{galleryItems.length} clips affichés</p>
         </div>
         <div className="flex gap-2">
           <button className="ghost-button" onClick={() => void refresh()}>
@@ -413,24 +516,119 @@ function Clips() {
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Rechercher un clip" />
         </div>
         <div className="segmented">
-          {(["all", "target-destroyed", "multi-kill", "player-destroyed", "manual"] as const).map((item) => (
+          {(["all", "target-destroyed", "base-destroyed", "multi-kill", "player-destroyed", "manual"] as const).map((item) => (
             <button key={item} className={filter === item ? "active" : ""} onClick={() => setFilter(item)}>
               {item === "all" ? "Tous" : reasonLabel[item]}
             </button>
           ))}
         </div>
       </div>
-      {visible.length === 0 ? (
+      {activeProcessingCount > 0 && (
+        <div className="processing-banner">
+          {activeProcessingCount} clip{activeProcessingCount > 1 ? "s" : ""} en cours de traitement
+        </div>
+      )}
+      {galleryItems.length === 0 ? (
         <Empty label="Aucun clip trouvé" />
       ) : (
         <div className="clip-grid">
-          {visible.map((clip) => (
-            <ClipCard key={clip.path} clip={clip} onDelete={() => void remove(clip.path)} />
+          {galleryItems.map((clip) => (
+            clip.status === "ready" && clip.filePath ? (
+              <ClipCard
+                key={clip.id}
+                clip={galleryItemToClipInfo(clip)}
+                onDelete={() => void remove(clip.filePath!)}
+              />
+            ) : (
+              <ClipProcessingCard key={clip.id} clip={clip} />
+            )
           ))}
         </div>
       )}
     </div>
   );
+}
+
+function clipToGalleryItem(clip: ClipInfo): GalleryClipItem {
+  return {
+    id: clip.path,
+    status: "ready",
+    reason: clip.reason,
+    createdAt: String(Date.now() - clip.modifiedSecsAgo * 1000),
+    title: clip.fileName,
+    filePath: clip.path,
+    thumbnailPath: clip.thumbnailPath ?? undefined,
+    previewUrl: clip.previewUrl ?? undefined,
+    durationSeconds: clip.durationSeconds,
+    sizeBytes: clip.sizeBytes,
+    progress: 100,
+  };
+}
+
+function galleryItemToClipInfo(clip: GalleryClipItem): ClipInfo {
+  return {
+    path: clip.filePath ?? "",
+    thumbnailPath: clip.thumbnailPath ?? null,
+    previewUrl: clip.previewUrl ?? null,
+    fileName: clip.title,
+    reason: clip.reason,
+    sizeBytes: clip.sizeBytes ?? 0,
+    durationSeconds: clip.durationSeconds ?? 0,
+    modifiedSecsAgo: secondsAgo(clip.createdAt),
+  };
+}
+
+function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
+  const failed = clip.status === "failed";
+  const progress = clip.progress ?? (failed ? 0 : 48);
+  return (
+    <motion.article whileHover={{ y: -4 }} className={`clip-card processing-card ${failed ? "failed" : ""}`}>
+      <div className="clip-thumb processing-thumb">
+        <div className="processing-skeleton" />
+        <div className="processing-loader">
+          {failed ? <AlertTriangle className="h-7 w-7 text-[#ff8d7a]" /> : <RefreshCcw className="h-7 w-7 animate-spin text-ember" />}
+        </div>
+        <span className={`reason reason-${clip.reason}`}>{reasonLabel[clip.reason]}</span>
+      </div>
+      <div className="p-3">
+        <div className="truncate text-sm font-bold text-white">{processingReasonLabel[clip.reason]}</div>
+        <div className="mt-1 text-sm text-zinc-400">{getClipStatusLabel(clip.status)}</div>
+        <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
+          <div
+            className={`processing-progress ${clip.progress == null && !failed ? "indeterminate" : ""}`}
+            style={{ width: `${Math.max(4, Math.min(100, progress))}%` }}
+          />
+        </div>
+        <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
+          <span>{relativeCreatedAt(clip.createdAt)}</span>
+          {!failed && <span>{Math.round(progress)}%</span>}
+        </div>
+        {failed && (
+          <details className="mt-3 rounded-md border border-[#ff8d7a]/25 bg-[#351711]/45 px-3 py-2 text-xs text-[#ffb7aa]">
+            <summary className="cursor-pointer font-bold text-[#ffd0c7]">Voir détails</summary>
+            <p className="mt-2 break-words">{clip.error ?? "Erreur pendant la création du clip"}</p>
+          </details>
+        )}
+      </div>
+    </motion.article>
+  );
+}
+
+function getClipStatusLabel(status: ClipStatus): string {
+  switch (status) {
+    case "detected":
+      return "Clip détecté...";
+    case "recording":
+      return "Capture en cours...";
+    case "encoding":
+      return "Encodage du clip...";
+    case "saving":
+      return "Sauvegarde...";
+    case "ready":
+      return "Prêt";
+    case "failed":
+      return "Erreur";
+  }
 }
 
 function ClipCard({ clip, onDelete }: { clip: ClipInfo; onDelete: () => void }) {
@@ -599,12 +797,10 @@ function Configuration() {
       <div>
         <h2 className="mb-3 text-lg font-bold text-white">Triggers</h2>
         <div className="trigger-grid">
-          {Object.entries(draft.triggers).map(([key, value]) => (
-            <label key={key} className="trigger-toggle">
-              <input type="checkbox" checked={value} onChange={(e) => updateTrigger(key as keyof AppConfig["triggers"], e.target.checked)} />
-              <span>{key}</span>
-            </label>
-          ))}
+          <label className="trigger-toggle">
+            <input type="checkbox" checked readOnly />
+            <span>target_destroyed</span>
+          </label>
         </div>
       </div>
     </div>
@@ -692,4 +888,15 @@ function relativeTime(seconds: number) {
   if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
   if (seconds < 86400) return `${Math.round(seconds / 3600)} h`;
   return `${Math.round(seconds / 86400)} j`;
+}
+
+function secondsAgo(value: string) {
+  const numeric = Number(value);
+  const timestamp = Number.isFinite(numeric) ? numeric : Date.parse(value);
+  if (!Number.isFinite(timestamp)) return 0;
+  return Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+}
+
+function relativeCreatedAt(value: string) {
+  return secondsAgo(value) < 5 ? "Il y a quelques secondes" : relativeTime(secondsAgo(value));
 }

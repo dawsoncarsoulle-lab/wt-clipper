@@ -83,7 +83,7 @@ Run:
 
 ```bash
 npm run build
-TAURI_SIGNING_PRIVATE_KEY="$(cat /path/to/wt-clipper-updater.key)" TAURI_SIGNING_PRIVATE_KEY_PASSWORD= cargo tauri build
+TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.local/share/wt-clipper/updater.key)" TAURI_SIGNING_PRIVATE_KEY_PASSWORD= cargo tauri build
 ```
 
 Expected default outputs under:
@@ -101,6 +101,7 @@ Check:
 - [ ] App installs or runs on a clean-ish session.
 - [ ] Packaged app can access GStreamer, portals, War Thunder localhost, and audio monitor.
 - [ ] Updater key is present in the build environment and matches the `pubkey` in `src-tauri/tauri.conf.json`.
+- [ ] If the release is meant to be updateable through `/releases/latest/...`, publish it as the GitHub "Latest" release.
 
 AppImage is intentionally not part of the default bundle targets yet. Track it separately:
 
@@ -113,6 +114,7 @@ Prepare:
 
 - [ ] Linux package files.
 - [ ] `latest.json` for the updater endpoint.
+- [ ] `./scripts/validate-latest-json.sh`.
 - [ ] `README.md`.
 - [ ] `LICENSE`.
 - [ ] Three screenshots:
@@ -125,6 +127,7 @@ Prepare:
   - [ ] Clip saved.
   - [ ] Clip playback includes audio.
 - [ ] Release notes mention the updater endpoint and the fact that updates are delivered through GitHub Releases.
+- [ ] Beta/prerelease builds use a separate updater endpoint or are explicitly excluded from the automatic updater flow.
 
 ## 8. Public Release Text
 

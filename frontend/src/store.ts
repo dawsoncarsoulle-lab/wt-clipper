@@ -1,5 +1,12 @@
 import { create } from "zustand";
-import type { AppConfig, ClipInfo, DoctorReport, EventEntry } from "./types";
+import type {
+  AppConfig,
+  ClipInfo,
+  ClipStatusChangedPayload,
+  DoctorReport,
+  EventEntry,
+  GalleryClipItem,
+} from "./types";
 
 type AppState = {
   activeView: "dashboard" | "clips" | "config" | "diagnostics";
@@ -11,6 +18,7 @@ type AppState = {
   sessionMultiKills: number;
   clipsSaved: number;
   clips: ClipInfo[];
+  processingClips: GalleryClipItem[];
   config: AppConfig | null;
   diagnostics: DoctorReport | null;
   diagnosticsRunning: boolean;
@@ -19,6 +27,7 @@ type AppState = {
   setActiveView: (view: AppState["activeView"]) => void;
   setConfig: (config: AppConfig) => void;
   setClips: (clips: ClipInfo[]) => void;
+  updateClipStatus: (payload: ClipStatusChangedPayload) => void;
   setDiagnostics: (report: DoctorReport | null) => void;
   setDiagnosticsRunning: (running: boolean) => void;
   setWtConnected: (connected: boolean) => void;
@@ -40,6 +49,7 @@ export const useAppStore = create<AppState>((set) => ({
   sessionMultiKills: 0,
   clipsSaved: 0,
   clips: [],
+  processingClips: [],
   config: null,
   diagnostics: null,
   diagnosticsRunning: false,
@@ -60,11 +70,36 @@ export const useAppStore = create<AppState>((set) => ({
     set({ bufferFilledSecs, bufferTotalSecs: Math.max(1, bufferTotalSecs) }),
   setDiskUsedBytes: (diskUsedBytes) => set({ diskUsedBytes }),
   addClip: (clip) =>
-    set((state) => ({
-      clips: [clip, ...state.clips.filter((item) => item.path !== clip.path)],
-      clipsSaved: state.clipsSaved + 1,
-      diskUsedBytes: state.diskUsedBytes + clip.sizeBytes,
-    })),
+    set((state) => {
+      const existed = state.clips.some((item) => item.path === clip.path);
+      const clips = [clip, ...state.clips.filter((item) => item.path !== clip.path)];
+      return {
+        clips,
+        processingClips: state.processingClips.filter((item) => item.filePath !== clip.path),
+        clipsSaved: clips.length,
+        diskUsedBytes: existed
+          ? clips.reduce((sum, item) => sum + item.sizeBytes, 0)
+          : state.diskUsedBytes + clip.sizeBytes,
+      };
+    }),
+  updateClipStatus: (payload) =>
+    set((state) => {
+      const item: GalleryClipItem = {
+        id: payload.id,
+        status: payload.status,
+        reason: payload.reason,
+        createdAt: payload.createdAt,
+        title: payload.title,
+        filePath: payload.filePath ?? undefined,
+        thumbnailPath: payload.thumbnailPath ?? undefined,
+        durationSeconds: payload.durationSeconds ?? undefined,
+        sizeBytes: payload.sizeBytes ?? undefined,
+        progress: payload.progress ?? undefined,
+        error: payload.error ?? undefined,
+      };
+      const others = state.processingClips.filter((clip) => clip.id !== payload.id);
+      return { processingClips: [item, ...others] };
+    }),
   addEvent: (event) =>
     set((state) => ({
       sessionKills:

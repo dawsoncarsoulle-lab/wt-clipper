@@ -5,6 +5,33 @@ use tokio::sync::mpsc;
 
 use crate::{capture::buffer::ClipReason, config::AppConfig, doctor::DoctorReport};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClipStatus {
+    Detected,
+    Recording,
+    Encoding,
+    Saving,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipStatusPayload {
+    pub id: String,
+    pub status: ClipStatus,
+    pub reason: ClipReason,
+    pub title: String,
+    pub created_at: String,
+    pub file_path: Option<PathBuf>,
+    pub thumbnail_path: Option<PathBuf>,
+    pub duration_seconds: Option<u64>,
+    pub size_bytes: Option<u64>,
+    pub progress: Option<u8>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum AppEvent {
@@ -21,6 +48,9 @@ pub enum AppEvent {
         reason: ClipReason,
         duration_seconds: u64,
         size_bytes: u64,
+    },
+    ClipStatusChanged {
+        payload: ClipStatusPayload,
     },
     ClipFailed {
         message: String,
