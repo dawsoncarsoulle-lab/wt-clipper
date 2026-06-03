@@ -8,7 +8,15 @@ use ashpd::desktop::screencast::Screencast;
 use gstreamer as gst;
 use serde::{Deserialize, Serialize};
 
-use crate::capture::output::default_output_dir;
+use crate::{
+    capture::{
+        audio::resolve_system_audio_source,
+        output::default_output_dir,
+        recorder::{choose_backend, CaptureBackend},
+        x11::resolve_x11_window_id,
+    },
+    cli::CaptureSource,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,8 +61,11 @@ pub async fn build_report(output_dir: Option<PathBuf>) -> DoctorReport {
     let mut checks = Vec::new();
     let (session_kind, session_check) = check_session();
     checks.push(session_check);
+    checks.push(check_capture_backend(session_kind));
     checks.extend(check_portal().await);
     checks.extend(check_gstreamer(session_kind));
+    checks.push(check_x11_window(session_kind));
+    checks.push(check_audio_source());
     checks.push(check_war_thunder_localhost().await);
     checks.push(check_writable_dir(
         "Output dir writable",
@@ -67,6 +78,79 @@ pub async fn build_report(output_dir: Option<PathBuf>) -> DoctorReport {
 
     let summary = summary_for_checks(&checks);
     DoctorReport { checks, summary }
+}
+
+fn check_capture_backend(session_kind: SessionKind) -> DoctorCheck {
+    let session = match session_kind {
+        SessionKind::X11 => "x11",
+        SessionKind::Wayland => "wayland",
+        SessionKind::Unknown => "",
+    };
+    match choose_backend(session) {
+        CaptureBackend::X11 => {
+            DoctorCheck::ok("Capture backend", "X11 window capture via ximagesrc")
+        }
+        CaptureBackend::PortalPipeWire => DoctorCheck::ok(
+            "Capture backend",
+            "Wayland/COSMIC portal capture via pipewiresrc",
+        ),
+        CaptureBackend::ManualPipeWirePath(path) => {
+            DoctorCheck::ok("Capture backend", format!("manual PipeWire path {path}"))
+        }
+        CaptureBackend::ManualPipeWireTarget(target) => DoctorCheck::ok(
+            "Capture backend",
+            format!("manual PipeWire target {target}"),
+        ),
+    }
+}
+
+fn check_x11_window(session_kind: SessionKind) -> DoctorCheck {
+    if session_kind != SessionKind::X11 {
+        return DoctorCheck::ok("X11 War Thunder window", "not needed for this session");
+    }
+
+    match resolve_x11_window_id(CaptureSource::Window) {
+        Ok(Some(window)) => DoctorCheck::ok(
+            "X11 War Thunder window",
+            format!(
+                "found {:#x}{}{}",
+                window.id,
+                window
+                    .title
+                    .as_deref()
+                    .map(|title| format!(" title={title:?}"))
+                    .unwrap_or_default(),
+                window
+                    .class
+                    .as_deref()
+                    .map(|class| format!(" class={class:?}"))
+                    .unwrap_or_default()
+            ),
+        ),
+        Ok(None) => DoctorCheck::warn(
+            "X11 War Thunder window",
+            "not selected",
+            Some("set source=window or use screen capture"),
+        ),
+        Err(error) => DoctorCheck::warn(
+            "X11 War Thunder window",
+            format!("not found: {error}"),
+            Some("launch War Thunder first, or set WT_CLIPPER_X11_WINDOW_ID"),
+        ),
+    }
+}
+
+fn check_audio_source() -> DoctorCheck {
+    match resolve_system_audio_source() {
+        Some(source) => DoctorCheck::ok("System audio monitor", source.device),
+        None => DoctorCheck::warn(
+            "System audio monitor",
+            "not detected",
+            Some(
+                "install/use pactl, or set WT_CLIPPER_AUDIO_DEVICE; audio capture will be skipped",
+            ),
+        ),
+    }
 }
 
 fn check_session() -> (SessionKind, DoctorCheck) {

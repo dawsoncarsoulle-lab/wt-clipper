@@ -721,7 +721,7 @@ fn clip_row(
                 ui.add(
                     egui::Image::new(uri)
                         .fit_to_exact_size(egui::vec2(160.0, 90.0))
-                        .rounding(8.0),
+                        .corner_radius(8.0),
                 );
             } else {
                 let (thumb, _) =

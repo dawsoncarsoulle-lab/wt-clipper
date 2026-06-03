@@ -1,6 +1,7 @@
 /target
 /src-tauri/target/
 /serveur/fonts/
+/release/
 
 
 # Added by cargo

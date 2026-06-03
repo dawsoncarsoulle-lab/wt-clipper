@@ -522,13 +522,13 @@ fn emit_app_event(
     };
 
     match result {
-        Ok(()) => println!("[UI-BRIDGE] emitted tauri event {event_name}"),
+        Ok(()) => debug!(event = event_name, "emitted Tauri event"),
         Err(error) => debug!(%error, "failed to emit Tauri event"),
     }
     if let Err(error) = app.emit("app-event", generic_event) {
         debug!(%error, "failed to emit generic Tauri app event");
     } else {
-        println!("[UI-BRIDGE] emitted tauri event app-event");
+        debug!(event = "app-event", "emitted Tauri event");
     }
 }
 
@@ -548,39 +548,33 @@ fn tauri_event_name(event: &AppEvent) -> &'static str {
 
 fn log_bridge_event_received(event: &AppEvent) {
     match event {
-        AppEvent::WtConnected => println!("[UI-BRIDGE] AppEvent::WtConnected received from backend"),
+        AppEvent::WtConnected => debug!("AppEvent::WtConnected received from backend"),
         AppEvent::WtDisconnected => {
-            println!("[UI-BRIDGE] AppEvent::WtDisconnected received from backend")
+            debug!("AppEvent::WtDisconnected received from backend")
         }
         AppEvent::BufferProgress {
             filled_secs,
             total_secs,
-        } => println!(
-            "[UI-BRIDGE] AppEvent::BufferProgress filled={filled_secs:.1} total={total_secs:.1}"
-        ),
+        } => debug!(filled_secs, total_secs, "AppEvent::BufferProgress received from backend"),
         AppEvent::KillDetected {
             reason,
             description,
             ..
-        } => println!(
-            "[UI-BRIDGE] AppEvent::KillDetected reason={reason:?} description={description}"
-        ),
-        AppEvent::ClipSaved { path, reason, .. } => println!(
-            "[UI-BRIDGE] AppEvent::ClipSaved reason={reason:?} path={}",
-            path.display()
-        ),
+        } => debug!(?reason, description, "AppEvent::KillDetected received from backend"),
+        AppEvent::ClipSaved { path, reason, .. } => {
+            debug!(?reason, path = %path.display(), "AppEvent::ClipSaved received from backend")
+        }
         AppEvent::ClipFailed { message } => {
-            println!("[UI-BRIDGE] AppEvent::ClipFailed message={message}")
+            debug!(message, "AppEvent::ClipFailed received from backend")
         }
         AppEvent::DiskUsage { used_bytes } => {
-            println!("[UI-BRIDGE] AppEvent::DiskUsage used={used_bytes}")
+            debug!(used_bytes, "AppEvent::DiskUsage received from backend")
         }
-        AppEvent::ClipsLoaded { clips, total_bytes } => println!(
-            "[UI-BRIDGE] AppEvent::ClipsLoaded clips={} total={total_bytes}",
-            clips.len()
-        ),
+        AppEvent::ClipsLoaded { clips, total_bytes } => {
+            debug!(clips = clips.len(), total_bytes, "AppEvent::ClipsLoaded received from backend")
+        }
         AppEvent::DiagnosticsReady(_) => {
-            println!("[UI-BRIDGE] AppEvent::DiagnosticsReady received from backend")
+            debug!("AppEvent::DiagnosticsReady received from backend")
         }
     }
 }

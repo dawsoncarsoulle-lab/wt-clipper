@@ -825,12 +825,12 @@ fn event_vehicle_target(event: &WarThunderEvent) -> (Option<String>, Option<Stri
 
 fn send_ui_event(auto_config: &AutoClipConfig, event: AppEvent) {
     if let Some(sender) = &auto_config.ui_events {
-        println!("[UI-BRIDGE] queueing AppEvent from auto backend: {event:?}");
+        debug!(?event, "queueing AppEvent from auto backend");
         if let Err(error) = sender.send(event) {
-            println!("[UI-BRIDGE] failed to queue AppEvent from auto backend: {error}");
+            debug!(%error, "failed to queue AppEvent from auto backend");
         }
     } else {
-        println!("[UI-BRIDGE] no ui_events channel configured for AppEvent: {event:?}");
+        debug!(?event, "no ui_events channel configured for AppEvent");
     }
 }
 
