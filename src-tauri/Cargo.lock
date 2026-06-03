@@ -7957,7 +7957,7 @@ dependencies = [
 
 [[package]]
 name = "wt-clipper"
-version = "0.1.0"
+version = "0.1.1-beta.1"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -7983,7 +7983,7 @@ dependencies = [
 
 [[package]]
 name = "wt-clipper-tauri"
-version = "0.1.0"
+version = "0.1.1-beta.1"
 dependencies = [
  "anyhow",
  "serde",
