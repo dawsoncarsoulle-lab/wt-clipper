@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type {
   AppConfig,
   ClipInfo,
+  ClipStatus,
   ClipStatusChangedPayload,
   DoctorReport,
   EventEntry,
@@ -27,6 +28,7 @@ type AppState = {
   runtimeStatus: RuntimeStatus | null;
   diagnosticsRunning: boolean;
   exportProgress: ExportProgressPayload | null;
+  isExporting: boolean;
   events: EventEntry[];
   toast: string | null;
   setActiveView: (view: AppState["activeView"]) => void;
@@ -35,6 +37,7 @@ type AppState = {
   updateClipStatus: (payload: ClipStatusChangedPayload) => void;
   setPendingExportClips: (clips: PendingClipExportDto[]) => void;
   setExportProgress: (payload: ExportProgressPayload | null) => void;
+  setIsExporting: (value: boolean) => void;
   setDiagnostics: (report: DoctorReport | null) => void;
   setRuntimeStatus: (status: RuntimeStatus) => void;
   setDiagnosticsRunning: (running: boolean) => void;
@@ -63,6 +66,7 @@ export const useAppStore = create<AppState>((set) => ({
   runtimeStatus: null,
   diagnosticsRunning: false,
   exportProgress: null,
+  isExporting: false,
   events: [],
   toast: null,
   setActiveView: (activeView) => set({ activeView }),
@@ -101,6 +105,11 @@ export const useAppStore = create<AppState>((set) => ({
     }),
   updateClipStatus: (payload) =>
     set((state) => {
+      if (payload.status === "ready") {
+        return {
+          processingClips: state.processingClips.filter((clip) => clip.id !== payload.id),
+        };
+      }
       const item: GalleryClipItem = {
         id: payload.id,
         status: payload.status,
@@ -113,6 +122,10 @@ export const useAppStore = create<AppState>((set) => ({
         sizeBytes: payload.sizeBytes ?? undefined,
         progress: payload.progress ?? undefined,
         error: payload.error ?? undefined,
+        exportableAt: payload.exportableAt ?? undefined,
+        isExportable: payload.isExportable ?? undefined,
+        canExport: payload.canExport ?? inferCanExport(payload.status, payload.retryable),
+        retryable: payload.retryable ?? undefined,
       };
       const others = state.processingClips.filter((clip) => clip.id !== payload.id);
       return { processingClips: [item, ...others] };
@@ -132,11 +145,25 @@ export const useAppStore = create<AppState>((set) => ({
         canExport: clip.canExport,
         retryable: clip.retryable,
       }));
-      const itemIds = new Set(items.map((item) => item.id));
-      const others = state.processingClips.filter((clip) => !itemIds.has(clip.id));
-      return { processingClips: [...items, ...others] };
+      const backendIds = new Set(items.map((item) => item.id));
+      const queueStatuses = new Set<ClipStatus>([
+        "waiting_post_event",
+        "freezing_segments",
+        "ready_to_export",
+        "exporting",
+        "failed",
+        "expired",
+      ]);
+      const preserved = state.processingClips.filter((clip) => {
+        if (queueStatuses.has(clip.status)) {
+          return backendIds.has(clip.id);
+        }
+        return clip.status !== "ready";
+      });
+      return { processingClips: [...items, ...preserved] };
     }),
   setExportProgress: (exportProgress) => set({ exportProgress }),
+  setIsExporting: (isExporting) => set({ isExporting }),
   addEvent: (event) =>
     set((state) => ({
       sessionKills:
@@ -178,3 +205,7 @@ export const useAppStore = create<AppState>((set) => ({
     window.setTimeout(() => set({ toast: null }), 3200);
   },
 }));
+
+function inferCanExport(status: ClipStatus, retryable?: boolean | null) {
+  return status === "ready_to_export" || (status === "failed" && retryable !== false);
+}

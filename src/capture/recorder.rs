@@ -291,8 +291,9 @@ fn recording_mux_pipeline(
     location: &str,
     audio_source: Option<&AudioCaptureSource>,
 ) -> String {
-    let video_chain =
-        format!("{video_source_chain} ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder}");
+    let video_chain = format!(
+        "{video_source_chain} ! queue max-size-buffers=4 leaky=downstream ! videoconvert ! videorate ! {raw_caps} ! queue max-size-buffers=8 leaky=downstream ! {encoder}"
+    );
     if let Some(audio_source) = audio_source {
         let audio_chain = audio_source.source_chain();
         format!(
@@ -382,9 +383,11 @@ mod tests {
         .unwrap();
 
         assert!(pipeline.contains("pipewiresrc fd=8 path=99"));
-        assert!(pipeline.contains("video/x-raw,framerate=60/1"));
+        assert!(pipeline.contains("queue max-size-buffers=4 leaky=downstream"));
+        assert!(pipeline.contains("video/x-raw,framerate=30/1"));
+        assert!(pipeline.contains("queue max-size-buffers=8 leaky=downstream"));
         assert!(pipeline.contains(
-            "vp8enc deadline=1 end-usage=cbr target-bitrate=20000000 cpu-used=2 keyframe-max-dist=120"
+            "vp8enc deadline=1 end-usage=cbr target-bitrate=10000000 cpu-used=4 keyframe-max-dist=60"
         ));
         assert!(pipeline.contains("webmmux"));
         assert!(pipeline.contains("filesink location=\"/tmp/out.webm\""));
@@ -403,7 +406,7 @@ mod tests {
 
         assert!(pipeline.contains("ximagesrc"));
         assert!(pipeline.contains("vp8enc"));
-        assert!(pipeline.contains("target-bitrate=20000000"));
+        assert!(pipeline.contains("target-bitrate=10000000"));
     }
 
     #[test]

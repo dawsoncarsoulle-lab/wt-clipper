@@ -1243,8 +1243,9 @@ pub(crate) fn buffer_pipeline_description(
         target_bitrate = quality.bitrate_bps(),
         "segment target-bitrate"
     );
-    let video_chain =
-        format!("{source_chain} ! videoconvert ! videorate ! {raw_caps} ! queue ! {encoder}");
+    let video_chain = format!(
+        "{source_chain} ! queue max-size-buffers=4 leaky=downstream ! videoconvert ! videorate ! {raw_caps} ! queue max-size-buffers=8 leaky=downstream ! {encoder}"
+    );
     if let Some(audio_source) = audio_source {
         let audio_chain = audio_source.source_chain();
         Ok(format!(
@@ -1278,9 +1279,11 @@ mod tests {
 
         assert!(pipeline.contains("pipewiresrc fd=8 path=99"));
         assert!(pipeline.contains("splitmuxsink"));
-        assert!(pipeline.contains("video/x-raw,framerate=60/1"));
+        assert!(pipeline.contains("queue max-size-buffers=4 leaky=downstream"));
+        assert!(pipeline.contains("video/x-raw,framerate=30/1"));
+        assert!(pipeline.contains("queue max-size-buffers=8 leaky=downstream"));
         assert!(pipeline.contains(
-            "vp8enc deadline=1 end-usage=cbr target-bitrate=20000000 cpu-used=2 keyframe-max-dist=120"
+            "vp8enc deadline=1 end-usage=cbr target-bitrate=10000000 cpu-used=4 keyframe-max-dist=60"
         ));
         assert!(pipeline.contains("muxer-factory=webmmux"));
         assert!(pipeline.contains("max-size-time=2000000000"));
@@ -1383,7 +1386,7 @@ mod tests {
             events: vec![event],
             player_name: Some("dawson16800".to_owned()),
             video_quality: VideoQuality::default(),
-            quality_preset: QualityPreset::High,
+            quality_preset: QualityPreset::Medium,
             duration_seconds: 20,
             post_event_seconds: 5,
             segment_seconds: 2,
@@ -1453,7 +1456,7 @@ mod tests {
             events: Vec::new(),
             player_name: None,
             video_quality: VideoQuality::default(),
-            quality_preset: QualityPreset::High,
+            quality_preset: QualityPreset::Medium,
             duration_seconds: 20,
             post_event_seconds: 0,
             segment_seconds: 2,
@@ -1491,9 +1494,9 @@ mod tests {
         assert_eq!(json["duration_seconds"], 20);
         assert_eq!(json["post_event_seconds"], 5);
         assert_eq!(json["segment_seconds"], 2);
-        assert_eq!(json["quality"], "high");
-        assert_eq!(json["fps"], 60);
-        assert_eq!(json["video_bitrate_kbps"], 20_000);
+        assert_eq!(json["quality"], "medium");
+        assert_eq!(json["fps"], 30);
+        assert_eq!(json["video_bitrate_kbps"], 10_000);
         assert_eq!(json["segments_dir"], "/tmp/kill-segments");
     }
 

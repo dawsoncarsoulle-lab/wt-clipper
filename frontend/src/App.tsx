@@ -147,6 +147,9 @@ export function App() {
       listen<ExportProgressPayload>("export_progress_changed", (event) => {
         console.info("[FRONTEND] received export_progress_changed", event.payload);
         store.setExportProgress(event.payload);
+        if (!event.payload.active) {
+          store.setIsExporting(false);
+        }
       }),
       listen<{ message: string }>("clip-failed", (event) => {
         console.info("[FRONTEND] received clip-failed", event.payload);
@@ -597,7 +600,17 @@ function Metric({ icon: Icon, label, value }: { icon: typeof Zap; label: string;
 }
 
 function Clips() {
-  const { activeView, clips, processingClips, setClips, setPendingExportClips, showToast } = useAppStore();
+  const {
+    activeView,
+    clips,
+    processingClips,
+    isExporting,
+    setClips,
+    setExportProgress,
+    setIsExporting,
+    setPendingExportClips,
+    showToast,
+  } = useAppStore();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | ClipReason>("all");
   useEffect(() => {
@@ -660,15 +673,49 @@ function Clips() {
   }
 
   async function exportNow() {
+    if (isExporting || pendingExportReadyCount === 0) return;
+    setIsExporting(true);
+    setExportProgress({
+      active: true,
+      total: pendingExportReadyCount,
+      completed: 0,
+      failed: 0,
+      currentClipId: null,
+      currentClipTitle: null,
+      currentStep: "preparing",
+      progress: 0,
+      message: "Préparation de l'export...",
+    });
     showToast("Export des clips en attente...");
-    const summary = await invoke<ExportSummary>("export_pending_clips");
-    await refresh();
-    if (summary.total === 0 && processingClips.some((clip) => clip.status === "waiting_post_event" || clip.status === "freezing_segments")) {
-      showToast("Certains clips ne sont pas encore prêts à exporter");
-    } else if (summary.failed > 0) {
-      showToast(`${summary.completed} clips exportés, ${summary.failed} erreur`);
-    } else {
-      showToast("Export terminé");
+    try {
+      const summary = await invoke<ExportSummary>("export_pending_clips");
+      await refresh();
+      if (
+        summary.total === 0 &&
+        processingClips.some((clip) => clip.status === "waiting_post_event" || clip.status === "freezing_segments")
+      ) {
+        showToast("Certains clips ne sont pas encore prêts à exporter");
+      } else if (summary.failed > 0) {
+        showToast(`${summary.completed} clips exportés, ${summary.failed} erreur`);
+      } else {
+        showToast("Export terminé");
+      }
+    } catch (error) {
+      setExportProgress({
+        active: false,
+        total: pendingExportReadyCount,
+        completed: 0,
+        failed: pendingExportReadyCount,
+        currentClipId: null,
+        currentClipTitle: null,
+        currentStep: "failed",
+        progress: 100,
+        message: String(error),
+      });
+      await refresh();
+      showToast(`Export: ${String(error)}`);
+    } finally {
+      setIsExporting(false);
     }
   }
 
@@ -680,10 +727,16 @@ function Clips() {
           <p className="text-sm text-zinc-500">{galleryItems.length} clips affichés</p>
         </div>
         <div className="flex gap-2">
-          {pendingExportCount > 0 && (
-            <button className="primary-action w-fit px-5" onClick={() => void exportNow()}>
+          {(pendingExportCount > 0 || isExporting) && (
+            <button
+              className="primary-action w-fit px-5"
+              disabled={isExporting || pendingExportReadyCount === 0}
+              onClick={() => void exportNow()}
+            >
               <Download className="h-4 w-4" />
-              {pendingExportReadyCount > 0
+              {isExporting
+                ? "Export en cours..."
+                : pendingExportReadyCount > 0
                 ? "Exporter maintenant"
                 : nextExportableInSeconds == null
                   ? "Exporter maintenant"
@@ -731,7 +784,9 @@ function Clips() {
       {pendingExportCount > 0 && (
         <div className="processing-banner pending-export-banner">
           {pendingExportCount} clip{pendingExportCount > 1 ? "s" : ""} en attente d'export
-          <button onClick={() => void exportNow()}>Exporter maintenant</button>
+          <button disabled={isExporting || pendingExportReadyCount === 0} onClick={() => void exportNow()}>
+            {isExporting ? "Export en cours..." : "Exporter maintenant"}
+          </button>
         </div>
       )}
       {galleryItems.length === 0 ? (
@@ -746,7 +801,12 @@ function Clips() {
                 onDelete={() => void remove(clip.filePath!)}
               />
             ) : (
-              <ClipProcessingCard key={clip.id} clip={clip} />
+              <ClipProcessingCard
+                key={clip.id}
+                clip={clip}
+                disabledExport={isExporting || pendingExportReadyCount === 0}
+                onExportNow={() => void exportNow()}
+              />
             )
           ))}
         </div>
@@ -810,24 +870,24 @@ function galleryItemToClipInfo(clip: GalleryClipItem): ClipInfo {
   };
 }
 
-function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
+function ClipProcessingCard({
+  clip,
+  disabledExport,
+  onExportNow,
+}: {
+  clip: GalleryClipItem;
+  disabledExport: boolean;
+  onExportNow: () => void;
+}) {
   const { setPendingExportClips, showToast } = useAppStore();
   const failed = clip.status === "failed";
   const waiting = clip.status === "waiting_post_event";
   const freezing = clip.status === "freezing_segments";
-  const pending = clip.status === "ready_to_export" || clip.status === "pending_export";
+  const pending = (clip.status === "ready_to_export" || clip.status === "pending_export") && clip.canExport !== false;
   const expired = clip.status === "expired";
   const exporting = clip.status === "exporting";
   const progress = clip.progress ?? (failed ? 0 : 48);
   const exportableIn = waiting && clip.isExportable === false ? nextPendingExportableSeconds([clip]) : null;
-  async function exportNow() {
-    const summary = await invoke<ExportSummary>("export_pending_clips");
-    const pendingClips = await invoke<PendingClipExportDto[]>("get_pending_export_clips");
-    setPendingExportClips(pendingClips);
-    if (summary.total === 0 && pendingClips.length > 0) {
-      showToast("Certains clips ne sont pas encore prêts à exporter");
-    }
-  }
   async function removePending() {
     await invoke("delete_pending_export_clip", { id: clip.id });
     const pendingClips = await invoke<PendingClipExportDto[]>("get_pending_export_clips");
@@ -880,9 +940,9 @@ function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
           </div>
         )}
         {pending && (
-          <button className="delete-button mt-3" onClick={() => void exportNow()}>
+          <button className="delete-button mt-3" disabled={disabledExport} onClick={onExportNow}>
             <Download className="h-3.5 w-3.5" />
-            Exporter maintenant
+            {disabledExport ? "Export en cours..." : "Exporter maintenant"}
           </button>
         )}
         {expired && (
@@ -898,10 +958,12 @@ function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
           <div className="mt-3 rounded-md border border-[#ff8d7a]/25 bg-[#351711]/45 px-3 py-2 text-xs text-[#ffb7aa]">
             <div className="font-bold text-[#ffd0c7]">Détails</div>
             <p className="mt-2 break-words">{clip.error ?? "Erreur pendant la création du clip"}</p>
-            <button className="delete-button mt-3" onClick={() => void exportNow()}>
-              <RefreshCcw className="h-3.5 w-3.5" />
-              Réessayer
-            </button>
+            {clip.canExport !== false && (
+              <button className="delete-button mt-3" disabled={disabledExport} onClick={onExportNow}>
+                <RefreshCcw className="h-3.5 w-3.5" />
+                {disabledExport ? "Export en cours..." : "Réessayer"}
+              </button>
+            )}
             <button className="delete-button mt-2" onClick={() => void removePending()}>
               <Trash2 className="h-3.5 w-3.5" />
               Supprimer

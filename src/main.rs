@@ -457,7 +457,7 @@ async fn scan_clips(output_dir: PathBuf) -> anyhow::Result<(Vec<ClipInfo>, u64)>
                 modified_secs_ago,
             });
         }
-        clips.sort_by_key(|clip| std::cmp::Reverse(clip.modified_secs_ago));
+        clips.sort_by_key(|clip| clip.modified_secs_ago);
         Ok((clips, total_bytes))
     })
     .await?
@@ -995,8 +995,8 @@ mod tests {
             resolve_configured_video_quality(&config, Some(QualityPreset::Medium), None, None)
                 .unwrap();
 
-        assert_eq!(quality.fps, 60);
-        assert_eq!(quality.video_bitrate_kbps, 12_000);
+        assert_eq!(quality.fps, 30);
+        assert_eq!(quality.video_bitrate_kbps, 10_000);
         assert_eq!(quality.encoder_cpu_used, 4);
     }
 

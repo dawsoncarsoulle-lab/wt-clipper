@@ -67,6 +67,9 @@ pub struct ClipStatusPayload {
     pub size_bytes: Option<u64>,
     pub progress: Option<u8>,
     pub error: Option<String>,
+    pub exportable_at: Option<String>,
+    pub can_export: bool,
+    pub retryable: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

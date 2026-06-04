@@ -29,6 +29,22 @@ pub fn concatenate_segments_to_webm(
             .with_context(|| format!("failed to create output directory {}", parent.display()))?;
     }
 
+    let temp_output_path = output_path.with_extension(
+        output_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!("{extension}.tmp"))
+            .unwrap_or_else(|| "tmp".to_owned()),
+    );
+    if temp_output_path.exists() {
+        fs::remove_file(&temp_output_path).with_context(|| {
+            format!(
+                "failed to remove stale temporary concat output {}",
+                temp_output_path.display()
+            )
+        })?;
+    }
+
     gst::init().context("failed to initialize GStreamer")?;
     debug!(
         target_bitrate = quality.bitrate_bps(),
@@ -38,29 +54,46 @@ pub fn concatenate_segments_to_webm(
     let mut result = None;
     if resolve_system_audio_source().is_some() {
         let audio_pipeline =
-            concat_pipeline_description_with_audio(&segments, &output_path, quality);
+            concat_pipeline_description_with_audio(&segments, &temp_output_path, quality);
         debug!(pipeline = %audio_pipeline, "final audio/video concat pipeline");
-        match run_concat_description(&audio_pipeline, &output_path) {
+        match run_concat_description(&audio_pipeline, &temp_output_path) {
             Ok(()) => result = Some(Ok(())),
             Err(error) => {
                 warn!(%error, "audio/video concat failed; retrying video-only concat");
-                if let Err(remove_error) = fs::remove_file(&output_path) {
-                    debug!(%remove_error, path = %output_path.display(), "failed to remove partial concat output");
+                if let Err(remove_error) = fs::remove_file(&temp_output_path) {
+                    debug!(%remove_error, path = %temp_output_path.display(), "failed to remove partial concat output");
                 }
             }
         }
     }
 
     if result.is_none() {
-        let pipeline_description = concat_pipeline_description(&segments, &output_path, quality);
+        let pipeline_description =
+            concat_pipeline_description(&segments, &temp_output_path, quality);
         debug!(
             pipeline = %pipeline_description,
             "final video-only concat pipeline"
         );
-        result = Some(run_concat_description(&pipeline_description, &output_path));
+        result = Some(run_concat_description(
+            &pipeline_description,
+            &temp_output_path,
+        ));
     }
 
-    result.expect("concat result is always set")?;
+    if let Err(error) = result.expect("concat result is always set") {
+        if let Err(remove_error) = fs::remove_file(&temp_output_path) {
+            debug!(%remove_error, path = %temp_output_path.display(), "failed to remove failed temporary concat output");
+        }
+        return Err(error);
+    }
+    verify_output_file(&temp_output_path)?;
+    fs::rename(&temp_output_path, &output_path).with_context(|| {
+        format!(
+            "failed to move temporary concat output {} to {}",
+            temp_output_path.display(),
+            output_path.display()
+        )
+    })?;
     Ok(output_path)
 }
 
@@ -239,9 +272,9 @@ mod tests {
         );
 
         assert!(pipeline.contains("concat name=c"));
-        assert!(pipeline.contains("video/x-raw,framerate=60/1"));
+        assert!(pipeline.contains("video/x-raw,framerate=30/1"));
         assert!(pipeline.contains(
-            "vp8enc deadline=1 end-usage=cbr target-bitrate=20000000 cpu-used=2 keyframe-max-dist=120"
+            "vp8enc deadline=1 end-usage=cbr target-bitrate=10000000 cpu-used=4 keyframe-max-dist=60"
         ));
         assert!(pipeline.contains("decodebin"));
         assert!(pipeline.contains("/tmp/segment-000001.webm"));

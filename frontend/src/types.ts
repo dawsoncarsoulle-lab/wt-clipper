@@ -45,6 +45,10 @@ export type ClipStatusChangedPayload = {
   sizeBytes?: number | null;
   progress?: number | null;
   error?: string | null;
+  exportableAt?: string | null;
+  isExportable?: boolean | null;
+  canExport?: boolean | null;
+  retryable?: boolean | null;
 };
 
 export type GalleryClipItem = {

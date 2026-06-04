@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum QualityPreset {
     Low,
-    Medium,
     #[default]
+    Medium,
     High,
 }
 
@@ -27,13 +27,13 @@ impl QualityPreset {
                 encoder_cpu_used: 6,
             },
             Self::Medium => VideoQuality {
-                fps: 60,
-                video_bitrate_kbps: 12_000,
+                fps: 30,
+                video_bitrate_kbps: 10_000,
                 encoder_cpu_used: 4,
             },
             Self::High => VideoQuality {
                 fps: 60,
-                video_bitrate_kbps: 20_000,
+                video_bitrate_kbps: 16_000,
                 encoder_cpu_used: 2,
             },
         }
@@ -49,7 +49,7 @@ pub struct VideoQuality {
 
 impl Default for VideoQuality {
     fn default() -> Self {
-        QualityPreset::High.video_quality()
+        QualityPreset::Medium.video_quality()
     }
 }
 
@@ -131,8 +131,8 @@ mod tests {
         assert_eq!(
             QualityPreset::Medium.video_quality(),
             VideoQuality {
-                fps: 60,
-                video_bitrate_kbps: 12_000,
+                fps: 30,
+                video_bitrate_kbps: 10_000,
                 encoder_cpu_used: 4,
             }
         );
@@ -140,7 +140,7 @@ mod tests {
             QualityPreset::High.video_quality(),
             VideoQuality {
                 fps: 60,
-                video_bitrate_kbps: 20_000,
+                video_bitrate_kbps: 16_000,
                 encoder_cpu_used: 2,
             }
         );
@@ -148,8 +148,8 @@ mod tests {
 
     #[test]
     fn converts_kbps_to_bits_per_second() {
-        let quality = VideoQuality::new(60, 20_000, 2).unwrap();
-        assert_eq!(quality.bitrate_bps(), 20_000_000);
+        let quality = VideoQuality::new(60, 16_000, 2).unwrap();
+        assert_eq!(quality.bitrate_bps(), 16_000_000);
     }
 
     #[test]
@@ -159,7 +159,7 @@ mod tests {
             60
         );
         assert_eq!(
-            VideoQuality::new(60, 20_000, 2)
+            VideoQuality::new(60, 16_000, 2)
                 .unwrap()
                 .keyframe_max_dist(),
             120
@@ -188,7 +188,7 @@ mod tests {
     fn fps_override_replaces_preset_fps() {
         let quality = VideoQuality::with_overrides(QualityPreset::High, Some(30), None).unwrap();
         assert_eq!(quality.fps, 30);
-        assert_eq!(quality.video_bitrate_kbps, 20_000);
+        assert_eq!(quality.video_bitrate_kbps, 16_000);
         assert_eq!(quality.encoder_cpu_used, 2);
     }
 }

@@ -936,7 +936,7 @@ async fn scan_clips(
                 modified_secs_ago,
             });
         }
-        clips.sort_by_key(|clip| std::cmp::Reverse(clip.modified_secs_ago));
+        clips.sort_by_key(|clip| clip.modified_secs_ago);
         Ok((clips, total_bytes))
     })
     .await?

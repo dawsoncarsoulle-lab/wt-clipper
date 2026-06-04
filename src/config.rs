@@ -100,7 +100,7 @@ pub struct PendingExportsConfig {
 
 impl Default for ClipConfig {
     fn default() -> Self {
-        let quality = QualityPreset::High;
+        let quality = QualityPreset::Medium;
         let video_quality = quality.video_quality();
         Self {
             seconds: default_clip_seconds(),
@@ -254,9 +254,9 @@ segment_seconds = 2
 post_event_seconds = 5
 multi_kill_window_seconds = 8
 output_dir = "~/Videos/WarThunder Clips"
-quality = "high"
-fps = 60
-video_bitrate_kbps = 20000
+quality = "medium"
+fps = 30
+video_bitrate_kbps = 10000
 source = "window"
 keep_segments = false
 export_mode = "deferred"
@@ -325,11 +325,11 @@ fn default_pending_max_age_hours() -> u64 {
 }
 
 fn default_fps() -> u32 {
-    60
+    30
 }
 
 fn default_video_bitrate_kbps() -> u32 {
-    20_000
+    10_000
 }
 
 fn default_base_url() -> String {
@@ -368,7 +368,7 @@ mod tests {
         let config = AppConfig::load(Some(&path)).unwrap();
 
         assert_eq!(config.clip.seconds, 20);
-        assert_eq!(config.clip.quality, QualityPreset::High);
+        assert_eq!(config.clip.quality, QualityPreset::Medium);
         assert_eq!(config.clip.source, CaptureSource::Window);
     }
 
@@ -377,7 +377,7 @@ mod tests {
         let config: AppConfig = toml::from_str(default_config_toml()).unwrap();
 
         assert_eq!(config.clip.seconds, 20);
-        assert_eq!(config.clip.video_bitrate_kbps, 20_000);
+        assert_eq!(config.clip.video_bitrate_kbps, 10_000);
         assert_eq!(config.clip.multi_kill_window_seconds, 8);
         assert_eq!(config.war_thunder.poll_interval_ms, 300);
         assert!(config.triggers.target_destroyed);
