@@ -691,6 +691,7 @@ fn log_bridge_event_received(event: &AppEvent) {
                 total = payload.total,
                 completed = payload.completed,
                 failed = payload.failed,
+                ?payload.current_clip_number,
                 progress = payload.progress,
                 ?payload.current_step,
                 "AppEvent::ExportProgressChanged received from backend"

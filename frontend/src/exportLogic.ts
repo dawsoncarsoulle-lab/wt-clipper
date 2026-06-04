@@ -29,6 +29,15 @@ export function canCloseExportModal(
   return exportProgress.currentStep === "done" || exportProgress.currentStep === "failed";
 }
 
+export function currentExportClipNumber(exportProgress: ExportProgressPayload): number {
+  if (exportProgress.total <= 0) return 0;
+  if (typeof exportProgress.currentClipNumber === "number") {
+    return Math.min(Math.max(1, exportProgress.currentClipNumber), exportProgress.total);
+  }
+
+  return Math.min(exportProgress.completed + exportProgress.failed + 1, exportProgress.total);
+}
+
 export function formatClipDuration(durationSeconds: number | null | undefined): string {
   const total = Math.max(0, Math.floor(durationSeconds ?? 0));
   const minutes = Math.floor(total / 60);

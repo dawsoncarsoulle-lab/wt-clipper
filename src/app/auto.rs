@@ -834,6 +834,7 @@ impl ExportQueue {
                         total,
                         completed: 0,
                         failed: total,
+                        current_clip_number: None,
                         current_clip_id: None,
                         current_clip_title: None,
                         current_step: ExportProgressStep::Failed,
@@ -851,6 +852,7 @@ impl ExportQueue {
                 total,
                 completed: 0,
                 failed: 0,
+                current_clip_number: None,
                 current_clip_id: None,
                 current_clip_title: None,
                 current_step: ExportProgressStep::Preparing,
@@ -959,6 +961,17 @@ impl ExportQueue {
                             continue;
                         }
                     };
+                    emit_clip_export_step(
+                        auto_config,
+                        &clip,
+                        total,
+                        summary.completed,
+                        summary.failed,
+                        position,
+                        ExportProgressStep::Metadata,
+                        0.97,
+                        "Vérification des metadata",
+                    );
                     emit_clip_export_step(
                         auto_config,
                         &clip,
@@ -1078,6 +1091,7 @@ impl ExportQueue {
                 total: summary.total,
                 completed: summary.completed,
                 failed: summary.failed,
+                current_clip_number: None,
                 current_clip_id: None,
                 current_clip_title: None,
                 current_step: if summary.failed > 0 {
@@ -2923,13 +2937,7 @@ fn emit_clip_export_step(
     clip_progress: f32,
     label: &str,
 ) {
-    let progress = if total == 0 {
-        100
-    } else {
-        (((completed as f32 + clip_progress) / total as f32) * 100.0)
-            .round()
-            .clamp(0.0, 100.0) as u8
-    };
+    let progress = export_step_progress_percent(total, position, clip_progress);
     emit_export_progress(
         auto_config,
         ExportProgressPayload {
@@ -2937,6 +2945,7 @@ fn emit_clip_export_step(
             total,
             completed,
             failed,
+            current_clip_number: Some(position + 1),
             current_clip_id: Some(clip.id.clone()),
             current_clip_title: Some(clip.title.clone()),
             current_step,
@@ -2944,6 +2953,16 @@ fn emit_clip_export_step(
             message: format!("{label} {} / {}...", position + 1, total),
         },
     );
+}
+
+fn export_step_progress_percent(total: usize, position: usize, clip_progress: f32) -> u8 {
+    if total == 0 {
+        return 100;
+    }
+
+    (((position as f32 + clip_progress.clamp(0.0, 1.0)) / total as f32) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as u8
 }
 
 fn preflight_export_disk_space(
@@ -3074,6 +3093,18 @@ fn verify_completed_export(
 }
 
 fn emit_export_progress(auto_config: &AutoClipConfig, payload: ExportProgressPayload) {
+    info!(
+        active = payload.active,
+        total = payload.total,
+        completed = payload.completed,
+        failed = payload.failed,
+        current_clip_number = ?payload.current_clip_number,
+        current_clip_id = ?payload.current_clip_id,
+        current_clip_title = ?payload.current_clip_title,
+        current_step = ?payload.current_step,
+        progress = payload.progress,
+        "[EXPORT] progress"
+    );
     send_ui_event(auto_config, AppEvent::ExportProgressChanged { payload });
 }
 
@@ -3208,6 +3239,56 @@ mod tests {
         let segments_dir = pending_dir.join("segments");
         std::fs::create_dir_all(&segments_dir).unwrap();
         std::fs::write(segments_dir.join("segment-000000.webm"), b"segment").unwrap();
+    }
+
+    #[test]
+    fn export_progress_formula_advances_across_five_clips() {
+        assert_eq!(export_step_progress_percent(5, 0, 0.05), 1);
+        assert_eq!(export_step_progress_percent(5, 0, 0.85), 17);
+        assert_eq!(export_step_progress_percent(5, 1, 0.05), 21);
+        assert_eq!(export_step_progress_percent(5, 4, 1.0), 100);
+    }
+
+    #[test]
+    fn export_progress_event_includes_current_clip_number() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut config = test_auto_config(5, 2);
+        config.ui_events = Some(tx);
+        let root = std::env::temp_dir().join(format!(
+            "wt-clipper-progress-event-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let clip = pending_export_for_test(
+            "clip-2",
+            "target-destroyed|clip-2",
+            PendingExportStatus::ReadyToExport,
+            root.join("clip-2"),
+        );
+
+        emit_clip_export_step(
+            &config,
+            &clip,
+            5,
+            1,
+            0,
+            1,
+            ExportProgressStep::Preparing,
+            0.05,
+            "Préparation du clip",
+        );
+
+        match rx.try_recv().unwrap() {
+            AppEvent::ExportProgressChanged { payload } => {
+                assert_eq!(payload.total, 5);
+                assert_eq!(payload.completed, 1);
+                assert_eq!(payload.current_clip_number, Some(2));
+                assert_eq!(payload.current_clip_id.as_deref(), Some("clip-2"));
+                assert_eq!(payload.current_step, ExportProgressStep::Preparing);
+                assert_eq!(payload.progress, 21);
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
     }
 
     #[test]

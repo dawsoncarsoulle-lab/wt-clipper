@@ -179,9 +179,37 @@ pub(crate) fn wait_for_eos_or_error(pipeline: &gst::Pipeline) -> anyhow::Result<
                     error.debug()
                 );
             }
+            MessageView::Warning(warning) => {
+                let source = warning.src().map(|src| src.path_string());
+                let message = warning.error().to_string();
+                let debug_msg = warning.debug().map(|debug| debug.to_string());
+                tracing::warn!(
+                    source = ?source,
+                    error = %message,
+                    debug = ?debug_msg,
+                    "[EXPORT_PIPELINE] GStreamer warning"
+                );
+                if gstreamer_warning_is_fatal(&message, debug_msg.as_deref()) {
+                    anyhow::bail!(
+                        "GStreamer warning from {:?}: {} ({:?})",
+                        source,
+                        message,
+                        debug_msg
+                    );
+                }
+            }
             _ => {}
         }
     }
+}
+
+pub(crate) fn gstreamer_warning_is_fatal(message: &str, debug: Option<&str>) -> bool {
+    let message = message.to_ascii_lowercase();
+    let debug = debug.unwrap_or_default().to_ascii_lowercase();
+    let text = format!("{message} {debug}");
+    text.contains("splitmuxsink")
+        || text.contains("will not work")
+        || text.contains("could not add sink")
 }
 
 fn verify_output_file(path: &Path) -> anyhow::Result<()> {
@@ -459,5 +487,14 @@ mod tests {
         assert!(pipeline.contains("webmmux name=mux"));
         assert!(pipeline.contains("pulsesrc device=\"alsa_output.test.monitor\""));
         assert!(pipeline.contains("opusenc bitrate=128000"));
+    }
+
+    #[test]
+    fn splitmuxsink_warning_is_fatal() {
+        assert!(gstreamer_warning_is_fatal(
+            "Could not add sink_28 element",
+            Some("splitmuxsink will not work")
+        ));
+        assert!(!gstreamer_warning_is_fatal("latency redistribution", None));
     }
 }

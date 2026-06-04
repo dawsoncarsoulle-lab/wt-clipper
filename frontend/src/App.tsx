@@ -34,6 +34,7 @@ import {
 import { useAppStore } from "./store";
 import {
   canCloseExportModal,
+  currentExportClipNumber,
   exportableCount,
   formatClipDuration,
   shouldShowExportButton,
@@ -94,6 +95,15 @@ export function App() {
     console.info("[FRONTEND] listening to buffer-progress");
     console.info("[FRONTEND] listening to kill-detected");
     console.info("[FRONTEND] listening to clip-saved");
+    console.info("[FRONTEND] listening to export_progress_changed");
+    console.info("[FRONTEND] listening to export-progress-changed");
+    const handleExportProgress = (payload: ExportProgressPayload) => {
+      console.info("[FRONTEND] received export progress", payload);
+      store.setExportProgress(payload);
+      if (!payload.active) {
+        store.setIsExporting(false);
+      }
+    };
     const unsubs = [
       listen("wt-connected", () => {
         console.info("[FRONTEND] received wt-connected");
@@ -151,11 +161,10 @@ export function App() {
         }
       }),
       listen<ExportProgressPayload>("export_progress_changed", (event) => {
-        console.info("[FRONTEND] received export_progress_changed", event.payload);
-        store.setExportProgress(event.payload);
-        if (!event.payload.active) {
-          store.setIsExporting(false);
-        }
+        handleExportProgress(event.payload);
+      }),
+      listen<ExportProgressPayload>("export-progress-changed", (event) => {
+        handleExportProgress(event.payload);
       }),
       listen<{ message: string }>("clip-failed", (event) => {
         console.info("[FRONTEND] received clip-failed", event.payload);
@@ -515,6 +524,7 @@ function ExportProgressModal() {
     progressState.currentStep === "done" ||
     progressState.currentStep === "failed";
   const hasErrors = progressState.failed > 0;
+  const currentClipNumber = currentExportClipNumber(progressState);
 
   function close() {
     if (!canClose) {
@@ -548,7 +558,7 @@ function ExportProgressModal() {
                   ? hasErrors
                     ? `${progressState.completed} clips exportés, ${progressState.failed} erreur`
                     : "Export terminé"
-                  : `Clip ${Math.min(progressState.completed + 1, progressState.total)} / ${progressState.total}`}
+                  : `Clip ${currentClipNumber} / ${progressState.total}`}
               </h2>
             </div>
             <button

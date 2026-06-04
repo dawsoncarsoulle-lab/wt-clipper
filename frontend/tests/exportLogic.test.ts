@@ -1,10 +1,12 @@
 import {
   canCloseExportModal,
+  currentExportClipNumber,
   exportableCount,
   formatClipDuration,
   shouldShowExportButton,
 } from "../src/exportLogic.js";
-import type { ExportProgressPayload, GalleryClipItem } from "../src/types.js";
+import { mergePendingExportClips } from "../src/pendingQueueState.js";
+import type { ExportProgressPayload, GalleryClipItem, PendingClipExportDto } from "../src/types.js";
 
 function test(name: string, run: () => void) {
   try {
@@ -34,12 +36,29 @@ function clip(status: GalleryClipItem["status"], canExport = false, retryable = 
   };
 }
 
+function pendingDto(id: string): PendingClipExportDto {
+  return {
+    id,
+    status: "ready_to_export",
+    reason: "target-destroyed",
+    title: id,
+    createdAt: new Date().toISOString(),
+    exportableAt: new Date().toISOString(),
+    isExportable: true,
+    canExport: true,
+    retryable: false,
+    progress: 100,
+    error: null,
+  };
+}
+
 function progress(active: boolean, currentStep: ExportProgressPayload["currentStep"]): ExportProgressPayload {
   return {
     active,
     total: 3,
     completed: 0,
     failed: 0,
+    currentClipNumber: null,
     currentClipId: null,
     currentClipTitle: null,
     currentStep,
@@ -132,4 +151,101 @@ test("2 waiting + 3 ready_to_export => modal total=3", () => {
     ]),
     3,
   );
+});
+
+test("setPendingExportClips_empty_clears_old_pending", () => {
+  const state = mergePendingExportClips([clip("ready_to_export", true)], []);
+
+  assertEqual(state.length, 0);
+});
+
+test("setPendingExportClips avec les memes 5 DTO deux fois reste a 5", () => {
+  const backend = [1, 2, 3, 4, 5].map((index) => pendingDto(`clip-${index}`));
+  const first = mergePendingExportClips([], backend);
+  const second = mergePendingExportClips(first, backend);
+
+  assertEqual(first.length, 5);
+  assertEqual(second.length, 5);
+});
+
+test("ouvrir fermer la galerie plusieurs fois ne duplique pas la queue", () => {
+  const backend = [1, 2, 3, 4, 5].map((index) => pendingDto(`clip-${index}`));
+  let state: GalleryClipItem[] = [];
+
+  for (let index = 0; index < 5; index += 1) {
+    state = mergePendingExportClips(state, backend);
+  }
+
+  assertEqual(state.length, 5);
+});
+
+test("refreshPendingExportClips ne doit jamais append aveuglement", () => {
+  const backend = [1, 2, 3, 4, 5].map((index) => pendingDto(`clip-${index}`));
+  const state = mergePendingExportClips(mergePendingExportClips([], backend), backend);
+  const ids = new Set(state.map((item) => item.id));
+
+  assertEqual(state.length, ids.size);
+  assertEqual(state.length, 5);
+});
+
+test("export de 5 clips => la modal avance de clip 1 a 5", () => {
+  const events: ExportProgressPayload[] = [1, 2, 3, 4, 5].map((currentClipNumber) => ({
+    active: true,
+    total: 5,
+    completed: currentClipNumber - 1,
+    failed: 0,
+    currentClipNumber,
+    currentClipId: `clip-${currentClipNumber}`,
+    currentClipTitle: `Clip ${currentClipNumber}`,
+    currentStep: "encoding",
+    progress: currentClipNumber * 20 - 3,
+    message: "Encodage",
+  }));
+
+  assertEqual(events.map(currentExportClipNumber).join(","), "1,2,3,4,5");
+});
+
+test("la modal ne reste pas bloquee a preparing 0 si l_export avance", () => {
+  const events: ExportProgressPayload[] = [
+    {
+      active: true,
+      total: 5,
+      completed: 0,
+      failed: 0,
+      currentClipNumber: 1,
+      currentClipId: "clip-1",
+      currentClipTitle: "Clip 1",
+      currentStep: "preparing",
+      progress: 1,
+      message: "Préparation",
+    },
+    {
+      active: true,
+      total: 5,
+      completed: 0,
+      failed: 0,
+      currentClipNumber: 1,
+      currentClipId: "clip-1",
+      currentClipTitle: "Clip 1",
+      currentStep: "encoding",
+      progress: 17,
+      message: "Encodage",
+    },
+    {
+      active: true,
+      total: 5,
+      completed: 1,
+      failed: 0,
+      currentClipNumber: 2,
+      currentClipId: "clip-2",
+      currentClipTitle: "Clip 2",
+      currentStep: "preparing",
+      progress: 21,
+      message: "Préparation",
+    },
+  ];
+
+  assertEqual(events.some((event) => event.progress > 0), true);
+  assertEqual(events.some((event) => event.currentStep !== "preparing"), true);
+  assertEqual(events.map(currentExportClipNumber).join(","), "1,1,2");
 });

@@ -14,7 +14,7 @@ use tokio::{
     sync::mpsc,
     time::{interval, MissedTickBehavior},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -25,8 +25,8 @@ use crate::{
         portal::PortalScreencastSession,
         quality::{QualityPreset, VideoQuality},
         recorder::{
-            choose_backend, encode_location, wait_for_eos_or_error, x11_source_chain,
-            CaptureBackend, PipelineSource,
+            choose_backend, encode_location, gstreamer_warning_is_fatal, wait_for_eos_or_error,
+            x11_source_chain, CaptureBackend, PipelineSource,
         },
         segments::{
             prune_old_segments, segment_file_name, segment_location_pattern, segments_to_keep,
@@ -203,7 +203,10 @@ impl ReplayBufferHandle {
             config.quality,
             audio_source.as_ref(),
         )?;
-        info!(pipeline = %pipeline_description, "starting replay buffer pipeline");
+        info!(
+            pipeline = %pipeline_description,
+            "[BUFFER_PIPELINE] replay buffer pipeline"
+        );
 
         let element =
             gst::parse::launch(&pipeline_description).context("failed to build pipeline")?;
@@ -1207,6 +1210,25 @@ fn check_pipeline_bus(pipeline: &gst::Pipeline) -> anyhow::Result<()> {
                     error.error(),
                     error.debug()
                 );
+            }
+            MessageView::Warning(warning) => {
+                let source = warning.src().map(|src| src.path_string());
+                let message = warning.error().to_string();
+                let debug_msg = warning.debug().map(|debug| debug.to_string());
+                warn!(
+                    source = ?source,
+                    error = %message,
+                    debug = ?debug_msg,
+                    "[BUFFER_PIPELINE] GStreamer warning"
+                );
+                if gstreamer_warning_is_fatal(&message, debug_msg.as_deref()) {
+                    anyhow::bail!(
+                        "GStreamer buffer pipeline warning from {:?}: {} ({:?})",
+                        source,
+                        message,
+                        debug_msg
+                    );
+                }
             }
             MessageView::Eos(_) => anyhow::bail!("replay buffer pipeline ended unexpectedly"),
             _ => {}

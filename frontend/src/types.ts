@@ -96,6 +96,7 @@ export type ExportProgressStep =
   | "extracting"
   | "assembling"
   | "encoding"
+  | "metadata"
   | "thumbnail"
   | "saving"
   | "done"
@@ -106,6 +107,7 @@ export type ExportProgressPayload = {
   total: number;
   completed: number;
   failed: number;
+  currentClipNumber?: number | null;
   currentClipId?: string | null;
   currentClipTitle?: string | null;
   currentStep: ExportProgressStep;

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { mergePendingExportClips } from "./pendingQueueState";
 import type {
   AppConfig,
   ClipInfo,
@@ -132,35 +133,7 @@ export const useAppStore = create<AppState>((set) => ({
     }),
   setPendingExportClips: (clips) =>
     set((state) => {
-      const items = clips.map((clip): GalleryClipItem => ({
-        id: clip.id,
-        status: clip.status,
-        reason: clip.reason,
-        createdAt: clip.createdAt,
-        title: clip.title,
-        progress: clip.progress ?? undefined,
-        error: clip.error ?? undefined,
-        exportableAt: clip.exportableAt,
-        isExportable: clip.isExportable,
-        canExport: clip.canExport,
-        retryable: clip.retryable,
-      }));
-      const backendIds = new Set(items.map((item) => item.id));
-      const queueStatuses = new Set<ClipStatus>([
-        "waiting_post_event",
-        "freezing_segments",
-        "ready_to_export",
-        "exporting",
-        "failed",
-        "expired",
-      ]);
-      const preserved = state.processingClips.filter((clip) => {
-        if (queueStatuses.has(clip.status)) {
-          return backendIds.has(clip.id);
-        }
-        return clip.status !== "ready";
-      });
-      return { processingClips: [...items, ...preserved] };
+      return { processingClips: mergePendingExportClips(state.processingClips, clips) };
     }),
   setExportProgress: (exportProgress) => set({ exportProgress }),
   setIsExporting: (isExporting) => set({ isExporting }),

@@ -6,7 +6,7 @@ use std::{
 use anyhow::Context;
 use gst::prelude::*;
 use gstreamer as gst;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::capture::{
     audio::resolve_system_audio_source,
@@ -55,7 +55,10 @@ pub fn concatenate_segments_to_webm(
     if resolve_system_audio_source().is_some() {
         let audio_pipeline =
             concat_pipeline_description_with_audio(&segments, &temp_output_path, quality);
-        debug!(pipeline = %audio_pipeline, "final audio/video concat pipeline");
+        info!(
+            pipeline = %audio_pipeline,
+            "[EXPORT_PIPELINE] audio/video concat pipeline"
+        );
         match run_concat_description(&audio_pipeline, &temp_output_path) {
             Ok(()) => result = Some(Ok(())),
             Err(error) => {
@@ -70,9 +73,9 @@ pub fn concatenate_segments_to_webm(
     if result.is_none() {
         let pipeline_description =
             concat_pipeline_description(&segments, &temp_output_path, quality);
-        debug!(
+        info!(
             pipeline = %pipeline_description,
-            "final video-only concat pipeline"
+            "[EXPORT_PIPELINE] video-only concat pipeline"
         );
         result = Some(run_concat_description(
             &pipeline_description,
