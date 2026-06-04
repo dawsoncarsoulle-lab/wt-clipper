@@ -26,7 +26,7 @@ use wt_clipper::{
     },
     config::{default_config_path, AppConfig, ClipConfig, ClipExportMode},
     doctor::{self, DoctorReport},
-    ui::bridge::{AppEvent, ClipInfo, UiCommand},
+    ui::bridge::{AppEvent, ClipInfo, ExportProgressPayload, UiCommand},
     warthunder::client::WarThunderClient,
 };
 
@@ -198,6 +198,7 @@ struct RuntimeStatus {
     pending_export_bytes: u64,
     clips_saved: usize,
     recent_events: Vec<RuntimeEvent>,
+    export_progress: Option<ExportProgressPayload>,
     last_error: Option<String>,
 }
 
@@ -233,6 +234,7 @@ impl RuntimeStatus {
             pending_export_bytes: 0,
             clips_saved: 0,
             recent_events: Vec::new(),
+            export_progress: None,
             last_error: None,
         }
     }
@@ -746,6 +748,9 @@ fn update_runtime_status(runtime_status: &Arc<Mutex<RuntimeStatus>>, event: &App
         AppEvent::ClipSaved { .. } => {
             status.clips_saved = status.clips_saved.saturating_add(1);
             status.last_error = None;
+        }
+        AppEvent::ExportProgressChanged { payload } => {
+            status.export_progress = Some(payload.clone());
         }
         AppEvent::ClipsLoaded { clips, .. } => status.clips_saved = clips.len(),
         _ => {}

@@ -108,8 +108,8 @@ export type ExportProgressPayload = {
   completed: number;
   failed: number;
   currentClipNumber?: number | null;
-  currentClipId?: string | null;
-  currentClipTitle?: string | null;
+  currentClipId: string | null;
+  currentClipTitle: string | null;
   currentStep: ExportProgressStep;
   progress: number;
   message: string;
@@ -181,6 +181,7 @@ export type RuntimeStatus = {
   pendingExportDir: string;
   pendingExportBytes: number;
   clipsSaved: number;
+  exportProgress?: ExportProgressPayload | null;
   recentEvents: Array<{
     id: string;
     at: string;

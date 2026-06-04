@@ -3,6 +3,7 @@ import {
   currentExportClipNumber,
   exportableCount,
   formatClipDuration,
+  mapExportProgressPayload,
   shouldShowExportButton,
 } from "../src/exportLogic.js";
 import { mergePendingExportClips } from "../src/pendingQueueState.js";
@@ -248,4 +249,110 @@ test("la modal ne reste pas bloquee a preparing 0 si l_export avance", () => {
   assertEqual(events.some((event) => event.progress > 0), true);
   assertEqual(events.some((event) => event.currentStep !== "preparing"), true);
   assertEqual(events.map(currentExportClipNumber).join(","), "1,1,2");
+});
+
+test("payload snake_case est mappe correctement", () => {
+  const mapped = mapExportProgressPayload({
+    active: true,
+    total: 6,
+    completed: 1,
+    failed: 0,
+    current_clip_number: 2,
+    current_clip_id: "clip-2",
+    current_clip_title: "Clip 2",
+    current_step: "encoding",
+    progress: 27,
+    message: "Encodage du clip 2 / 6...",
+  });
+
+  assertEqual(mapped?.currentClipNumber, 2);
+  assertEqual(mapped?.currentClipId, "clip-2");
+  assertEqual(mapped?.currentClipTitle, "Clip 2");
+  assertEqual(mapped?.currentStep, "encoding");
+  assertEqual(mapped?.progress, 27);
+});
+
+test("reception export_progress_changed met a jour exportProgress", () => {
+  let state: ExportProgressPayload | null = null;
+  const mapped = mapExportProgressPayload({
+    active: true,
+    total: 6,
+    completed: 0,
+    failed: 0,
+    currentClipNumber: 1,
+    currentClipId: "clip-1",
+    currentClipTitle: "Clip 1",
+    currentStep: "assembling",
+    progress: 3,
+    message: "Assemblage du clip 1 / 6...",
+  });
+
+  state = mapped;
+
+  assertEqual(state?.currentStep, "assembling");
+  assertEqual(state?.progress, 3);
+});
+
+test("generic app-event export-progress-changed est mappe", () => {
+  const mapped = mapExportProgressPayload({
+    type: "export-progress-changed",
+    payload: {
+      active: true,
+      total: 6,
+      completed: 1,
+      failed: 0,
+      current_clip_number: 2,
+      current_clip_id: "clip-2",
+      current_clip_title: "Clip 2",
+      current_step: "encoding",
+      progress: 27,
+      message: "Encodage du clip 2 / 6...",
+    },
+  });
+
+  assertEqual(mapped?.currentClipNumber, 2);
+  assertEqual(mapped?.currentStep, "encoding");
+});
+
+test("modal passe de Clip 1/6 a Clip 2/6 apres event", () => {
+  const first = mapExportProgressPayload({
+    active: true,
+    total: 6,
+    completed: 0,
+    failed: 0,
+    currentClipNumber: 1,
+    currentStep: "assembling",
+    progress: 3,
+    message: "Assemblage",
+  });
+  const second = mapExportProgressPayload({
+    active: true,
+    total: 6,
+    completed: 1,
+    failed: 0,
+    currentClipNumber: 2,
+    currentStep: "assembling",
+    progress: 18,
+    message: "Assemblage",
+  });
+
+  assertEqual(first ? currentExportClipNumber(first) : 0, 1);
+  assertEqual(second ? currentExportClipNumber(second) : 0, 2);
+});
+
+test("progress 100 affiche export termine", () => {
+  const mapped = mapExportProgressPayload({
+    active: false,
+    total: 6,
+    completed: 6,
+    failed: 0,
+    currentStep: "done",
+    progress: 100,
+    message: "Export terminé",
+  });
+
+  assertEqual(mapped?.active, false);
+  assertEqual(mapped?.currentStep, "done");
+  assertEqual(mapped?.progress, 100);
+  assertEqual(mapped?.message, "Export terminé");
 });

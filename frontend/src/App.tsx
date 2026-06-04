@@ -37,6 +37,7 @@ import {
   currentExportClipNumber,
   exportableCount,
   formatClipDuration,
+  mapExportProgressPayload,
   shouldShowExportButton,
 } from "./exportLogic";
 import type { AppConfig, ClipInfo, ClipReason, DoctorReport, RuntimeStatus } from "./types";
@@ -97,10 +98,15 @@ export function App() {
     console.info("[FRONTEND] listening to clip-saved");
     console.info("[FRONTEND] listening to export_progress_changed");
     console.info("[FRONTEND] listening to export-progress-changed");
-    const handleExportProgress = (payload: ExportProgressPayload) => {
+    const handleExportProgress = (rawPayload: unknown) => {
+      const payload = mapExportProgressPayload(rawPayload);
+      if (!payload) {
+        console.info("[FRONTEND] ignored malformed export progress", rawPayload);
+        return;
+      }
       console.info("[FRONTEND] received export progress", payload);
       store.setExportProgress(payload);
-      if (!payload.active) {
+      if (!payload.active || payload.currentStep === "done" || payload.currentStep === "failed") {
         store.setIsExporting(false);
       }
     };
@@ -160,11 +166,22 @@ export function App() {
           store.showToast("Erreur pendant la création du clip");
         }
       }),
-      listen<ExportProgressPayload>("export_progress_changed", (event) => {
+      listen<unknown>("export_progress_changed", (event) => {
         handleExportProgress(event.payload);
       }),
-      listen<ExportProgressPayload>("export-progress-changed", (event) => {
+      listen<unknown>("export-progress-changed", (event) => {
         handleExportProgress(event.payload);
+      }),
+      listen<unknown>("app-event", (event) => {
+        if (
+          event.payload &&
+          typeof event.payload === "object" &&
+          "type" in event.payload &&
+          ((event.payload as { type?: unknown }).type === "export-progress-changed" ||
+            (event.payload as { type?: unknown }).type === "export_progress_changed")
+        ) {
+          handleExportProgress(event.payload);
+        }
       }),
       listen<{ message: string }>("clip-failed", (event) => {
         console.info("[FRONTEND] received clip-failed", event.payload);
@@ -226,6 +243,16 @@ export function App() {
     store.setRuntimeStatus(status);
     store.setWtConnected(status.wtConnected);
     store.setBuffer(status.bufferFilledSecs, status.bufferTotalSecs);
+    const progress = mapExportProgressPayload(status.exportProgress);
+    if (progress) {
+      const current = useAppStore.getState();
+      if (progress.active || current.isExporting || current.exportProgress?.active) {
+        store.setExportProgress(progress);
+        if (!progress.active || progress.currentStep === "done" || progress.currentStep === "failed") {
+          store.setIsExporting(false);
+        }
+      }
+    }
     for (const event of [...status.recentEvents].reverse()) {
       if (seenRuntimeEvents.current.has(event.id)) {
         continue;
@@ -578,6 +605,9 @@ function ExportProgressModal() {
             <div className="text-sm font-bold text-white">
               {progressState.currentClipTitle ?? progressState.message}
             </div>
+            {progressState.currentClipTitle && (
+              <div className="mt-1 text-sm text-zinc-300">{progressState.message}</div>
+            )}
             <div className="mt-1 text-xs uppercase text-zinc-500">{progressState.currentStep}</div>
             <div className="mt-4 h-3 overflow-hidden rounded-full bg-white/10">
               <div className="processing-progress" style={{ width: `${progressState.progress}%` }} />
@@ -716,6 +746,7 @@ function Clips() {
         total: activeExportableCount,
         completed: 0,
         failed: 0,
+        currentClipNumber: null,
         currentClipId: null,
         currentClipTitle: null,
         currentStep: "preparing",
@@ -724,6 +755,21 @@ function Clips() {
       });
       showToast("Export des clips en attente...");
       const summary = await invoke<ExportSummary>("export_pending_clips");
+      setExportProgress({
+        active: false,
+        total: summary.total || activeExportableCount,
+        completed: summary.completed,
+        failed: summary.failed,
+        currentClipNumber: null,
+        currentClipId: null,
+        currentClipTitle: null,
+        currentStep: summary.failed > 0 ? "failed" : "done",
+        progress: 100,
+        message:
+          summary.failed > 0
+            ? `${summary.completed} clips exportés, ${summary.failed} erreur${summary.failed > 1 ? "s" : ""}`
+            : "Export terminé",
+      });
       await refresh();
       if (
         summary.total === 0 &&
@@ -741,6 +787,7 @@ function Clips() {
         total: activeExportableCount,
         completed: 0,
         failed: activeExportableCount,
+        currentClipNumber: null,
         currentClipId: null,
         currentClipTitle: null,
         currentStep: "failed",

@@ -827,46 +827,13 @@ impl ExportQueue {
                 );
                 error!(%message, "deferred export preflight failed");
                 summary.failed = total;
-                emit_export_progress(
-                    auto_config,
-                    ExportProgressPayload {
-                        active: false,
-                        total,
-                        completed: 0,
-                        failed: total,
-                        current_clip_number: None,
-                        current_clip_id: None,
-                        current_clip_title: None,
-                        current_step: ExportProgressStep::Failed,
-                        progress: 0,
-                        message,
-                    },
-                );
+                emit_export_progress(auto_config, failed_export_progress_payload(total, message));
                 return summary;
             }
         }
         emit_export_progress(
             auto_config,
-            ExportProgressPayload {
-                active: total > 0,
-                total,
-                completed: 0,
-                failed: 0,
-                current_clip_number: None,
-                current_clip_id: None,
-                current_clip_title: None,
-                current_step: ExportProgressStep::Preparing,
-                progress: 0,
-                message: if total == 0 {
-                    if not_ready > 0 {
-                        "Certains clips ne sont pas encore prêts à exporter.".to_owned()
-                    } else {
-                        "Aucun clip en attente d'export".to_owned()
-                    }
-                } else {
-                    "Préparation de l'export des clips...".to_owned()
-                },
-            },
+            initial_export_progress_payload(total, not_ready),
         );
 
         for (position, clip_id) in export_ids.into_iter().enumerate() {
@@ -899,19 +866,8 @@ impl ExportQueue {
                 summary.completed,
                 summary.failed,
                 position,
-                ExportProgressStep::Preparing,
-                0.05,
-                "Préparation du clip",
-            );
-            emit_clip_export_step(
-                auto_config,
-                &clip,
-                total,
-                summary.completed,
-                summary.failed,
-                position,
                 ExportProgressStep::Assembling,
-                0.25,
+                0.15,
                 "Assemblage des segments",
             );
             emit_clip_export_step(
@@ -922,7 +878,7 @@ impl ExportQueue {
                 summary.failed,
                 position,
                 ExportProgressStep::Encoding,
-                0.85,
+                0.60,
                 "Encodage du clip",
             );
 
@@ -935,17 +891,6 @@ impl ExportQueue {
             .await;
             match result {
                 Ok(replay) => {
-                    emit_clip_export_step(
-                        auto_config,
-                        &clip,
-                        total,
-                        summary.completed,
-                        summary.failed,
-                        position,
-                        ExportProgressStep::Saving,
-                        0.95,
-                        "Sauvegarde du clip",
-                    );
                     crate::capture::buffer::print_saved_replay(&replay);
                     let final_video_path = match replay.final_video_path.as_deref() {
                         Some(path) => path.to_path_buf(),
@@ -969,8 +914,8 @@ impl ExportQueue {
                         summary.failed,
                         position,
                         ExportProgressStep::Metadata,
-                        0.97,
-                        "Vérification des metadata",
+                        0.85,
+                        "Génération des métadonnées",
                     );
                     emit_clip_export_step(
                         auto_config,
@@ -980,7 +925,7 @@ impl ExportQueue {
                         summary.failed,
                         position,
                         ExportProgressStep::Thumbnail,
-                        0.98,
+                        0.92,
                         "Génération de la miniature",
                     );
                     let thumbnail_path = generate_clip_thumbnail(&final_video_path).await;
@@ -1019,6 +964,7 @@ impl ExportQueue {
                     self.pending[index].status = PendingExportStatus::Ready;
                     self.pending[index].error = None;
                     self.pending[index].retryable = false;
+                    summary.completed += 1;
                     emit_clip_export_step(
                         auto_config,
                         &clip,
@@ -1026,11 +972,10 @@ impl ExportQueue {
                         summary.completed,
                         summary.failed,
                         position,
-                        ExportProgressStep::Done,
+                        ExportProgressStep::Saving,
                         1.0,
                         "Clip exporté",
                     );
-                    summary.completed += 1;
                     let mut payload = clip.status_payload(
                         ClipStatus::Ready,
                         Some(100),
@@ -1086,33 +1031,7 @@ impl ExportQueue {
         );
         emit_export_progress(
             auto_config,
-            ExportProgressPayload {
-                active: false,
-                total: summary.total,
-                completed: summary.completed,
-                failed: summary.failed,
-                current_clip_number: None,
-                current_clip_id: None,
-                current_clip_title: None,
-                current_step: if summary.failed > 0 {
-                    ExportProgressStep::Failed
-                } else {
-                    ExportProgressStep::Done
-                },
-                progress: 100,
-                message: if not_ready > 0 && summary.completed == 0 && summary.failed == 0 {
-                    "Certains clips ne sont pas encore prêts à exporter.".to_owned()
-                } else if summary.failed > 0 {
-                    format!(
-                        "{} clips exportés, {} erreur{}",
-                        summary.completed,
-                        summary.failed,
-                        if summary.failed > 1 { "s" } else { "" }
-                    )
-                } else {
-                    "Export terminé".to_owned()
-                },
-            },
+            done_export_progress_payload(summary, not_ready),
         );
 
         summary
@@ -2955,6 +2874,74 @@ fn emit_clip_export_step(
     );
 }
 
+fn initial_export_progress_payload(total: usize, not_ready: usize) -> ExportProgressPayload {
+    ExportProgressPayload {
+        active: total > 0,
+        total,
+        completed: 0,
+        failed: 0,
+        current_clip_number: None,
+        current_clip_id: None,
+        current_clip_title: None,
+        current_step: ExportProgressStep::Preparing,
+        progress: 0,
+        message: if total == 0 {
+            if not_ready > 0 {
+                "Certains clips ne sont pas encore prêts à exporter.".to_owned()
+            } else {
+                "Aucun clip en attente d'export".to_owned()
+            }
+        } else {
+            "Préparation de l'export...".to_owned()
+        },
+    }
+}
+
+fn failed_export_progress_payload(total: usize, message: String) -> ExportProgressPayload {
+    ExportProgressPayload {
+        active: false,
+        total,
+        completed: 0,
+        failed: total,
+        current_clip_number: None,
+        current_clip_id: None,
+        current_clip_title: None,
+        current_step: ExportProgressStep::Failed,
+        progress: 100,
+        message,
+    }
+}
+
+fn done_export_progress_payload(summary: ExportSummary, not_ready: usize) -> ExportProgressPayload {
+    ExportProgressPayload {
+        active: false,
+        total: summary.total,
+        completed: summary.completed,
+        failed: summary.failed,
+        current_clip_number: None,
+        current_clip_id: None,
+        current_clip_title: None,
+        current_step: if summary.failed > 0 {
+            ExportProgressStep::Failed
+        } else {
+            ExportProgressStep::Done
+        },
+        progress: 100,
+        message: if not_ready > 0 && summary.completed == 0 && summary.failed == 0 {
+            "Certains clips ne sont pas encore prêts à exporter.".to_owned()
+        } else if summary.failed > 0 {
+            format!(
+                "{} clips exportés, {} erreur{}",
+                summary.completed,
+                summary.failed,
+                if summary.failed > 1 { "s" } else { "" }
+            )
+        } else {
+            "Export terminé".to_owned()
+        },
+    }
+}
+
 fn export_step_progress_percent(total: usize, position: usize, clip_progress: f32) -> u8 {
     if total == 0 {
         return 100;
@@ -3093,6 +3080,7 @@ fn verify_completed_export(
 }
 
 fn emit_export_progress(auto_config: &AutoClipConfig, payload: ExportProgressPayload) {
+    let step = export_progress_step_log(payload.current_step);
     info!(
         active = payload.active,
         total = payload.total,
@@ -3103,9 +3091,46 @@ fn emit_export_progress(auto_config: &AutoClipConfig, payload: ExportProgressPay
         current_clip_title = ?payload.current_clip_title,
         current_step = ?payload.current_step,
         progress = payload.progress,
-        "[EXPORT] progress"
+        "[EXPORT_PROGRESS]"
     );
+    if let Some(current_clip_number) = payload.current_clip_number {
+        println!(
+            "[EXPORT_PROGRESS] active={} total={} completed={} failed={} clip={}/{} step={} progress={}",
+            payload.active,
+            payload.total,
+            payload.completed,
+            payload.failed,
+            current_clip_number,
+            payload.total,
+            step,
+            payload.progress
+        );
+    } else {
+        println!(
+            "[EXPORT_PROGRESS] active={} total={} completed={} failed={} step={} progress={}",
+            payload.active,
+            payload.total,
+            payload.completed,
+            payload.failed,
+            step,
+            payload.progress
+        );
+    }
     send_ui_event(auto_config, AppEvent::ExportProgressChanged { payload });
+}
+
+fn export_progress_step_log(step: ExportProgressStep) -> &'static str {
+    match step {
+        ExportProgressStep::Preparing => "preparing",
+        ExportProgressStep::Extracting => "extracting",
+        ExportProgressStep::Assembling => "assembling",
+        ExportProgressStep::Encoding => "encoding",
+        ExportProgressStep::Metadata => "metadata",
+        ExportProgressStep::Thumbnail => "thumbnail",
+        ExportProgressStep::Saving => "saving",
+        ExportProgressStep::Done => "done",
+        ExportProgressStep::Failed => "failed",
+    }
 }
 
 fn send_ui_event(auto_config: &AutoClipConfig, event: AppEvent) {
@@ -3244,13 +3269,29 @@ mod tests {
     #[test]
     fn export_progress_formula_advances_across_five_clips() {
         assert_eq!(export_step_progress_percent(5, 0, 0.05), 1);
+        assert_eq!(export_step_progress_percent(5, 0, 0.15), 3);
+        assert_eq!(export_step_progress_percent(6, 0, 0.60), 10);
         assert_eq!(export_step_progress_percent(5, 0, 0.85), 17);
         assert_eq!(export_step_progress_percent(5, 1, 0.05), 21);
         assert_eq!(export_step_progress_percent(5, 4, 1.0), 100);
     }
 
     #[test]
-    fn export_progress_event_includes_current_clip_number() {
+    fn export_pending_clips_emits_initial_progress() {
+        let payload = initial_export_progress_payload(6, 0);
+
+        assert!(payload.active);
+        assert_eq!(payload.total, 6);
+        assert_eq!(payload.completed, 0);
+        assert_eq!(payload.failed, 0);
+        assert_eq!(payload.current_clip_number, None);
+        assert_eq!(payload.current_step, ExportProgressStep::Preparing);
+        assert_eq!(payload.progress, 0);
+        assert_eq!(payload.message, "Préparation de l'export...");
+    }
+
+    #[test]
+    fn export_pending_clips_emits_progress_for_each_clip() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut config = test_auto_config(5, 2);
         config.ui_events = Some(tx);
@@ -3273,9 +3314,9 @@ mod tests {
             1,
             0,
             1,
-            ExportProgressStep::Preparing,
-            0.05,
-            "Préparation du clip",
+            ExportProgressStep::Assembling,
+            0.15,
+            "Assemblage des segments",
         );
 
         match rx.try_recv().unwrap() {
@@ -3284,10 +3325,69 @@ mod tests {
                 assert_eq!(payload.completed, 1);
                 assert_eq!(payload.current_clip_number, Some(2));
                 assert_eq!(payload.current_clip_id.as_deref(), Some("clip-2"));
-                assert_eq!(payload.current_step, ExportProgressStep::Preparing);
-                assert_eq!(payload.progress, 21);
+                assert_eq!(payload.current_step, ExportProgressStep::Assembling);
+                assert_eq!(payload.progress, 23);
             }
             event => panic!("unexpected event: {event:?}"),
+        }
+    }
+
+    #[test]
+    fn export_pending_clips_emits_done_100_percent() {
+        let payload = done_export_progress_payload(
+            ExportSummary {
+                total: 6,
+                completed: 6,
+                failed: 0,
+            },
+            0,
+        );
+
+        assert!(!payload.active);
+        assert_eq!(payload.total, 6);
+        assert_eq!(payload.completed, 6);
+        assert_eq!(payload.failed, 0);
+        assert_eq!(payload.current_step, ExportProgressStep::Done);
+        assert_eq!(payload.progress, 100);
+        assert_eq!(payload.message, "Export terminé");
+    }
+
+    #[test]
+    fn export_pending_clips_progress_total_matches_exportable_count() {
+        let mut config = test_auto_config(5, 2);
+        let root = std::env::temp_dir().join(format!(
+            "wt-clipper-progress-total-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        config.output_dir = Some(root.join("output"));
+        let mut queue = ExportQueue::default();
+
+        for index in 0..2 {
+            let pending_dir = root.join(format!("ready-{index}"));
+            write_test_segment(&pending_dir);
+            queue.add_pending_clip(pending_export_for_test(
+                &format!("ready-{index}"),
+                &format!("target-destroyed|ready-{index}"),
+                PendingExportStatus::ReadyToExport,
+                pending_dir,
+            ));
+        }
+        queue.add_pending_clip(pending_export_for_test(
+            "waiting",
+            "target-destroyed|waiting",
+            PendingExportStatus::WaitingPostEvent,
+            root.join("waiting"),
+        ));
+
+        let total = queue.exportable_count();
+        let payload = initial_export_progress_payload(total, queue.pending_count() - total);
+
+        assert_eq!(total, 2);
+        assert_eq!(payload.total, 2);
+        assert_eq!(payload.progress, 0);
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
