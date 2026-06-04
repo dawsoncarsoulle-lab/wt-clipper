@@ -4,6 +4,7 @@
 /release/
 frontend/node_modules/
 frontend/dist/
+frontend/.tmp-tests/
 .env
 npm-debug.log*
 

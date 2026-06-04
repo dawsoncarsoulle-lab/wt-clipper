@@ -210,6 +210,12 @@ struct RuntimeEvent {
     description: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClipMetadataInfo {
+    reason: Option<ClipReason>,
+    duration_seconds: Option<u64>,
+}
+
 impl RuntimeStatus {
     fn from_config(config: &AppConfig) -> Self {
         Self {
@@ -532,6 +538,7 @@ async fn run_auto_backend(
             ui_events: Some(event_tx),
             export_mode: config.clip.export_mode,
             pending_export_dir: config.pending_exports.pending_export_dir_path()?,
+            delete_ready_after_export: config.pending_exports.delete_ready_after_export,
             command_rx: Some(auto_cmd_rx),
         },
     )
@@ -925,14 +932,20 @@ async fn scan_clips(
                 .and_then(|name| name.to_str())
                 .map(str::to_owned)
                 .unwrap_or_else(|| path.display().to_string());
+            let metadata_info = read_clip_metadata_info(&path.with_extension("json"));
             clips.push(ClipInfo {
-                reason: clip_reason_from_name(&file_name),
+                reason: metadata_info
+                    .as_ref()
+                    .and_then(|metadata| metadata.reason)
+                    .unwrap_or_else(|| clip_reason_from_name(&file_name)),
                 path: path.to_path_buf(),
                 thumbnail_path: path.with_extension("jpg").exists().then(|| path.with_extension("jpg")),
                 preview_url: preview_server.url_for_path(path),
                 file_name,
                 size_bytes,
-                duration_seconds: 0,
+                duration_seconds: metadata_info
+                    .and_then(|metadata| metadata.duration_seconds)
+                    .unwrap_or(0),
                 modified_secs_ago,
             });
         }
@@ -940,6 +953,11 @@ async fn scan_clips(
         Ok((clips, total_bytes))
     })
     .await?
+}
+
+fn read_clip_metadata_info(path: &Path) -> Option<ClipMetadataInfo> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
 }
 
 fn clip_reason_from_name(name: &str) -> ClipReason {

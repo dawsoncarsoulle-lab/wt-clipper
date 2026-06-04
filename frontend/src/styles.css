@@ -76,6 +76,23 @@ select {
   background: rgba(255, 90, 47, .12);
 }
 
+.ghost-button:disabled,
+.delete-button:disabled,
+.icon-button:disabled,
+.primary-action:disabled {
+  cursor: not-allowed;
+  opacity: .48;
+  transform: none;
+}
+
+.ghost-button:disabled:hover,
+.delete-button:disabled:hover,
+.icon-button:disabled:hover,
+.primary-action:disabled:hover {
+  border-color: rgba(255,255,255,.1);
+  background: rgba(255,255,255,.055);
+}
+
 .icon-button {
   height: 34px;
   width: 34px;

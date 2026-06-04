@@ -2,6 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
 use eframe::egui;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info};
@@ -24,6 +25,12 @@ use wt_clipper::warthunder::client::{ChatMessage, Endpoint, EndpointProbe, WarTh
 use wt_clipper::warthunder::events::WarThunderEvent;
 use wt_clipper::warthunder::parser::{is_personal_kill, parse_gamechat_event};
 use wt_clipper::warthunder::recent::RecentMessageCache;
+
+#[derive(Debug, Deserialize)]
+struct ClipMetadataInfo {
+    reason: Option<wt_clipper::capture::buffer::ClipReason>,
+    duration_seconds: Option<u64>,
+}
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -147,6 +154,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     ui_events: None,
                     export_mode: config.clip.export_mode,
                     pending_export_dir: config.pending_exports.pending_export_dir_path()?,
+                    delete_ready_after_export: config.pending_exports.delete_ready_after_export,
                     command_rx: None,
                 },
             )
@@ -314,6 +322,7 @@ fn spawn_gui_runtime(
                     ui_events: Some(event_tx.clone()),
                     export_mode: config.clip.export_mode,
                     pending_export_dir,
+                    delete_ready_after_export: config.pending_exports.delete_ready_after_export,
                     command_rx: None,
                 },
             );
@@ -443,8 +452,12 @@ async fn scan_clips(output_dir: PathBuf) -> anyhow::Result<(Vec<ClipInfo>, u64)>
                 .and_then(|name| name.to_str())
                 .map(str::to_owned)
                 .unwrap_or_else(|| path.display().to_string());
+            let metadata_info = read_clip_metadata_info(&path.with_extension("json"));
             clips.push(ClipInfo {
-                reason: clip_reason_from_name(&file_name),
+                reason: metadata_info
+                    .as_ref()
+                    .and_then(|metadata| metadata.reason)
+                    .unwrap_or_else(|| clip_reason_from_name(&file_name)),
                 path: path.to_path_buf(),
                 thumbnail_path: path
                     .with_extension("jpg")
@@ -453,7 +466,9 @@ async fn scan_clips(output_dir: PathBuf) -> anyhow::Result<(Vec<ClipInfo>, u64)>
                 preview_url: None,
                 file_name,
                 size_bytes,
-                duration_seconds: 0,
+                duration_seconds: metadata_info
+                    .and_then(|metadata| metadata.duration_seconds)
+                    .unwrap_or(0),
                 modified_secs_ago,
             });
         }
@@ -461,6 +476,11 @@ async fn scan_clips(output_dir: PathBuf) -> anyhow::Result<(Vec<ClipInfo>, u64)>
         Ok((clips, total_bytes))
     })
     .await?
+}
+
+fn read_clip_metadata_info(path: &std::path::Path) -> Option<ClipMetadataInfo> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
 }
 
 fn clip_reason_from_name(name: &str) -> wt_clipper::capture::buffer::ClipReason {

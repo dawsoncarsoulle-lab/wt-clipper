@@ -322,4 +322,18 @@ mod tests {
         let error = valid_segments(&[]).unwrap();
         assert!(error.is_empty());
     }
+
+    #[test]
+    fn partial_tmp_file_removed_on_failure() {
+        let dir = test_dir("tmp-failure");
+        fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("clip.webm");
+        let tmp = output.with_extension("webm.tmp");
+
+        let result = concatenate_segments_to_webm(&[], output, VideoQuality::default());
+
+        assert!(result.is_err());
+        assert!(!tmp.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

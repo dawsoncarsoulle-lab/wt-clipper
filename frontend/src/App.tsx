@@ -32,6 +32,12 @@ import {
   Zap,
 } from "lucide-react";
 import { useAppStore } from "./store";
+import {
+  canCloseExportModal,
+  exportableCount,
+  formatClipDuration,
+  shouldShowExportButton,
+} from "./exportLogic";
 import type { AppConfig, ClipInfo, ClipReason, DoctorReport, RuntimeStatus } from "./types";
 import type {
   ClipStatus,
@@ -499,18 +505,20 @@ function ProcessingPopup() {
 }
 
 function ExportProgressModal() {
-  const { exportProgress, setExportProgress, setActiveView } = useAppStore();
+  const { exportProgress, isExporting, setExportProgress, setActiveView, showToast } = useAppStore();
   if (!exportProgress) return null;
   const progressState = exportProgress;
 
-  const finished = !progressState.active;
+  const canClose = canCloseExportModal(isExporting, progressState);
+  const finished =
+    !progressState.active ||
+    progressState.currentStep === "done" ||
+    progressState.currentStep === "failed";
   const hasErrors = progressState.failed > 0;
 
   function close() {
-    if (
-      progressState.active &&
-      !window.confirm("Un export est en cours. Fermer cette fenêtre ne stoppe pas l'export. Continuer ?")
-    ) {
+    if (!canClose) {
+      showToast("Export en cours, fermeture désactivée pour éviter de corrompre les clips.");
       return;
     }
     setExportProgress(null);
@@ -543,7 +551,16 @@ function ExportProgressModal() {
                   : `Clip ${Math.min(progressState.completed + 1, progressState.total)} / ${progressState.total}`}
               </h2>
             </div>
-            <button className="icon-button" onClick={close} disabled={progressState.active}>
+            <button
+              className="icon-button"
+              onClick={close}
+              disabled={!canClose}
+              title={
+                canClose
+                  ? "Fermer"
+                  : "Export en cours, fermeture désactivée pour éviter de corrompre les clips."
+              }
+            >
               <XCircle className="h-4 w-4" />
             </button>
           </div>
@@ -563,7 +580,9 @@ function ExportProgressModal() {
             </div>
           </div>
           {!finished && (
-            <p className="mt-4 text-sm text-[#ffd0c3]">Ne fermez pas l'application pendant l'export.</p>
+            <p className="mt-4 text-sm text-[#ffd0c3]">
+              Export en cours, fermeture désactivée pour éviter de corrompre les clips.
+            </p>
           )}
           {finished && hasErrors && (
             <p className="mt-4 text-sm text-[#ffb7aa]">
@@ -651,18 +670,15 @@ function Clips() {
   ).length;
   const waitingPostEventCount = processingClips.filter((clip) => clip.status === "waiting_post_event").length;
   const freezingSegmentsCount = processingClips.filter((clip) => clip.status === "freezing_segments").length;
-  const pendingExportCount = processingClips.filter((clip) => clip.canExport).length;
-  const pendingExportReadyCount = processingClips.filter(
-    (clip) => clip.canExport && clip.status !== "exporting",
-  ).length;
-  const nextExportableInSeconds = nextPendingExportableSeconds(processingClips);
+  const pendingExportReadyCount = exportableCount(processingClips);
+  const showExportButton = shouldShowExportButton(processingClips, isExporting);
 
   async function refresh() {
-    const [next, pending] = await Promise.all([
+    const [clips, pending] = await Promise.all([
       invoke<ClipInfo[]>("load_clips"),
       invoke<PendingClipExportDto[]>("get_pending_export_clips"),
     ]);
-    setClips(next);
+    setClips(clips);
     setPendingExportClips(pending);
   }
 
@@ -673,21 +689,30 @@ function Clips() {
   }
 
   async function exportNow() {
-    if (isExporting || pendingExportReadyCount === 0) return;
+    if (isExporting) return;
     setIsExporting(true);
-    setExportProgress({
-      active: true,
-      total: pendingExportReadyCount,
-      completed: 0,
-      failed: 0,
-      currentClipId: null,
-      currentClipTitle: null,
-      currentStep: "preparing",
-      progress: 0,
-      message: "Préparation de l'export...",
-    });
-    showToast("Export des clips en attente...");
+    let activeExportableCount = 0;
     try {
+      const pending = await invoke<PendingClipExportDto[]>("get_pending_export_clips");
+      setPendingExportClips(pending);
+      activeExportableCount = exportableCount(pending);
+      if (activeExportableCount === 0) {
+        setExportProgress(null);
+        showToast("Aucun clip prêt à exporter.");
+        return;
+      }
+      setExportProgress({
+        active: true,
+        total: activeExportableCount,
+        completed: 0,
+        failed: 0,
+        currentClipId: null,
+        currentClipTitle: null,
+        currentStep: "preparing",
+        progress: 0,
+        message: "Préparation de l'export...",
+      });
+      showToast("Export des clips en attente...");
       const summary = await invoke<ExportSummary>("export_pending_clips");
       await refresh();
       if (
@@ -703,9 +728,9 @@ function Clips() {
     } catch (error) {
       setExportProgress({
         active: false,
-        total: pendingExportReadyCount,
+        total: activeExportableCount,
         completed: 0,
-        failed: pendingExportReadyCount,
+        failed: activeExportableCount,
         currentClipId: null,
         currentClipTitle: null,
         currentStep: "failed",
@@ -727,20 +752,16 @@ function Clips() {
           <p className="text-sm text-zinc-500">{galleryItems.length} clips affichés</p>
         </div>
         <div className="flex gap-2">
-          {(pendingExportCount > 0 || isExporting) && (
+          {showExportButton && (
             <button
               className="primary-action w-fit px-5"
-              disabled={isExporting || pendingExportReadyCount === 0}
+              disabled={isExporting}
               onClick={() => void exportNow()}
             >
               <Download className="h-4 w-4" />
               {isExporting
                 ? "Export en cours..."
-                : pendingExportReadyCount > 0
-                ? "Exporter maintenant"
-                : nextExportableInSeconds == null
-                  ? "Exporter maintenant"
-                  : `Disponible dans ${nextExportableInSeconds}s`}
+                : "Exporter maintenant"}
             </button>
           )}
           <button className="ghost-button" onClick={() => void refresh()}>
@@ -781,10 +802,11 @@ function Clips() {
           Préservation des segments pour {freezingSegmentsCount} clip{freezingSegmentsCount > 1 ? "s" : ""}...
         </div>
       )}
-      {pendingExportCount > 0 && (
+      {pendingExportReadyCount > 0 && (
         <div className="processing-banner pending-export-banner">
-          {pendingExportCount} clip{pendingExportCount > 1 ? "s" : ""} en attente d'export
-          <button disabled={isExporting || pendingExportReadyCount === 0} onClick={() => void exportNow()}>
+          {pendingExportReadyCount} clip{pendingExportReadyCount > 1 ? "s" : ""} prêt
+          {pendingExportReadyCount > 1 ? "s" : ""} à exporter
+          <button disabled={isExporting} onClick={() => void exportNow()}>
             {isExporting ? "Export en cours..." : "Exporter maintenant"}
           </button>
         </div>
@@ -804,7 +826,7 @@ function Clips() {
               <ClipProcessingCard
                 key={clip.id}
                 clip={clip}
-                disabledExport={isExporting || pendingExportReadyCount === 0}
+                disabledExport={isExporting}
                 onExportNow={() => void exportNow()}
               />
             )
@@ -1068,8 +1090,9 @@ function ClipCard({ clip, onDelete }: { clip: ClipInfo; onDelete: () => void }) 
         <div className="truncate text-sm font-bold text-white">{clip.fileName}</div>
         <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
           <span>{formatBytes(clip.sizeBytes)}</span>
-          <span>{relativeTime(clip.modifiedSecsAgo)}</span>
+          <span>{formatClipDuration(clip.durationSeconds)}</span>
         </div>
+        <div className="mt-1 text-xs text-zinc-600">Ajouté {relativeTime(clip.modifiedSecsAgo)}</div>
         <button className="delete-button mt-3" onClick={onDelete}>
           <Trash2 className="h-3.5 w-3.5" />
           Supprimer

@@ -148,6 +148,12 @@ export type AppConfig = {
     max_clips: number;
     max_storage_gb: number;
   };
+  pending_exports: {
+    pending_export_dir: string;
+    max_total_size_mb: number;
+    max_age_hours: number;
+    delete_ready_after_export: boolean;
+  };
 };
 
 export type DoctorStatus = "ok" | "warn" | "error";

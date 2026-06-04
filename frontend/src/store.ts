@@ -207,5 +207,5 @@ export const useAppStore = create<AppState>((set) => ({
 }));
 
 function inferCanExport(status: ClipStatus, retryable?: boolean | null) {
-  return status === "ready_to_export" || (status === "failed" && retryable !== false);
+  return status === "ready_to_export" || (status === "failed" && retryable === true);
 }
