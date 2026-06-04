@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 use uuid::Uuid;
 mod export_queue;
+mod editor;
 mod updater;
 use export_queue::{ExportSummary, PendingClipExportDto};
 use wt_clipper::{
@@ -66,10 +67,15 @@ impl ClipPreviewServer {
     fn url_for_path(&self, path: &Path) -> Option<String> {
         let canonical = path.canonicalize().ok()?;
         let id = preview_clip_id(&canonical);
+        let extension = canonical
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "webm".to_owned());
         if let Ok(mut clips) = self.clips.lock() {
             clips.insert(id.clone(), canonical);
         }
-        Some(format!("{}/{}.webm", self.base_url, id))
+        Some(format!("{}/{}.{}", self.base_url, id, extension))
     }
 }
 
@@ -98,14 +104,15 @@ fn handle_preview_request(mut stream: TcpStream, clips: Arc<Mutex<HashMap<String
         return;
     }
 
-    let Some(id) = path
-        .trim_start_matches('/')
-        .strip_suffix(".webm")
-        .filter(|id| !id.is_empty())
-    else {
+    let path = path.trim_start_matches('/');
+    let Some((id, extension)) = path.rsplit_once('.') else {
         write_http_status(&mut stream, "404 Not Found");
         return;
     };
+    if id.is_empty() || !matches!(extension, "webm" | "mp4") {
+        write_http_status(&mut stream, "404 Not Found");
+        return;
+    }
     let clip_path = match clips.lock().ok().and_then(|clips| clips.get(id).cloned()) {
         Some(path) => path,
         None => {
@@ -136,8 +143,9 @@ fn handle_preview_request(mut stream: TcpStream, clips: Arc<Mutex<HashMap<String
     } else {
         String::new()
     };
+    let content_type = video_content_type(&clip_path);
     let headers = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: video/webm\r\nAccept-Ranges: bytes\r\n{content_range}Content-Length: {length}\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccept-Ranges: bytes\r\n{content_range}Content-Length: {length}\r\nConnection: close\r\n\r\n"
     );
     if stream.write_all(headers.as_bytes()).is_err() || method == "HEAD" {
         return;
@@ -184,6 +192,18 @@ fn write_http_status(stream: &mut TcpStream, status: &str) {
     );
 }
 
+fn video_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mp4") => "video/mp4",
+        _ => "video/webm",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeStatus {
@@ -214,7 +234,7 @@ struct RuntimeEvent {
 #[derive(Debug, Deserialize)]
 struct ClipMetadataInfo {
     reason: Option<ClipReason>,
-    duration_seconds: Option<u64>,
+    duration_seconds: Option<f64>,
 }
 
 impl RuntimeStatus {
@@ -371,6 +391,33 @@ fn get_runtime_status(state: State<'_, BackendState>) -> Result<RuntimeStatus, S
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+async fn export_edited_clip(
+    request: editor::ClipEditRequest,
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+) -> Result<editor::EditedClipResult, String> {
+    let config = AppConfig::load(Some(&state.config_path)).map_err(|error| error.to_string())?;
+    let result = editor::export_edited_clip(request, config, app).await?;
+    let _ = state.cmd_tx.send(UiCommand::LoadClips);
+    Ok(result)
+}
+
+#[tauri::command]
+async fn get_clip_media_info(path: String) -> Result<editor::ClipMediaInfo, String> {
+    editor::get_clip_media_info(path).await
+}
+
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    editor::open_path(path)
+}
+
+#[tauri::command]
+fn open_parent_folder(path: String) -> Result<(), String> {
+    editor::open_parent_folder(path)
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -412,7 +459,11 @@ fn main() {
             delete_pending_export_clip,
             restart_buffer,
             updater::check_for_updates,
-            get_runtime_status
+            get_runtime_status,
+            export_edited_clip,
+            get_clip_media_info,
+            open_path,
+            open_parent_folder
         ])
         .run(tauri::generate_context!())
         .expect("failed to run WT Clipper Tauri app");
@@ -909,56 +960,80 @@ async fn scan_clips(
         let mut clips = Vec::new();
         let mut total_bytes = 0_u64;
         let now = std::time::SystemTime::now();
-        for entry in walkdir::WalkDir::new(&output_dir)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("webm") {
-                continue;
-            }
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    debug!(%error, path = %path.display(), "failed to read clip metadata");
+        for root in gallery_scan_roots(&output_dir) {
+            for entry in walkdir::WalkDir::new(&root)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                let path = entry.path();
+                if !is_supported_gallery_video(path) {
                     continue;
                 }
-            };
-            let size_bytes = metadata.len();
-            total_bytes = total_bytes.saturating_add(size_bytes);
-            let modified_secs_ago = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0);
-            let file_name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| path.display().to_string());
-            let metadata_info = read_clip_metadata_info(&path.with_extension("json"));
-            clips.push(ClipInfo {
-                reason: metadata_info
-                    .as_ref()
-                    .and_then(|metadata| metadata.reason)
-                    .unwrap_or_else(|| clip_reason_from_name(&file_name)),
-                path: path.to_path_buf(),
-                thumbnail_path: path.with_extension("jpg").exists().then(|| path.with_extension("jpg")),
-                preview_url: preview_server.url_for_path(path),
-                file_name,
-                size_bytes,
-                duration_seconds: metadata_info
-                    .and_then(|metadata| metadata.duration_seconds)
-                    .unwrap_or(0),
-                modified_secs_ago,
-            });
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        debug!(%error, path = %path.display(), "failed to read clip metadata");
+                        continue;
+                    }
+                };
+                let size_bytes = metadata.len();
+                total_bytes = total_bytes.saturating_add(size_bytes);
+                let modified_secs_ago = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| path.display().to_string());
+                let metadata_info = read_clip_metadata_info(&path.with_extension("json"));
+                clips.push(ClipInfo {
+                    reason: metadata_info
+                        .as_ref()
+                        .and_then(|metadata| metadata.reason)
+                        .unwrap_or_else(|| clip_reason_from_name(&file_name)),
+                    path: path.to_path_buf(),
+                    thumbnail_path: path.with_extension("jpg").exists().then(|| path.with_extension("jpg")),
+                    preview_url: preview_server.url_for_path(path),
+                    file_name,
+                    size_bytes,
+                    duration_seconds: metadata_info
+                        .and_then(|metadata| metadata.duration_seconds)
+                        .map(|duration| duration.max(0.0).round() as u64)
+                        .unwrap_or(0),
+                    modified_secs_ago,
+                });
+            }
         }
         clips.sort_by_key(|clip| clip.modified_secs_ago);
         Ok((clips, total_bytes))
     })
     .await?
+}
+
+fn gallery_scan_roots(output_dir: &Path) -> [PathBuf; 3] {
+    [
+        output_dir.to_path_buf(),
+        output_dir.join("Edited"),
+        output_dir.join("Social"),
+    ]
+}
+
+fn is_supported_gallery_video(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("webm" | "mp4")
+    )
 }
 
 fn read_clip_metadata_info(path: &Path) -> Option<ClipMetadataInfo> {

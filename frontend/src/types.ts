@@ -22,6 +22,65 @@ export type ClipStatus =
 
 export type ExportMode = "instant" | "deferred";
 
+export type ClipEditorMode =
+  | "trim_original"
+  | "youtube_horizontal"
+  | "social_vertical";
+
+export type SocialLayout =
+  | "vertical_blur"
+  | "vertical_crop";
+
+export type ClipEditRequest = {
+  clipPath: string;
+  metadataPath?: string;
+  startSeconds: number;
+  endSeconds: number;
+  mode: ClipEditorMode;
+  outputFormat: "webm" | "mp4";
+  layout?: SocialLayout;
+  title?: string;
+  subtitle?: string;
+  watermark: boolean;
+  fps: number;
+  bitrateKbps: number;
+};
+
+export type EditedClipResult = {
+  outputPath: string;
+  metadataPath?: string;
+  thumbnailPath?: string;
+  durationSeconds: number;
+  sizeBytes: number;
+};
+
+export type ClipMediaInfo = {
+  durationSeconds: number;
+  width: number;
+  height: number;
+  fps: number;
+  codec: string;
+  container: string;
+  sizeBytes: number;
+};
+
+export type EditorExportProgressPayload = {
+  active: boolean;
+  step:
+    | "preparing"
+    | "trimming"
+    | "encoding"
+    | "thumbnail"
+    | "metadata"
+    | "saving"
+    | "done"
+    | "failed";
+  progress: number;
+  message: string;
+  outputPath?: string;
+  error?: string;
+};
+
 export type ClipInfo = {
   path: string;
   thumbnailPath?: string | null;

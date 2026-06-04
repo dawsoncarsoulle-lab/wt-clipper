@@ -22,6 +22,7 @@ import {
   Search,
   Settings,
   ShieldAlert,
+  Scissors,
   Sparkles,
   Trash2,
   Video,
@@ -50,6 +51,7 @@ import type {
   PendingClipExportDto,
 } from "./types";
 import brandLogo from "./assets/brand/WT_clipper_brand.png";
+import { ClipEditorModal } from "./components/ClipEditorModal";
 
 const nav = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -672,6 +674,7 @@ function Clips() {
   } = useAppStore();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | ClipReason>("all");
+  const [editingClip, setEditingClip] = useState<ClipInfo | null>(null);
   useEffect(() => {
     let cancelled = false;
     async function refreshPending() {
@@ -877,6 +880,7 @@ function Clips() {
               <ClipCard
                 key={clip.id}
                 clip={galleryItemToClipInfo(clip)}
+                onEdit={() => setEditingClip(galleryItemToClipInfo(clip))}
                 onDelete={() => void remove(clip.filePath!)}
               />
             ) : (
@@ -889,6 +893,13 @@ function Clips() {
             )
           ))}
         </div>
+      )}
+      {editingClip && (
+        <ClipEditorModal
+          clip={editingClip}
+          onClose={() => setEditingClip(null)}
+          onExportComplete={refresh}
+        />
       )}
     </div>
   );
@@ -1083,10 +1094,20 @@ function getClipStatusLabel(status: ClipStatus): string {
   }
 }
 
-function ClipCard({ clip, onDelete }: { clip: ClipInfo; onDelete: () => void }) {
+function ClipCard({
+  clip,
+  onDelete,
+  onEdit,
+}: {
+  clip: ClipInfo;
+  onDelete: () => void;
+  onEdit: () => void;
+}) {
   const [videoFailed, setVideoFailed] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const videoSrc = clip.previewUrl ?? convertFileSrc(clip.path);
+  const videoType = videoMimeTypeForPath(clip.path);
+  const editedBadge = editedBadgeForPath(clip.path);
 
   useEffect(() => {
     setVideoFailed(false);
@@ -1129,7 +1150,7 @@ function ClipCard({ clip, onDelete }: { clip: ClipInfo; onDelete: () => void }) 
             loop
             onError={() => setVideoFailed(true)}
           >
-            <source src={videoSrc} type="video/webm" />
+            <source src={videoSrc} type={videoType} />
           </video>
         ) : (
           <div className="clip-thumb-fallback">
@@ -1139,6 +1160,7 @@ function ClipCard({ clip, onDelete }: { clip: ClipInfo; onDelete: () => void }) 
         )}
         <div className="clip-overlay" />
         <span className={`reason reason-${clip.reason}`}>{reasonLabel[clip.reason]}</span>
+        {editedBadge && <span className="edited-badge">{editedBadge}</span>}
         <button className="icon-button absolute bottom-3 right-3">
           <Play className="h-4 w-4" />
         </button>
@@ -1150,10 +1172,16 @@ function ClipCard({ clip, onDelete }: { clip: ClipInfo; onDelete: () => void }) 
           <span>{formatClipDuration(clip.durationSeconds)}</span>
         </div>
         <div className="mt-1 text-xs text-zinc-600">Ajouté {relativeTime(clip.modifiedSecsAgo)}</div>
-        <button className="delete-button mt-3" onClick={onDelete}>
-          <Trash2 className="h-3.5 w-3.5" />
-          Supprimer
-        </button>
+        <div className="clip-card-actions">
+          <button className="ghost-button" onClick={onEdit}>
+            <Scissors className="h-3.5 w-3.5" />
+            Éditer
+          </button>
+          <button className="delete-button" onClick={onDelete}>
+            <Trash2 className="h-3.5 w-3.5" />
+            Supprimer
+          </button>
+        </div>
       </div>
     </motion.article>
   );
@@ -1426,6 +1454,21 @@ function Empty({ label }: { label: string }) {
       <span>{label}</span>
     </div>
   );
+}
+
+function videoMimeTypeForPath(path: string): string {
+  return path.toLowerCase().endsWith(".mp4") ? "video/mp4" : "video/webm";
+}
+
+function editedBadgeForPath(path: string): "Edited" | "Vertical" | null {
+  const normalized = path.replace(/\\/g, "/").toLowerCase();
+  if (normalized.includes("/social/") || normalized.includes("_vertical_")) {
+    return "Vertical";
+  }
+  if (normalized.includes("/edited/") || normalized.includes("_trim_") || normalized.includes("_youtube_")) {
+    return "Edited";
+  }
+  return null;
 }
 
 function formatBytes(bytes: number) {
