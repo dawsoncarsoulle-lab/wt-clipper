@@ -12,9 +12,13 @@ export type ClipStatus =
   | "encoding"
   | "saving"
   | "pending_export"
+  | "waiting_post_event"
+  | "freezing_segments"
+  | "ready_to_export"
   | "exporting"
   | "ready"
-  | "failed";
+  | "failed"
+  | "expired";
 
 export type ExportMode = "instant" | "deferred";
 
@@ -56,21 +60,37 @@ export type GalleryClipItem = {
   sizeBytes?: number;
   progress?: number;
   error?: string;
+  exportableAt?: string;
+  isExportable?: boolean;
+  canExport?: boolean;
+  retryable?: boolean;
 };
 
 export type PendingClipExportDto = {
   id: string;
-  status: "pending" | "exporting" | "ready" | "failed";
+  status:
+    | "waiting_post_event"
+    | "freezing_segments"
+    | "ready_to_export"
+    | "exporting"
+    | "ready"
+    | "failed"
+    | "expired";
   reason: ClipReason;
   title: string;
   createdAt: string;
   progress?: number | null;
   error?: string | null;
+  exportableAt: string;
+  isExportable: boolean;
+  canExport: boolean;
+  retryable: boolean;
 };
 
 export type ExportProgressStep =
   | "preparing"
   | "extracting"
+  | "assembling"
   | "encoding"
   | "thumbnail"
   | "saving"
@@ -143,6 +163,11 @@ export type RuntimeStatus = {
   bufferFilledSecs: number;
   bufferTotalSecs: number;
   autoClipRunning: boolean;
+  activeExportMode: ExportMode;
+  configRestartRequired: boolean;
+  pendingExportCount: number;
+  pendingExportDir: string;
+  pendingExportBytes: number;
   clipsSaved: number;
   recentEvents: Array<{
     id: string;

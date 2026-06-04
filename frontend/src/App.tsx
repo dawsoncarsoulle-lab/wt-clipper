@@ -68,6 +68,10 @@ const processingReasonLabel: Record<ClipReason, string> = {
   unknown: "Clip",
 };
 
+function formatExportMode(mode: AppConfig["clip"]["export_mode"]) {
+  return mode === "deferred" ? "Différé" : "Instantané";
+}
+
 export function App() {
   const store = useAppStore();
   const seenRuntimeEvents = useRef(new Set<string>());
@@ -102,6 +106,11 @@ export function App() {
             title: reasonLabel[event.payload.reason],
             detail: event.payload.description,
           });
+          window.setTimeout(() => {
+            void refreshPendingExportClips().catch((error) =>
+              console.info("[FRONTEND] pending refresh after kill failed", error),
+            );
+          }, 300);
         },
       ),
       listen<ClipInfo>("clip-saved", (event) => {
@@ -122,7 +131,12 @@ export function App() {
         store.updateClipStatus(event.payload);
         if (event.payload.status === "detected") {
           store.showToast("Clip détecté — création en cours...");
-        } else if (event.payload.status === "pending_export") {
+        } else if (
+          event.payload.status === "waiting_post_event" ||
+          event.payload.status === "freezing_segments" ||
+          event.payload.status === "ready_to_export" ||
+          event.payload.status === "pending_export"
+        ) {
           store.showToast("Clip en attente d'export");
         } else if (event.payload.status === "ready") {
           store.showToast("Clip prêt");
@@ -191,6 +205,7 @@ export function App() {
   }
 
   function applyRuntimeStatus(status: RuntimeStatus) {
+    store.setRuntimeStatus(status);
     store.setWtConnected(status.wtConnected);
     store.setBuffer(status.bufferFilledSecs, status.bufferTotalSecs);
     for (const event of [...status.recentEvents].reverse()) {
@@ -376,11 +391,16 @@ function Dashboard() {
           </div>
         </div>
       </section>
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-5 gap-4">
         <Metric icon={Zap} label="Kills session" value={state.sessionKills} />
         <Metric icon={Sparkles} label="Multi-kills" value={state.sessionMultiKills} />
         <Metric icon={Video} label="Clips sauvegardés" value={state.clipsSaved} />
         <Metric icon={HardDrive} label="Stockage" value={formatBytes(state.diskUsedBytes)} />
+        <Metric
+          icon={Download}
+          label="Mode actif"
+          value={formatExportMode(state.runtimeStatus?.activeExportMode ?? state.config?.clip.export_mode ?? "deferred")}
+        />
       </div>
       <section>
         <div className="mb-3 flex items-center justify-between">
@@ -577,9 +597,31 @@ function Metric({ icon: Icon, label, value }: { icon: typeof Zap; label: string;
 }
 
 function Clips() {
-  const { clips, processingClips, setClips, showToast } = useAppStore();
+  const { activeView, clips, processingClips, setClips, setPendingExportClips, showToast } = useAppStore();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | ClipReason>("all");
+  useEffect(() => {
+    let cancelled = false;
+    async function refreshPending() {
+      const pending = await invoke<PendingClipExportDto[]>("get_pending_export_clips");
+      if (!cancelled) {
+        setPendingExportClips(pending);
+      }
+    }
+    void refreshPending().catch((error) => console.info("[FRONTEND] pending refresh failed", error));
+    if (activeView !== "clips") {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const interval = window.setInterval(() => {
+      void refreshPending().catch((error) => console.info("[FRONTEND] pending refresh failed", error));
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [activeView, setPendingExportClips]);
   const galleryItems = useMemo(() => {
     const readyPaths = new Set(clips.map((clip) => clip.path));
     const processing = processingClips.filter((clip) => !clip.filePath || !readyPaths.has(clip.filePath));
@@ -594,11 +636,21 @@ function Clips() {
   const activeProcessingCount = processingClips.filter((clip) =>
     ["detected", "recording", "encoding", "saving", "exporting"].includes(clip.status),
   ).length;
-  const pendingExportCount = processingClips.filter((clip) => clip.status === "pending_export").length;
+  const waitingPostEventCount = processingClips.filter((clip) => clip.status === "waiting_post_event").length;
+  const freezingSegmentsCount = processingClips.filter((clip) => clip.status === "freezing_segments").length;
+  const pendingExportCount = processingClips.filter((clip) => clip.canExport).length;
+  const pendingExportReadyCount = processingClips.filter(
+    (clip) => clip.canExport && clip.status !== "exporting",
+  ).length;
+  const nextExportableInSeconds = nextPendingExportableSeconds(processingClips);
 
   async function refresh() {
-    const next = await invoke<ClipInfo[]>("load_clips");
+    const [next, pending] = await Promise.all([
+      invoke<ClipInfo[]>("load_clips"),
+      invoke<PendingClipExportDto[]>("get_pending_export_clips"),
+    ]);
     setClips(next);
+    setPendingExportClips(pending);
   }
 
   async function remove(path: string) {
@@ -611,7 +663,9 @@ function Clips() {
     showToast("Export des clips en attente...");
     const summary = await invoke<ExportSummary>("export_pending_clips");
     await refresh();
-    if (summary.failed > 0) {
+    if (summary.total === 0 && processingClips.some((clip) => clip.status === "waiting_post_event" || clip.status === "freezing_segments")) {
+      showToast("Certains clips ne sont pas encore prêts à exporter");
+    } else if (summary.failed > 0) {
       showToast(`${summary.completed} clips exportés, ${summary.failed} erreur`);
     } else {
       showToast("Export terminé");
@@ -629,7 +683,11 @@ function Clips() {
           {pendingExportCount > 0 && (
             <button className="primary-action w-fit px-5" onClick={() => void exportNow()}>
               <Download className="h-4 w-4" />
-              Exporter maintenant
+              {pendingExportReadyCount > 0
+                ? "Exporter maintenant"
+                : nextExportableInSeconds == null
+                  ? "Exporter maintenant"
+                  : `Disponible dans ${nextExportableInSeconds}s`}
             </button>
           )}
           <button className="ghost-button" onClick={() => void refresh()}>
@@ -658,6 +716,16 @@ function Clips() {
       {activeProcessingCount > 0 && (
         <div className="processing-banner">
           {activeProcessingCount} clip{activeProcessingCount > 1 ? "s" : ""} en cours de traitement
+        </div>
+      )}
+      {waitingPostEventCount > 0 && (
+        <div className="processing-banner">
+          {waitingPostEventCount} clip{waitingPostEventCount > 1 ? "s" : ""} en cours de capture...
+        </div>
+      )}
+      {freezingSegmentsCount > 0 && (
+        <div className="processing-banner">
+          Préservation des segments pour {freezingSegmentsCount} clip{freezingSegmentsCount > 1 ? "s" : ""}...
         </div>
       )}
       {pendingExportCount > 0 && (
@@ -705,13 +773,28 @@ function clipToGalleryItem(clip: ClipInfo): GalleryClipItem {
 
 function compareGalleryItems(a: GalleryClipItem, b: GalleryClipItem) {
   const rank = (status: ClipStatus) => {
-    if (status === "pending_export") return 0;
-    if (status === "exporting") return 1;
-    if (status === "failed") return 2;
-    if (status === "ready") return 4;
-    return 3;
+    if (status === "ready_to_export") return 0;
+    if (status === "freezing_segments") return 1;
+    if (status === "waiting_post_event") return 2;
+    if (status === "exporting") return 3;
+    if (status === "failed") return 4;
+    if (status === "expired") return 5;
+    if (status === "ready") return 7;
+    return 6;
   };
   return rank(a.status) - rank(b.status) || secondsAgo(a.createdAt) - secondsAgo(b.createdAt);
+}
+
+function nextPendingExportableSeconds(clips: GalleryClipItem[]) {
+  const next = clips
+    .filter((clip) => clip.status === "waiting_post_event" && clip.isExportable === false && clip.exportableAt)
+    .map((clip) => new Date(clip.exportableAt!).getTime())
+    .filter((timestamp) => Number.isFinite(timestamp))
+    .sort((a, b) => a - b)[0];
+  if (next == null) {
+    return null;
+  }
+  return Math.max(1, Math.ceil((next - Date.now()) / 1000));
 }
 
 function galleryItemToClipInfo(clip: GalleryClipItem): ClipInfo {
@@ -728,12 +811,28 @@ function galleryItemToClipInfo(clip: GalleryClipItem): ClipInfo {
 }
 
 function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
+  const { setPendingExportClips, showToast } = useAppStore();
   const failed = clip.status === "failed";
-  const pending = clip.status === "pending_export";
+  const waiting = clip.status === "waiting_post_event";
+  const freezing = clip.status === "freezing_segments";
+  const pending = clip.status === "ready_to_export" || clip.status === "pending_export";
+  const expired = clip.status === "expired";
   const exporting = clip.status === "exporting";
   const progress = clip.progress ?? (failed ? 0 : 48);
+  const exportableIn = waiting && clip.isExportable === false ? nextPendingExportableSeconds([clip]) : null;
   async function exportNow() {
-    await invoke<ExportSummary>("export_pending_clips");
+    const summary = await invoke<ExportSummary>("export_pending_clips");
+    const pendingClips = await invoke<PendingClipExportDto[]>("get_pending_export_clips");
+    setPendingExportClips(pendingClips);
+    if (summary.total === 0 && pendingClips.length > 0) {
+      showToast("Certains clips ne sont pas encore prêts à exporter");
+    }
+  }
+  async function removePending() {
+    await invoke("delete_pending_export_clip", { id: clip.id });
+    const pendingClips = await invoke<PendingClipExportDto[]>("get_pending_export_clips");
+    setPendingExportClips(pendingClips);
+    showToast("Clip pending supprimé");
   }
   return (
     <motion.article whileHover={{ y: -4 }} className={`clip-card processing-card ${failed ? "failed" : ""}`}>
@@ -742,7 +841,7 @@ function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
         <div className="processing-loader">
           {failed ? (
             <AlertTriangle className="h-7 w-7 text-[#ff8d7a]" />
-          ) : pending ? (
+          ) : pending || waiting || freezing ? (
             <Clock3 className="h-7 w-7 text-amberline" />
           ) : (
             <RefreshCcw className={`h-7 w-7 text-ember ${exporting ? "animate-spin" : ""}`} />
@@ -752,8 +851,16 @@ function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
       </div>
       <div className="p-3">
         <div className="truncate text-sm font-bold text-white">{clip.title || processingReasonLabel[clip.reason]}</div>
-        <div className="mt-1 text-sm text-zinc-400">{getClipStatusLabel(clip.status)}</div>
-        {!pending && (
+        <div className="mt-1 text-sm text-zinc-400">
+          {waiting && clip.isExportable === false
+            ? exportableIn == null
+              ? "En attente de la fin du buffer..."
+              : `En attente de la fin du buffer... ${exportableIn}s`
+            : expired
+              ? "Clip expiré — les segments ont été écrasés"
+            : getClipStatusLabel(clip.status)}
+        </div>
+        {!pending && !waiting && !freezing && !expired && (
           <>
             <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
               <div
@@ -767,11 +874,25 @@ function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
             </div>
           </>
         )}
+        {(waiting || freezing) && (
+          <div className="mt-3 rounded-md border border-white/10 bg-white/[0.035] px-3 py-2 text-xs text-zinc-400">
+            {waiting ? "Capture de la fin du clip..." : "Préservation des segments..."}
+          </div>
+        )}
         {pending && (
           <button className="delete-button mt-3" onClick={() => void exportNow()}>
             <Download className="h-3.5 w-3.5" />
             Exporter maintenant
           </button>
+        )}
+        {expired && (
+          <div className="mt-3 rounded-md border border-[#ff8d7a]/25 bg-[#351711]/45 px-3 py-2 text-xs text-[#ffb7aa]">
+            {clip.error ?? "Clip expiré — les segments ont été écrasés"}
+            <button className="delete-button mt-3" onClick={() => void removePending()}>
+              <Trash2 className="h-3.5 w-3.5" />
+              Supprimer
+            </button>
+          </div>
         )}
         {failed && (
           <div className="mt-3 rounded-md border border-[#ff8d7a]/25 bg-[#351711]/45 px-3 py-2 text-xs text-[#ffb7aa]">
@@ -780,6 +901,10 @@ function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
             <button className="delete-button mt-3" onClick={() => void exportNow()}>
               <RefreshCcw className="h-3.5 w-3.5" />
               Réessayer
+            </button>
+            <button className="delete-button mt-2" onClick={() => void removePending()}>
+              <Trash2 className="h-3.5 w-3.5" />
+              Supprimer
             </button>
           </div>
         )}
@@ -800,12 +925,20 @@ function getClipStatusLabel(status: ClipStatus): string {
       return "Sauvegarde...";
     case "pending_export":
       return "En attente d'export";
+    case "waiting_post_event":
+      return "Capture de la fin du clip...";
+    case "freezing_segments":
+      return "Préservation des segments...";
+    case "ready_to_export":
+      return "Prêt à exporter";
     case "exporting":
       return "Export en cours...";
     case "ready":
       return "Prêt";
     case "failed":
       return "Erreur";
+    case "expired":
+      return "Clip expiré";
   }
 }
 
@@ -885,7 +1018,7 @@ function ClipCard({ clip, onDelete }: { clip: ClipInfo; onDelete: () => void }) 
 }
 
 function Configuration() {
-  const { config, setConfig, showToast } = useAppStore();
+  const { config, runtimeStatus, setConfig, setPendingExportClips, setRuntimeStatus, showToast } = useAppStore();
   const [draft, setDraft] = useState<AppConfig | null>(config);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   useEffect(() => setDraft(config), [config]);
@@ -905,6 +1038,12 @@ function Configuration() {
     const nextConfig = draft;
     await invoke("save_config", { config: nextConfig });
     setConfig(nextConfig);
+    const [status, pending] = await Promise.all([
+      invoke<RuntimeStatus>("get_runtime_status"),
+      invoke<PendingClipExportDto[]>("get_pending_export_clips"),
+    ]);
+    setRuntimeStatus(status);
+    setPendingExportClips(pending);
     showToast("Configuration sauvegardée");
   }
 
@@ -942,6 +1081,34 @@ function Configuration() {
           </button>
         </div>
       </div>
+      <div className="grid grid-cols-2 gap-4">
+        <div className="metric-panel">
+          <Settings className="h-5 w-5 text-ember" />
+          <div>
+            <div className="text-lg font-black text-white">{formatExportMode(draft.clip.export_mode)}</div>
+            <div className="text-xs uppercase text-zinc-500">Mode fichier config</div>
+          </div>
+        </div>
+        <div className="metric-panel">
+          <Cpu className="h-5 w-5 text-amberline" />
+          <div>
+            <div className="text-lg font-black text-white">
+              {formatExportMode(runtimeStatus?.activeExportMode ?? draft.clip.export_mode)}
+            </div>
+            <div className="text-xs uppercase text-zinc-500">Mode actif backend</div>
+          </div>
+        </div>
+      </div>
+      {runtimeStatus && draft.clip.export_mode !== runtimeStatus.activeExportMode && (
+        <div className="processing-banner border-[#ffb454]/35 bg-[#2a1b08]/60 text-[#ffd6a3]">
+          La configuration affichée n'est pas encore appliquée au backend.
+        </div>
+      )}
+      {runtimeStatus?.configRestartRequired && (
+        <div className="processing-banner border-[#ffb454]/35 bg-[#2a1b08]/60 text-[#ffd6a3]">
+          Certains paramètres vidéo nécessitent un redémarrage du buffer.
+        </div>
+      )}
       <div className="settings-grid">
         <Field label="player_name">
           <input value={draft.war_thunder.player_name ?? ""} onChange={(e) => updateWt("player_name", e.target.value || null)} />
@@ -1018,10 +1185,15 @@ function Configuration() {
 }
 
 function Diagnostics() {
-  const { diagnostics, diagnosticsRunning, setDiagnostics, setDiagnosticsRunning } = useAppStore();
+  const { diagnostics, diagnosticsRunning, runtimeStatus, setDiagnostics, setDiagnosticsRunning, setRuntimeStatus } = useAppStore();
   async function run() {
     setDiagnosticsRunning(true);
-    setDiagnostics(await invoke<DoctorReport>("run_diagnostics"));
+    const [report, status] = await Promise.all([
+      invoke<DoctorReport>("run_diagnostics"),
+      invoke<RuntimeStatus>("get_runtime_status"),
+    ]);
+    setDiagnostics(report);
+    setRuntimeStatus(status);
   }
   const counts = diagnostics?.checks.reduce(
     (acc, check) => ({ ...acc, [check.status]: acc[check.status] + 1 }),
@@ -1043,6 +1215,33 @@ function Diagnostics() {
         <Metric icon={CheckCircle2} label="OK" value={counts?.ok ?? 0} />
         <Metric icon={AlertTriangle} label="Warn" value={counts?.warn ?? 0} />
         <Metric icon={XCircle} label="Error" value={counts?.error ?? 0} />
+      </div>
+      <div className="grid grid-cols-3 gap-4">
+        <Metric
+          icon={Cpu}
+          label="Backend auto"
+          value={runtimeStatus?.autoClipRunning ? "Oui" : "Non"}
+        />
+        <Metric
+          icon={Download}
+          label="Mode export actif"
+          value={formatExportMode(runtimeStatus?.activeExportMode ?? "deferred")}
+        />
+        <Metric
+          icon={Clock3}
+          label="Queue pending"
+          value={runtimeStatus?.pendingExportCount ?? 0}
+        />
+      </div>
+      <div className="diagnostic-row">
+        <FolderOpen className="h-5 w-5 text-amberline" />
+        <div className="min-w-0">
+          <div className="font-semibold text-white">Pending exports</div>
+          <div className="break-words text-sm text-zinc-400">{runtimeStatus?.pendingExportDir ?? "-"}</div>
+          <div className="mt-1 text-xs text-zinc-500">
+            {formatBytes(runtimeStatus?.pendingExportBytes ?? 0)}
+          </div>
+        </div>
       </div>
       <div className="diagnostic-list">
         {!diagnostics ? (

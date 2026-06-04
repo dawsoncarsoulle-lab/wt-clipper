@@ -14,12 +14,13 @@ use uuid::Uuid;
 use crate::{
     capture::{
         buffer::{
-            ClipContext, ClipReason, ReplayBufferConfig, ReplayBufferHandle, SaveReplayOutcome,
+            save_frozen_replay, ClipContext, ClipReason, FreezeReplayOutcome, ReplayBufferConfig,
+            ReplayBufferHandle, SaveReplayOutcome,
         },
         quality::{QualityPreset, VideoQuality},
     },
     cli::CaptureSource,
-    config::{ClipExportMode, TriggerConfig, WarThunderConfig},
+    config::{AppConfig, ClipExportMode, TriggerConfig, WarThunderConfig},
     ui::bridge::{
         AppEvent, ClipStatus, ClipStatusPayload, ExportProgressPayload, ExportProgressStep,
     },
@@ -49,6 +50,7 @@ pub struct AutoClipConfig {
     pub triggers: TriggerConfig,
     pub ui_events: Option<mpsc::UnboundedSender<AppEvent>>,
     pub export_mode: ClipExportMode,
+    pub pending_export_dir: PathBuf,
     pub command_rx: Option<mpsc::UnboundedReceiver<AutoClipCommand>>,
 }
 
@@ -61,15 +63,35 @@ pub enum AutoClipCommand {
     GetPendingExportClips {
         respond_to: oneshot::Sender<Vec<PendingClipExportDto>>,
     },
+    DeletePendingClip {
+        id: String,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    UpdateConfig {
+        config: AppConfig,
+        respond_to: oneshot::Sender<RuntimeConfigUpdateResult>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeConfigUpdateResult {
+    pub applied_live: bool,
+    pub restart_required: bool,
+    pub active_export_mode: ClipExportMode,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingExportStatus {
-    Pending,
+    WaitingPostEvent,
+    FreezingSegments,
+    ReadyToExport,
     Exporting,
     Ready,
     Failed,
+    Expired,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +103,11 @@ pub struct PendingClipExport {
     pub game_time: Option<Duration>,
     pub start_time: SystemTime,
     pub end_time: SystemTime,
+    pub exportable_at: SystemTime,
+    pub pending_dir: PathBuf,
+    pub segments_dir: PathBuf,
+    pub manifest_path: PathBuf,
+    pub frozen_segments: Vec<PathBuf>,
     pub pre_event_seconds: u64,
     pub post_event_seconds: u64,
     pub status: PendingExportStatus,
@@ -90,6 +117,7 @@ pub struct PendingClipExport {
     quality_preset: QualityPreset,
     segment_seconds: u64,
     error: Option<String>,
+    retryable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +130,26 @@ pub struct PendingClipExportDto {
     pub status: PendingExportStatus,
     pub progress: Option<u8>,
     pub error: Option<String>,
+    pub exportable_at: String,
+    pub is_exportable: bool,
+    pub can_export: bool,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingClipManifest {
+    id: String,
+    reason: ClipReason,
+    title: String,
+    detected_at: String,
+    event_time: String,
+    start_time: String,
+    end_time: String,
+    pre_event_seconds: u64,
+    post_event_seconds: u64,
+    segments: Vec<PathBuf>,
+    status: PendingExportStatus,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,12 +311,14 @@ impl ExportQueue {
         info!(
             id = %clip.id,
             reason = ?clip.reason,
+            status = ?clip.status,
             title = %clip.title,
             start_time = ?clip.start_time,
             end_time = ?clip.end_time,
+            exportable_at = ?clip.exportable_at,
             pre_event_seconds = clip.pre_event_seconds,
             post_event_seconds = clip.post_event_seconds,
-            "clip added to deferred export queue"
+            "[QUEUE] pending clip upsert"
         );
         if let Some(existing) = self
             .pending
@@ -286,23 +336,38 @@ impl ExportQueue {
     pub fn pending_count(&self) -> usize {
         self.pending
             .iter()
-            .filter(|clip| clip.status == PendingExportStatus::Pending)
-            .count()
-    }
-
-    pub fn pending_dtos(&self) -> Vec<PendingClipExportDto> {
-        self.pending
-            .iter()
             .filter(|clip| {
                 matches!(
                     clip.status,
-                    PendingExportStatus::Pending
+                    PendingExportStatus::WaitingPostEvent
+                        | PendingExportStatus::FreezingSegments
+                        | PendingExportStatus::ReadyToExport
                         | PendingExportStatus::Exporting
                         | PendingExportStatus::Failed
                 )
             })
+            .count()
+    }
+
+    pub fn pending_dtos(&self) -> Vec<PendingClipExportDto> {
+        let dtos = self
+            .pending
+            .iter()
+            .filter(|clip| {
+                matches!(
+                    clip.status,
+                    PendingExportStatus::WaitingPostEvent
+                        | PendingExportStatus::FreezingSegments
+                        | PendingExportStatus::ReadyToExport
+                        | PendingExportStatus::Exporting
+                        | PendingExportStatus::Expired
+                        | PendingExportStatus::Failed
+                )
+            })
             .map(PendingClipExport::dto)
-            .collect()
+            .collect::<Vec<_>>();
+        info!(pending = dtos.len(), "get_pending_export_clips response");
+        dtos
     }
 
     pub async fn export_pending_clips(
@@ -310,14 +375,22 @@ impl ExportQueue {
         buffer: &ReplayBufferHandle,
         auto_config: &AutoClipConfig,
     ) -> ExportSummary {
-        let export_ids = self
+        let not_ready = self
             .pending
             .iter()
             .filter(|clip| {
                 matches!(
                     clip.status,
-                    PendingExportStatus::Pending | PendingExportStatus::Failed
+                    PendingExportStatus::WaitingPostEvent | PendingExportStatus::FreezingSegments
                 )
+            })
+            .count();
+        let export_ids = self
+            .pending
+            .iter()
+            .filter(|clip| {
+                clip.status == PendingExportStatus::ReadyToExport
+                    || (clip.status == PendingExportStatus::Failed && clip.retryable)
             })
             .map(|clip| clip.id.clone())
             .collect::<Vec<_>>();
@@ -328,7 +401,7 @@ impl ExportQueue {
             failed: 0,
         };
 
-        info!(total, "starting deferred clip export");
+        info!(total, not_ready, "starting deferred clip export");
         if total > 0 {
             if let Err(error) = preflight_export_disk_space(buffer, auto_config, total) {
                 let message = format!(
@@ -364,7 +437,11 @@ impl ExportQueue {
                 current_step: ExportProgressStep::Preparing,
                 progress: 0,
                 message: if total == 0 {
-                    "Aucun clip en attente d'export".to_owned()
+                    if not_ready > 0 {
+                        "Certains clips ne sont pas encore prêts à exporter.".to_owned()
+                    } else {
+                        "Aucun clip en attente d'export".to_owned()
+                    }
                 } else {
                     "Préparation de l'export des clips...".to_owned()
                 },
@@ -382,10 +459,8 @@ impl ExportQueue {
                 id = %clip.id,
                 title = %clip.title,
                 reason = ?clip.reason,
-                start_time = ?clip.start_time,
-                end_time = ?clip.end_time,
-                expected_duration_seconds = clip.duration_seconds(),
-                "exporting deferred clip"
+                segments = clip.frozen_segments.len(),
+                "[EXPORT] using frozen segments"
             );
             send_ui_event(
                 auto_config,
@@ -412,9 +487,9 @@ impl ExportQueue {
                 summary.completed,
                 summary.failed,
                 position,
-                ExportProgressStep::Extracting,
+                ExportProgressStep::Assembling,
                 0.25,
-                "Extraction des segments",
+                "Assemblage des segments",
             );
             emit_clip_export_step(
                 auto_config,
@@ -428,9 +503,15 @@ impl ExportQueue {
                 "Encodage du clip",
             );
 
-            let result = buffer.save_replay(clip.clip_context()).await;
+            let result = save_frozen_replay(
+                clip.segments_dir.clone(),
+                auto_config.output_dir.clone(),
+                auto_config.keep_segments,
+                clip.clip_context(),
+            )
+            .await;
             match result {
-                Ok(SaveReplayOutcome::Saved(replay)) => {
+                Ok(replay) => {
                     emit_clip_export_step(
                         auto_config,
                         &clip,
@@ -481,15 +562,20 @@ impl ExportQueue {
                             },
                         );
                     }
-                }
-                Ok(SaveReplayOutcome::NotReadyYet(reason))
-                | Ok(SaveReplayOutcome::SkippedTooOld(reason)) => {
-                    summary.failed += 1;
-                    self.mark_failed(index, auto_config, &clip, reason);
+                    if let Err(error) = std::fs::remove_dir_all(&clip.pending_dir) {
+                        debug!(
+                            %error,
+                            id = %clip.id,
+                            path = %clip.pending_dir.display(),
+                            "failed to remove pending export directory after success"
+                        );
+                    } else {
+                        info!(id = %clip.id, "[EXPORT] pending dir removed");
+                    }
                 }
                 Err(error) => {
                     summary.failed += 1;
-                    self.mark_failed(index, auto_config, &clip, error.to_string());
+                    self.mark_failed(index, auto_config, &clip, error.to_string(), true);
                 }
             }
         }
@@ -515,7 +601,9 @@ impl ExportQueue {
                     ExportProgressStep::Done
                 },
                 progress: 100,
-                message: if summary.failed > 0 {
+                message: if not_ready > 0 && summary.completed == 0 && summary.failed == 0 {
+                    "Certains clips ne sont pas encore prêts à exporter.".to_owned()
+                } else if summary.failed > 0 {
                     format!(
                         "{} clips exportés, {} erreur{}",
                         summary.completed,
@@ -531,12 +619,71 @@ impl ExportQueue {
         summary
     }
 
+    pub async fn freeze_due_pending_clips(
+        &mut self,
+        buffer: &ReplayBufferHandle,
+        auto_config: &AutoClipConfig,
+    ) {
+        let now = SystemTime::now();
+        let due_ids = self
+            .pending
+            .iter()
+            .filter(|clip| {
+                clip.status == PendingExportStatus::WaitingPostEvent && clip.is_exportable_at(now)
+            })
+            .map(|clip| clip.id.clone())
+            .collect::<Vec<_>>();
+
+        for clip_id in due_ids {
+            let Some(index) = self.pending.iter().position(|clip| clip.id == clip_id) else {
+                continue;
+            };
+            let mut clip = self.pending[index].clone();
+            send_ui_event(
+                auto_config,
+                AppEvent::ClipStatusChanged {
+                    payload: clip.status_payload(
+                        ClipStatus::FreezingSegments,
+                        Some(35),
+                        None,
+                        None,
+                    ),
+                },
+            );
+            freeze_pending_clip_segments(buffer, &mut clip, auto_config).await;
+            self.pending[index] = clip.clone();
+            send_ui_event(
+                auto_config,
+                AppEvent::ClipStatusChanged {
+                    payload: clip.status_payload(
+                        clip_status_for_pending(&clip),
+                        clip.dto().progress,
+                        None,
+                        clip.error.clone(),
+                    ),
+                },
+            );
+        }
+    }
+
+    pub fn delete_pending_clip(&mut self, id: &str) -> Result<(), String> {
+        let Some(index) = self.pending.iter().position(|clip| clip.id == id) else {
+            return Ok(());
+        };
+        let clip = self.pending.remove(index);
+        if clip.pending_dir.exists() {
+            std::fs::remove_dir_all(&clip.pending_dir).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     fn mark_failed(
         &mut self,
         index: usize,
         auto_config: &AutoClipConfig,
         clip: &PendingClipExport,
         message: String,
+        retryable: bool,
     ) {
         error!(
             id = %clip.id,
@@ -546,6 +693,7 @@ impl ExportQueue {
         );
         self.pending[index].status = PendingExportStatus::Failed;
         self.pending[index].error = Some(message.clone());
+        self.pending[index].retryable = retryable;
         send_ui_event(
             auto_config,
             AppEvent::ClipStatusChanged {
@@ -564,13 +712,31 @@ impl PendingClipExport {
             created_at: system_time_rfc3339(self.detected_at),
             status: self.status.clone(),
             progress: match self.status {
-                PendingExportStatus::Pending => None,
+                PendingExportStatus::WaitingPostEvent => None,
+                PendingExportStatus::FreezingSegments => Some(35),
+                PendingExportStatus::ReadyToExport => Some(100),
                 PendingExportStatus::Exporting => Some(0),
                 PendingExportStatus::Ready => Some(100),
                 PendingExportStatus::Failed => None,
+                PendingExportStatus::Expired => None,
             },
             error: self.error.clone(),
+            exportable_at: system_time_rfc3339(self.exportable_at),
+            is_exportable: self.is_exportable_at(SystemTime::now()),
+            can_export: self.can_export(),
+            retryable: self.retryable,
         }
+    }
+
+    fn is_exportable_at(&self, now: SystemTime) -> bool {
+        self.exportable_at
+            .duration_since(now)
+            .map_or(true, |remaining| remaining.is_zero())
+    }
+
+    fn can_export(&self) -> bool {
+        self.status == PendingExportStatus::ReadyToExport
+            || (self.status == PendingExportStatus::Failed && self.retryable)
     }
 
     fn duration_seconds(&self) -> u64 {
@@ -606,11 +772,19 @@ impl PendingClipExport {
         file_path: Option<PathBuf>,
         error: Option<String>,
     ) -> ClipStatusPayload {
+        let title = match status {
+            ClipStatus::WaitingPostEvent => "Capture de la fin du clip...".to_owned(),
+            ClipStatus::FreezingSegments => "Préservation des segments...".to_owned(),
+            ClipStatus::ReadyToExport => self.title.clone(),
+            ClipStatus::Exporting => "Export en cours...".to_owned(),
+            ClipStatus::Expired => "Clip expiré".to_owned(),
+            _ => self.title.clone(),
+        };
         ClipStatusPayload {
             id: self.id.clone(),
             status,
             reason: self.reason,
-            title: self.title.clone(),
+            title,
             created_at: system_time_rfc3339(self.detected_at),
             file_path,
             thumbnail_path: None,
@@ -627,6 +801,41 @@ pub(crate) fn effective_post_event_delay(
     segment_seconds: u64,
 ) -> Duration {
     post_event_delay + Duration::from_secs(segment_seconds.saturating_add(1))
+}
+
+fn apply_runtime_config(
+    auto_config: &mut AutoClipConfig,
+    config: &AppConfig,
+) -> RuntimeConfigUpdateResult {
+    let next_output_dir = config.clip.output_dir_path().ok();
+    let restart_required = auto_config.buffer_seconds != config.clip.seconds
+        || auto_config.segment_seconds != config.clip.segment_seconds
+        || auto_config.output_dir != next_output_dir
+        || auto_config.source != config.clip.source
+        || auto_config.quality_preset != config.clip.quality
+        || auto_config.quality.fps != config.clip.fps
+        || auto_config.quality.video_bitrate_kbps != config.clip.video_bitrate_kbps;
+
+    auto_config.export_mode = config.clip.export_mode;
+    auto_config.triggers = config.triggers.clone();
+    auto_config.post_event_delay = Duration::from_secs(config.clip.post_event_seconds);
+    auto_config.multi_kill_window = Duration::from_secs(config.clip.multi_kill_window_seconds);
+    if let Ok(pending_export_dir) = config.pending_exports.pending_export_dir_path() {
+        auto_config.pending_export_dir = pending_export_dir;
+    }
+
+    let message = if restart_required {
+        "Configuration appliquée partiellement; les paramètres vidéo seront actifs après redémarrage du buffer."
+    } else {
+        "Configuration appliquée au backend actif."
+    };
+
+    RuntimeConfigUpdateResult {
+        applied_live: true,
+        restart_required,
+        active_export_mode: auto_config.export_mode,
+        message: message.to_owned(),
+    }
 }
 
 fn replay_buffer_seconds_for_auto(auto_config: &AutoClipConfig) -> u64 {
@@ -665,8 +874,8 @@ pub async fn run_auto_clip(
     println!("Press Ctrl+C to stop.");
 
     let player_name = warthunder_config.player_name.as_deref();
-    let configured_post_event_delay = auto_config.post_event_delay;
-    let effective_save_delay =
+    let mut configured_post_event_delay = auto_config.post_event_delay;
+    let mut effective_save_delay =
         effective_post_event_delay(auto_config.post_event_delay, auto_config.segment_seconds);
     let mut state = AutoWatchState::new();
     if auto_config.include_history {
@@ -723,6 +932,7 @@ pub async fn run_auto_clip(
                     ).await {
                         break Err(error);
                     }
+                    export_queue.freeze_due_pending_clips(buffer, &auto_config).await;
                 }
             }
             command = recv_auto_command(&mut command_rx), if command_rx.is_some() => {
@@ -749,6 +959,23 @@ pub async fn run_auto_clip(
                     }
                     AutoClipCommand::GetPendingExportClips { respond_to } => {
                         let _ = respond_to.send(export_queue.pending_dtos());
+                    }
+                    AutoClipCommand::DeletePendingClip { id, respond_to } => {
+                        let _ = respond_to.send(export_queue.delete_pending_clip(&id));
+                    }
+                    AutoClipCommand::UpdateConfig { config, respond_to } => {
+                        let result = apply_runtime_config(&mut auto_config, &config);
+                        configured_post_event_delay = auto_config.post_event_delay;
+                        effective_save_delay = effective_post_event_delay(
+                            auto_config.post_event_delay,
+                            auto_config.segment_seconds,
+                        );
+                        info!(
+                            export_mode = ?auto_config.export_mode,
+                            restart_required = result.restart_required,
+                            "auto backend runtime config updated"
+                        );
+                        let _ = respond_to.send(result);
                     }
                 }
             }
@@ -818,11 +1045,17 @@ pub async fn run_auto_clip(
                                     configured_post_event_delay,
                                 );
                                 export_queue.add_pending_clip(clip.clone());
+                                info!(
+                                    id = %clip.id,
+                                    reason = ?clip.reason,
+                                    export_mode = ?auto_config.export_mode,
+                                    "deferred pending clip emitted"
+                                );
                                 send_ui_event(
                                     &auto_config,
                                     AppEvent::ClipStatusChanged {
                                         payload: clip.status_payload(
-                                            ClipStatus::PendingExport,
+                                            ClipStatus::WaitingPostEvent,
                                             None,
                                             None,
                                             None,
@@ -895,11 +1128,17 @@ pub async fn run_auto_clip(
                             configured_post_event_delay,
                         );
                         export_queue.add_pending_clip(clip.clone());
+                        info!(
+                            id = %clip.id,
+                            reason = ?clip.reason,
+                            export_mode = ?auto_config.export_mode,
+                            "deferred pending clip emitted"
+                        );
                         send_ui_event(
                             &auto_config,
                             AppEvent::ClipStatusChanged {
                                 payload: clip.status_payload(
-                                    ClipStatus::PendingExport,
+                                    ClipStatus::WaitingPostEvent,
                                     None,
                                     None,
                                     None,
@@ -1024,6 +1263,9 @@ fn pending_export_from_pending(
         .checked_sub(Duration::from_secs(pre_event_seconds))
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let event_end = pending.last_event_wall_time + Duration::from_secs(post_event_seconds);
+    let exportable_at = event_end + pending_export_stable_margin(auto_config.segment_seconds);
+    let (pending_dir, segments_dir, manifest_path) =
+        pending_export_paths(&auto_config.pending_export_dir, &pending.clip_id);
     PendingClipExport {
         id: pending.clip_id.clone(),
         reason: pending.reason,
@@ -1032,15 +1274,21 @@ fn pending_export_from_pending(
         game_time: pending.last_event_game_time,
         start_time: event_start,
         end_time: event_end,
+        exportable_at,
+        pending_dir,
+        segments_dir,
+        manifest_path,
+        frozen_segments: Vec::new(),
         pre_event_seconds,
         post_event_seconds,
-        status: PendingExportStatus::Pending,
+        status: PendingExportStatus::WaitingPostEvent,
         events: pending.events.clone(),
         player_name: player_name.map(str::to_owned),
         quality: auto_config.quality,
         quality_preset: auto_config.quality_preset,
         segment_seconds: auto_config.segment_seconds,
         error: None,
+        retryable: false,
     }
 }
 
@@ -1053,24 +1301,44 @@ fn pending_manual_export(
     let start_time = detected_at
         .checked_sub(Duration::from_secs(pre_event_seconds))
         .unwrap_or(SystemTime::UNIX_EPOCH);
+    let id = format!("clip_{}", Uuid::new_v4());
+    let (pending_dir, segments_dir, manifest_path) =
+        pending_export_paths(&auto_config.pending_export_dir, &id);
     PendingClipExport {
-        id: format!("clip_{}", Uuid::new_v4()),
+        id,
         reason: ClipReason::Manual,
         title: "Clip manuel".to_owned(),
         detected_at,
         game_time: None,
         start_time,
         end_time: detected_at,
+        exportable_at: detected_at + pending_export_stable_margin(auto_config.segment_seconds),
+        pending_dir,
+        segments_dir,
+        manifest_path,
+        frozen_segments: Vec::new(),
         pre_event_seconds,
         post_event_seconds: 0,
-        status: PendingExportStatus::Pending,
+        status: PendingExportStatus::WaitingPostEvent,
         events: Vec::new(),
         player_name: player_name.map(str::to_owned),
         quality: auto_config.quality,
         quality_preset: auto_config.quality_preset,
         segment_seconds: auto_config.segment_seconds,
         error: None,
+        retryable: false,
     }
+}
+
+fn pending_export_paths(base_dir: &Path, clip_id: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let pending_dir = base_dir.join(clip_id);
+    let segments_dir = pending_dir.join("segments");
+    let manifest_path = pending_dir.join("manifest.json");
+    (pending_dir, segments_dir, manifest_path)
+}
+
+fn pending_export_stable_margin(segment_seconds: u64) -> Duration {
+    Duration::from_secs(segment_seconds.saturating_add(1))
 }
 
 fn pending_export_title(reason: ClipReason, kill_count: usize) -> String {
@@ -1167,13 +1435,13 @@ async fn save_ready_pending_clips(
                 auto_config,
                 configured_post_event_delay,
             );
-            send_ui_event(
-                auto_config,
-                AppEvent::ClipStatusChanged {
-                    payload: clip.status_payload(ClipStatus::PendingExport, None, None, None),
-                },
+            export_queue.add_pending_clip(clip.clone());
+            info!(
+                id = %clip.id,
+                reason = ?clip.reason,
+                export_mode = ?auto_config.export_mode,
+                "deferred pending clip emitted"
             );
-            export_queue.add_pending_clip(clip);
             cooldown.record_save(now);
             continue;
         }
@@ -1322,6 +1590,108 @@ fn requeue_pending_clip(
     pending_clips.push(pending);
 }
 
+async fn freeze_pending_clip_segments(
+    buffer: &ReplayBufferHandle,
+    clip: &mut PendingClipExport,
+    _auto_config: &AutoClipConfig,
+) {
+    clip.status = PendingExportStatus::FreezingSegments;
+    clip.error = None;
+    clip.retryable = false;
+    info!(id = %clip.id, "[CLIP] freezing segments");
+
+    match buffer
+        .freeze_replay_segments(clip.clip_context(), clip.segments_dir.clone())
+        .await
+    {
+        Ok(FreezeReplayOutcome::Frozen(segments)) => {
+            info!(
+                id = %clip.id,
+                count = segments.len(),
+                "[CLIP] selected segments"
+            );
+            clip.frozen_segments = segments
+                .iter()
+                .filter_map(|path| {
+                    path.strip_prefix(&clip.pending_dir)
+                        .ok()
+                        .map(Path::to_path_buf)
+                })
+                .collect();
+            clip.status = PendingExportStatus::ReadyToExport;
+            if let Err(error) = write_pending_manifest(clip) {
+                clip.status = PendingExportStatus::Failed;
+                clip.error = Some(error.to_string());
+                clip.retryable = true;
+                error!(
+                    id = %clip.id,
+                    error = %error,
+                    "failed to write pending export manifest"
+                );
+            } else {
+                info!(
+                    id = %clip.id,
+                    path = %clip.manifest_path.display(),
+                    "[CLIP] manifest written"
+                );
+                info!(id = %clip.id, "[CLIP] ready to export");
+            }
+        }
+        Ok(FreezeReplayOutcome::NotReadyYet(reason)) => {
+            clip.status = PendingExportStatus::WaitingPostEvent;
+            clip.error = Some(reason);
+        }
+        Ok(FreezeReplayOutcome::SkippedTooOld(reason)) => {
+            clip.status = PendingExportStatus::Expired;
+            clip.error = Some(format!(
+                "Clip expiré : les segments vidéo ont déjà été écrasés par le buffer. {reason}"
+            ));
+            clip.retryable = false;
+            info!(id = %clip.id, reason = ?clip.error, "[CLIP] expired");
+        }
+        Err(error) => {
+            clip.status = PendingExportStatus::Failed;
+            clip.error = Some(error.to_string());
+            clip.retryable = true;
+            error!(id = %clip.id, error = %error, "failed to freeze pending clip");
+        }
+    }
+}
+
+fn write_pending_manifest(clip: &PendingClipExport) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&clip.pending_dir)?;
+    let manifest = PendingClipManifest {
+        id: clip.id.clone(),
+        reason: clip.reason,
+        title: clip.title.clone(),
+        detected_at: system_time_rfc3339(clip.detected_at),
+        event_time: system_time_rfc3339(
+            clip.start_time + Duration::from_secs(clip.pre_event_seconds),
+        ),
+        start_time: system_time_rfc3339(clip.start_time),
+        end_time: system_time_rfc3339(clip.end_time),
+        pre_event_seconds: clip.pre_event_seconds,
+        post_event_seconds: clip.post_event_seconds,
+        segments: clip.frozen_segments.clone(),
+        status: clip.status.clone(),
+    };
+    let json = serde_json::to_string_pretty(&manifest)?;
+    std::fs::write(&clip.manifest_path, json)?;
+    Ok(())
+}
+
+fn clip_status_for_pending(clip: &PendingClipExport) -> ClipStatus {
+    match clip.status {
+        PendingExportStatus::WaitingPostEvent => ClipStatus::WaitingPostEvent,
+        PendingExportStatus::FreezingSegments => ClipStatus::FreezingSegments,
+        PendingExportStatus::ReadyToExport => ClipStatus::ReadyToExport,
+        PendingExportStatus::Exporting => ClipStatus::Exporting,
+        PendingExportStatus::Ready => ClipStatus::Ready,
+        PendingExportStatus::Failed => ClipStatus::Failed,
+        PendingExportStatus::Expired => ClipStatus::Expired,
+    }
+}
+
 async fn recv_auto_command(
     command_rx: &mut Option<mpsc::UnboundedReceiver<AutoClipCommand>>,
 ) -> Option<AutoClipCommand> {
@@ -1340,13 +1710,19 @@ async fn handle_manual_clip_command(
 ) {
     if auto_config.export_mode == ClipExportMode::Deferred {
         let clip = pending_manual_export(player_name, auto_config);
+        export_queue.add_pending_clip(clip.clone());
+        info!(
+            id = %clip.id,
+            reason = ?clip.reason,
+            export_mode = ?auto_config.export_mode,
+            "deferred pending clip emitted"
+        );
         send_ui_event(
             auto_config,
             AppEvent::ClipStatusChanged {
-                payload: clip.status_payload(ClipStatus::PendingExport, None, None, None),
+                payload: clip.status_payload(ClipStatus::WaitingPostEvent, None, None, None),
             },
         );
-        export_queue.add_pending_clip(clip);
         return;
     }
 
@@ -2009,6 +2385,7 @@ mod tests {
             triggers: TriggerConfig::default(),
             ui_events: None,
             export_mode: ClipExportMode::Instant,
+            pending_export_dir: std::env::temp_dir().join("wt-clipper-test-pending"),
             command_rx: None,
         }
     }
@@ -2932,7 +3309,7 @@ mod tests {
     #[test]
     fn deferred_target_destroyed_adds_pending_export_without_saving() {
         let config = test_auto_config(5, 2);
-        let event_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let event_time = SystemTime::now() + Duration::from_secs(10);
         let pending = PendingClip::new(
             kill("dawson16800"),
             "kill-1".to_owned(),
@@ -2952,11 +3329,19 @@ mod tests {
         );
 
         assert_eq!(clip.reason, ClipReason::TargetDestroyed);
-        assert_eq!(clip.status, PendingExportStatus::Pending);
+        assert_eq!(clip.status, PendingExportStatus::WaitingPostEvent);
         assert_eq!(clip.pre_event_seconds, 20);
         assert_eq!(clip.post_event_seconds, 5);
         assert_eq!(clip.start_time, event_time - Duration::from_secs(20));
         assert_eq!(clip.end_time, event_time + Duration::from_secs(5));
+        assert_eq!(
+            clip.exportable_at,
+            event_time
+                + Duration::from_secs(5)
+                + pending_export_stable_margin(config.segment_seconds)
+        );
+        assert!(!clip.is_exportable_at(event_time + Duration::from_secs(5)));
+        assert!(clip.is_exportable_at(clip.exportable_at));
     }
 
     #[test]
@@ -2967,10 +3352,79 @@ mod tests {
         let clip = pending_manual_export(Some("dawson16800"), &config);
 
         assert_eq!(clip.reason, ClipReason::Manual);
-        assert_eq!(clip.status, PendingExportStatus::Pending);
+        assert_eq!(clip.status, PendingExportStatus::WaitingPostEvent);
         assert_eq!(clip.pre_event_seconds, config.buffer_seconds);
         assert_eq!(clip.post_event_seconds, 0);
         assert_eq!(clip.title, "Clip manuel");
+        assert_eq!(
+            clip.exportable_at,
+            clip.detected_at + pending_export_stable_margin(config.segment_seconds)
+        );
+        assert!(!clip.dto().is_exportable);
+    }
+
+    #[test]
+    fn update_config_applies_export_mode_live() {
+        let mut auto_config = test_auto_config(5, 2);
+        auto_config.export_mode = ClipExportMode::Instant;
+        let mut app_config = AppConfig::default();
+        app_config.clip.export_mode = ClipExportMode::Deferred;
+        app_config.clip.post_event_seconds = 9;
+        app_config.clip.multi_kill_window_seconds = 12;
+        app_config.triggers.target_destroyed = false;
+
+        let result = apply_runtime_config(&mut auto_config, &app_config);
+
+        assert!(result.applied_live);
+        assert_eq!(result.active_export_mode, ClipExportMode::Deferred);
+        assert_eq!(auto_config.export_mode, ClipExportMode::Deferred);
+        assert_eq!(auto_config.post_event_delay, Duration::from_secs(9));
+        assert_eq!(auto_config.multi_kill_window, Duration::from_secs(12));
+        assert!(!auto_config.triggers.target_destroyed);
+    }
+
+    #[test]
+    fn update_config_marks_capture_changes_restart_required() {
+        let mut auto_config = test_auto_config(5, 2);
+        let mut app_config = AppConfig::default();
+        app_config.clip.export_mode = ClipExportMode::Deferred;
+        app_config.clip.seconds = auto_config.buffer_seconds + 5;
+
+        let result = apply_runtime_config(&mut auto_config, &app_config);
+
+        assert!(result.restart_required);
+        assert_eq!(auto_config.export_mode, ClipExportMode::Deferred);
+        assert_ne!(auto_config.buffer_seconds, app_config.clip.seconds);
+    }
+
+    #[test]
+    fn get_pending_export_clips_returns_detected_kill() {
+        let config = test_auto_config(5, 2);
+        let event_time = SystemTime::now() + Duration::from_secs(10);
+        let pending = PendingClip::new(
+            kill("dawson16800"),
+            "kill-1".to_owned(),
+            ClipReason::TargetDestroyed,
+            Instant::now(),
+            Some(Duration::from_secs(120)),
+            event_time,
+            Duration::from_secs(1),
+            "Cible détruite".to_owned(),
+        );
+        let mut queue = ExportQueue::default();
+
+        queue.add_pending_clip(pending_export_from_pending(
+            &pending,
+            Some("dawson16800"),
+            &config,
+            Duration::from_secs(5),
+        ));
+
+        let dtos = queue.pending_dtos();
+        assert_eq!(dtos.len(), 1);
+        assert_eq!(dtos[0].status, PendingExportStatus::WaitingPostEvent);
+        assert_eq!(dtos[0].reason, ClipReason::TargetDestroyed);
+        assert!(!dtos[0].is_exportable);
     }
 
     #[test]

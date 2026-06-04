@@ -14,9 +14,16 @@ pub enum ClipStatus {
     Saving,
     #[serde(rename = "pending_export")]
     PendingExport,
+    #[serde(rename = "waiting_post_event")]
+    WaitingPostEvent,
+    #[serde(rename = "freezing_segments")]
+    FreezingSegments,
+    #[serde(rename = "ready_to_export")]
+    ReadyToExport,
     Exporting,
     Ready,
     Failed,
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,6 +31,7 @@ pub enum ClipStatus {
 pub enum ExportProgressStep {
     Preparing,
     Extracting,
+    Assembling,
     Encoding,
     Thumbnail,
     Saving,

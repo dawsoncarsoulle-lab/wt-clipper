@@ -14,22 +14,19 @@ use serde_json::json;
 use tauri::{Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
-use chrono::Utc;
 use uuid::Uuid;
 mod export_queue;
 mod updater;
 use export_queue::{ExportSummary, PendingClipExportDto};
 use wt_clipper::{
-    app::auto::{
-        run_auto_clip, AutoClipCommand, AutoClipConfig,
-    },
+    app::auto::{run_auto_clip, AutoClipCommand, AutoClipConfig, RuntimeConfigUpdateResult},
     capture::{
-        buffer::{ClipReason, ReplayBufferConfig, ReplayBufferHandle, SaveReplayOutcome},
+        buffer::ClipReason,
         quality::VideoQuality,
     },
-    config::{default_config_path, AppConfig, ClipConfig},
+    config::{default_config_path, AppConfig, ClipConfig, ClipExportMode},
     doctor::{self, DoctorReport},
-    ui::bridge::{AppEvent, ClipInfo, ClipStatus, ClipStatusPayload, UiCommand},
+    ui::bridge::{AppEvent, ClipInfo, UiCommand},
     warthunder::client::WarThunderClient,
 };
 
@@ -194,6 +191,11 @@ struct RuntimeStatus {
     buffer_filled_secs: f32,
     buffer_total_secs: f32,
     auto_clip_running: bool,
+    active_export_mode: ClipExportMode,
+    config_restart_required: bool,
+    pending_export_count: usize,
+    pending_export_dir: PathBuf,
+    pending_export_bytes: u64,
     clips_saved: usize,
     recent_events: Vec<RuntimeEvent>,
     last_error: Option<String>,
@@ -215,6 +217,14 @@ impl RuntimeStatus {
             buffer_filled_secs: 0.0,
             buffer_total_secs: config.clip.seconds as f32,
             auto_clip_running: false,
+            active_export_mode: config.clip.export_mode,
+            config_restart_required: false,
+            pending_export_count: 0,
+            pending_export_dir: config
+                .pending_exports
+                .pending_export_dir_path()
+                .unwrap_or_else(|_| PathBuf::from("")),
+            pending_export_bytes: 0,
             clips_saved: 0,
             recent_events: Vec::new(),
             last_error: None,
@@ -228,12 +238,29 @@ fn get_config(state: State<'_, BackendState>) -> Result<AppConfig, String> {
 }
 
 #[tauri::command]
-fn save_config(config: AppConfig, state: State<'_, BackendState>) -> Result<(), String> {
+async fn save_config(
+    config: AppConfig,
+    state: State<'_, BackendState>,
+) -> Result<RuntimeConfigUpdateResult, String> {
     write_config(&state.config_path, &config).map_err(|error| error.to_string())?;
+    let status_config = config.clone();
+    let (respond_to, response) = oneshot::channel();
     state
-        .cmd_tx
-        .send(UiCommand::UpdateConfig(config))
-        .map_err(|error| error.to_string())
+        .auto_cmd_tx
+        .send(AutoClipCommand::UpdateConfig { config, respond_to })
+        .map_err(|error| error.to_string())?;
+    let result = response.await.map_err(|error| error.to_string())?;
+    if let Ok(mut status) = state.runtime_status.lock() {
+        status.active_export_mode = result.active_export_mode;
+        status.config_restart_required = result.restart_required;
+        status.pending_export_dir = status_config
+            .pending_exports
+            .pending_export_dir_path()
+            .unwrap_or_else(|_| status.pending_export_dir.clone());
+        status.pending_export_bytes = directory_size(&status.pending_export_dir);
+        status.last_error = None;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -301,7 +328,22 @@ async fn get_pending_export_clips(
         .auto_cmd_tx
         .send(AutoClipCommand::GetPendingExportClips { respond_to })
         .map_err(|error| error.to_string())?;
-    response.await.map_err(|error| error.to_string())
+    let clips = response.await.map_err(|error| error.to_string())?;
+    if let Ok(mut status) = state.runtime_status.lock() {
+        status.pending_export_count = clips.len();
+        status.pending_export_bytes = directory_size(&status.pending_export_dir);
+    }
+    Ok(clips)
+}
+
+#[tauri::command]
+async fn delete_pending_export_clip(id: String, state: State<'_, BackendState>) -> Result<(), String> {
+    let (respond_to, response) = oneshot::channel();
+    state
+        .auto_cmd_tx
+        .send(AutoClipCommand::DeletePendingClip { id, respond_to })
+        .map_err(|error| error.to_string())?;
+    response.await.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -359,6 +401,7 @@ fn main() {
             save_manual_clip,
             export_pending_clips,
             get_pending_export_clips,
+            delete_pending_export_clip,
             restart_buffer,
             updater::check_for_updates,
             get_runtime_status
@@ -377,6 +420,7 @@ fn spawn_backend(
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (auto_cmd_tx, auto_cmd_rx) = mpsc::unbounded_channel();
+    let returned_auto_cmd_tx = auto_cmd_tx.clone();
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
@@ -425,10 +469,12 @@ fn spawn_backend(
             let command_events = event_tx.clone();
             let command_output_dir = output_dir.clone();
             let command_preview_server = preview_server.clone();
+            let command_auto_tx = auto_cmd_tx.clone();
             tokio::spawn(async move {
                 command_loop(
                     cmd_rx,
                     command_events,
+                    command_auto_tx,
                     command_output_dir,
                     config_path,
                     command_preview_server,
@@ -452,7 +498,10 @@ fn spawn_backend(
             }
         });
     });
-    BackendChannels { cmd_tx, auto_cmd_tx }
+    BackendChannels {
+        cmd_tx,
+        auto_cmd_tx: returned_auto_cmd_tx,
+    }
 }
 
 async fn run_auto_backend(
@@ -482,6 +531,7 @@ async fn run_auto_backend(
             triggers: config.triggers.clone(),
             ui_events: Some(event_tx),
             export_mode: config.clip.export_mode,
+            pending_export_dir: config.pending_exports.pending_export_dir_path()?,
             command_rx: Some(auto_cmd_rx),
         },
     )
@@ -715,32 +765,23 @@ fn runtime_event_time() -> String {
     )
 }
 
-fn new_clip_status_payload(
-    id: &str,
-    status: ClipStatus,
-    reason: ClipReason,
-    title: impl Into<String>,
-    progress: Option<u8>,
-    error: Option<String>,
-) -> ClipStatusPayload {
-    ClipStatusPayload {
-        id: id.to_owned(),
-        status,
-        reason,
-        title: title.into(),
-        created_at: Utc::now().to_rfc3339(),
-        file_path: None,
-        thumbnail_path: None,
-        duration_seconds: None,
-        size_bytes: None,
-        progress,
-        error,
+fn directory_size(path: &Path) -> u64 {
+    if !path.exists() {
+        return 0;
     }
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .sum()
 }
 
 async fn command_loop(
     mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
+    auto_cmd_tx: mpsc::UnboundedSender<AutoClipCommand>,
     output_dir: PathBuf,
     config_path: PathBuf,
     preview_server: Arc<ClipPreviewServer>,
@@ -807,80 +848,36 @@ async fn command_loop(
             }
             UiCommand::UpdateConfig(config) => {
                 let path = config_path.clone();
+                let runtime_config = config.clone();
                 let result = tokio::task::spawn_blocking(move || write_config(&path, &config))
                     .await
                     .ok()
                     .and_then(Result::ok);
                 let message = if result.is_some() {
-                    "Configuration sauvegardée"
+                    let (respond_to, response) = oneshot::channel();
+                    match auto_cmd_tx.send(AutoClipCommand::UpdateConfig {
+                        config: runtime_config,
+                        respond_to,
+                    }) {
+                        Ok(()) => response
+                            .await
+                            .map(|result| result.message)
+                            .unwrap_or_else(|error| format!("Configuration sauvegardée; backend: {error}")),
+                        Err(error) => format!("Configuration sauvegardée; backend: {error}"),
+                    }
                 } else {
-                    "La configuration n'a pas pu être sauvegardée"
+                    "La configuration n'a pas pu être sauvegardée".to_owned()
                 };
                 let _ = event_tx.send(AppEvent::ClipFailed {
-                    message: message.to_owned(),
+                    message,
                 });
             }
             UiCommand::SaveManualClip => {
-                let event_tx = event_tx.clone();
-                let output_dir = output_dir.clone();
-                let config_path = config_path.clone();
-                tokio::spawn(async move {
-                    let clip_id = format!("clip_{}", Uuid::new_v4());
-                    let _ = event_tx.send(AppEvent::ClipStatusChanged {
-                        payload: new_clip_status_payload(
-                            &clip_id,
-                            ClipStatus::Detected,
-                            ClipReason::Manual,
-                            "Clip manuel détecté...",
-                            Some(10),
-                            None,
-                        ),
+                if let Err(error) = auto_cmd_tx.send(AutoClipCommand::SaveManualClip) {
+                    let _ = event_tx.send(AppEvent::ClipFailed {
+                        message: format!("Clip manuel: {error}"),
                     });
-                    let config = match AppConfig::load(Some(&config_path)) {
-                        Ok(config) => config,
-                        Err(error) => {
-                            let message = error.to_string();
-                            let _ = event_tx.send(AppEvent::ClipStatusChanged {
-                                payload: new_clip_status_payload(
-                                    &clip_id,
-                                    ClipStatus::Failed,
-                                    ClipReason::Manual,
-                                    "Erreur pendant la création du clip",
-                                    None,
-                                    Some(message.clone()),
-                                ),
-                            });
-                            let _ = event_tx.send(AppEvent::ClipFailed {
-                                message: format!("Config: {message}"),
-                            });
-                            return;
-                        }
-                    };
-                    if let Err(error) =
-                        save_standalone_manual_clip(
-                            config,
-                            output_dir,
-                            event_tx.clone(),
-                            clip_id.clone(),
-                        )
-                            .await
-                    {
-                        let message = error.to_string();
-                        let _ = event_tx.send(AppEvent::ClipStatusChanged {
-                            payload: new_clip_status_payload(
-                                &clip_id,
-                                ClipStatus::Failed,
-                                ClipReason::Manual,
-                                "Erreur pendant la création du clip",
-                                None,
-                                Some(message.clone()),
-                            ),
-                        });
-                        let _ = event_tx.send(AppEvent::ClipFailed {
-                            message: format!("Clip manuel: {message}"),
-                        });
-                    }
-                });
+                }
             }
             UiCommand::RestartBuffer => {
                 let _ = event_tx.send(AppEvent::ClipFailed {
@@ -889,96 +886,6 @@ async fn command_loop(
             }
         }
     }
-}
-
-async fn save_standalone_manual_clip(
-    config: AppConfig,
-    output_dir: PathBuf,
-    event_tx: mpsc::UnboundedSender<AppEvent>,
-    clip_id: String,
-) -> anyhow::Result<()> {
-    let quality = resolve_configured_video_quality(&config.clip)?;
-    let mut status = new_clip_status_payload(
-        &clip_id,
-        ClipStatus::Recording,
-        ClipReason::Manual,
-        "Capture en cours...",
-        Some(35),
-        None,
-    );
-    let created_at = status.created_at.clone();
-    let _ = event_tx.send(AppEvent::ClipStatusChanged {
-        payload: status.clone(),
-    });
-    let handle = ReplayBufferHandle::start(ReplayBufferConfig {
-        buffer_seconds: config.clip.seconds,
-        segment_seconds: config.clip.segment_seconds,
-        output_dir: Some(output_dir),
-        source: config.clip.source,
-        keep_segments: config.clip.keep_segments,
-        quality_preset: config.clip.quality,
-        quality,
-    })
-    .await?;
-    tokio::time::sleep(Duration::from_secs(config.clip.seconds.min(5))).await;
-    status.status = ClipStatus::Encoding;
-    status.title = "Encodage du clip...".to_owned();
-    status.progress = Some(72);
-    let _ = event_tx.send(AppEvent::ClipStatusChanged {
-        payload: status.clone(),
-    });
-    match handle.save_replay(handle.manual_clip_context()).await {
-        Ok(SaveReplayOutcome::Saved(replay)) => {
-            status.status = ClipStatus::Saving;
-            status.title = "Sauvegarde du clip...".to_owned();
-            status.progress = Some(92);
-            let _ = event_tx.send(AppEvent::ClipStatusChanged {
-                payload: status.clone(),
-            });
-            if let Some(path) = replay.final_video_path {
-                let size_bytes = std::fs::metadata(&path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0);
-                status.status = ClipStatus::Ready;
-                status.title = "Clip prêt".to_owned();
-                status.file_path = Some(path.clone());
-                status.duration_seconds = Some(config.clip.seconds);
-                status.size_bytes = Some(size_bytes);
-                status.progress = Some(100);
-                status.created_at = created_at;
-                let _ = event_tx.send(AppEvent::ClipStatusChanged { payload: status });
-                let _ = event_tx.send(AppEvent::ClipSaved {
-                    path,
-                    reason: ClipReason::Manual,
-                    duration_seconds: config.clip.seconds,
-                    size_bytes,
-                });
-            }
-        }
-        Ok(SaveReplayOutcome::NotReadyYet(reason))
-        | Ok(SaveReplayOutcome::SkippedTooOld(reason)) => {
-            status.status = ClipStatus::Failed;
-            status.title = "Erreur pendant la création du clip".to_owned();
-            status.progress = None;
-            status.error = Some(reason.clone());
-            let _ = event_tx.send(AppEvent::ClipStatusChanged { payload: status });
-            let _ = event_tx.send(AppEvent::ClipFailed {
-                message: format!("Clip manuel: {reason}"),
-            });
-        }
-        Err(error) => {
-            let message = error.to_string();
-            status.status = ClipStatus::Failed;
-            status.title = "Erreur pendant la création du clip".to_owned();
-            status.progress = None;
-            status.error = Some(message.clone());
-            let _ = event_tx.send(AppEvent::ClipStatusChanged { payload: status });
-            let _ = event_tx.send(AppEvent::ClipFailed {
-                message: format!("Clip manuel: {message}"),
-            });
-        }
-    }
-    handle.stop().await
 }
 
 async fn scan_clips(

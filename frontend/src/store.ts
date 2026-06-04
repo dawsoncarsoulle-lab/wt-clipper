@@ -8,6 +8,7 @@ import type {
   ExportProgressPayload,
   GalleryClipItem,
   PendingClipExportDto,
+  RuntimeStatus,
 } from "./types";
 
 type AppState = {
@@ -23,6 +24,7 @@ type AppState = {
   processingClips: GalleryClipItem[];
   config: AppConfig | null;
   diagnostics: DoctorReport | null;
+  runtimeStatus: RuntimeStatus | null;
   diagnosticsRunning: boolean;
   exportProgress: ExportProgressPayload | null;
   events: EventEntry[];
@@ -34,6 +36,7 @@ type AppState = {
   setPendingExportClips: (clips: PendingClipExportDto[]) => void;
   setExportProgress: (payload: ExportProgressPayload | null) => void;
   setDiagnostics: (report: DoctorReport | null) => void;
+  setRuntimeStatus: (status: RuntimeStatus) => void;
   setDiagnosticsRunning: (running: boolean) => void;
   setWtConnected: (connected: boolean) => void;
   setBuffer: (filled: number, total: number) => void;
@@ -57,6 +60,7 @@ export const useAppStore = create<AppState>((set) => ({
   processingClips: [],
   config: null,
   diagnostics: null,
+  runtimeStatus: null,
   diagnosticsRunning: false,
   exportProgress: null,
   events: [],
@@ -70,6 +74,13 @@ export const useAppStore = create<AppState>((set) => ({
       diskUsedBytes: clips.reduce((sum, clip) => sum + clip.sizeBytes, 0),
     }),
   setDiagnostics: (diagnostics) => set({ diagnostics, diagnosticsRunning: false }),
+  setRuntimeStatus: (runtimeStatus) =>
+    set({
+      runtimeStatus,
+      bufferFilledSecs: runtimeStatus.bufferFilledSecs,
+      bufferTotalSecs: Math.max(1, runtimeStatus.bufferTotalSecs),
+      wtConnected: runtimeStatus.wtConnected,
+    }),
   setDiagnosticsRunning: (diagnosticsRunning) => set({ diagnosticsRunning }),
   setWtConnected: (wtConnected) => set({ wtConnected }),
   setBuffer: (bufferFilledSecs, bufferTotalSecs) =>
@@ -110,17 +121,16 @@ export const useAppStore = create<AppState>((set) => ({
     set((state) => {
       const items = clips.map((clip): GalleryClipItem => ({
         id: clip.id,
-        status:
-          clip.status === "pending"
-            ? "pending_export"
-            : clip.status === "exporting"
-              ? "exporting"
-              : clip.status,
+        status: clip.status,
         reason: clip.reason,
         createdAt: clip.createdAt,
         title: clip.title,
         progress: clip.progress ?? undefined,
         error: clip.error ?? undefined,
+        exportableAt: clip.exportableAt,
+        isExportable: clip.isExportable,
+        canExport: clip.canExport,
+        retryable: clip.retryable,
       }));
       const itemIds = new Set(items.map((item) => item.id));
       const others = state.processingClips.filter((clip) => !itemIds.has(clip.id));

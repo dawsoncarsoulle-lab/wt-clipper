@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub triggers: TriggerConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub pending_exports: PendingExportsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -84,6 +86,18 @@ pub struct StorageConfig {
     pub max_storage_gb: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct PendingExportsConfig {
+    #[serde(default = "default_pending_export_dir_string")]
+    pub pending_export_dir: String,
+    #[serde(default = "default_pending_max_total_size_mb")]
+    pub max_total_size_mb: u64,
+    #[serde(default = "default_pending_max_age_hours")]
+    pub max_age_hours: u64,
+    #[serde(default = "default_true")]
+    pub delete_ready_after_export: bool,
+}
+
 impl Default for ClipConfig {
     fn default() -> Self {
         let quality = QualityPreset::High;
@@ -134,6 +148,17 @@ impl Default for StorageConfig {
     }
 }
 
+impl Default for PendingExportsConfig {
+    fn default() -> Self {
+        Self {
+            pending_export_dir: default_pending_export_dir_string(),
+            max_total_size_mb: default_pending_max_total_size_mb(),
+            max_age_hours: default_pending_max_age_hours(),
+            delete_ready_after_export: true,
+        }
+    }
+}
+
 impl AppConfig {
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
         let path = path
@@ -146,6 +171,8 @@ impl AppConfig {
         let content = fs::read_to_string(&path)?;
         let mut config: Self = toml::from_str(&content)?;
         config.clip.output_dir = expand_tilde_to_string(&config.clip.output_dir)?;
+        config.pending_exports.pending_export_dir =
+            expand_tilde_to_string(&config.pending_exports.pending_export_dir)?;
         if config
             .war_thunder
             .player_name
@@ -176,6 +203,12 @@ impl AppConfig {
 impl ClipConfig {
     pub fn output_dir_path(&self) -> anyhow::Result<PathBuf> {
         expand_tilde(&self.output_dir)
+    }
+}
+
+impl PendingExportsConfig {
+    pub fn pending_export_dir_path(&self) -> anyhow::Result<PathBuf> {
+        expand_tilde(&self.pending_export_dir)
     }
 }
 
@@ -240,6 +273,12 @@ player_destroyed = false
 [storage]
 max_clips = 100
 max_storage_gb = 20
+
+[pending_exports]
+pending_export_dir = "~/.cache/wt-clipper/pending"
+max_total_size_mb = 20000
+max_age_hours = 24
+delete_ready_after_export = true
 "#
 }
 
@@ -271,6 +310,18 @@ fn default_multi_kill_window_seconds() -> u64 {
 
 fn default_output_dir_string() -> String {
     "~/Videos/WarThunder Clips".to_owned()
+}
+
+fn default_pending_export_dir_string() -> String {
+    "~/.cache/wt-clipper/pending".to_owned()
+}
+
+fn default_pending_max_total_size_mb() -> u64 {
+    20_000
+}
+
+fn default_pending_max_age_hours() -> u64 {
+    24
 }
 
 fn default_fps() -> u32 {

@@ -146,6 +146,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     triggers: config.triggers.clone(),
                     ui_events: None,
                     export_mode: config.clip.export_mode,
+                    pending_export_dir: config.pending_exports.pending_export_dir_path()?,
                     command_rx: None,
                 },
             )
@@ -278,6 +279,15 @@ fn spawn_gui_runtime(
                     return;
                 }
             };
+            let pending_export_dir = match config.pending_exports.pending_export_dir_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = event_tx.send(AppEvent::ClipFailed {
+                        message: format!("Pending export dir: {error}"),
+                    });
+                    return;
+                }
+            };
 
             let command_events = event_tx.clone();
             let command_output_dir = output_dir.clone();
@@ -303,6 +313,7 @@ fn spawn_gui_runtime(
                     triggers: config.triggers.clone(),
                     ui_events: Some(event_tx.clone()),
                     export_mode: config.clip.export_mode,
+                    pending_export_dir,
                     command_rx: None,
                 },
             );

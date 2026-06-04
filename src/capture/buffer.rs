@@ -1,7 +1,7 @@
 use std::{
     fs,
     os::fd::AsRawFd,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -62,6 +62,13 @@ pub struct SavedReplay {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveReplayOutcome {
     Saved(SavedReplay),
+    NotReadyYet(String),
+    SkippedTooOld(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreezeReplayOutcome {
+    Frozen(Vec<PathBuf>),
     NotReadyYet(String),
     SkippedTooOld(String),
 }
@@ -231,6 +238,19 @@ impl ReplayBufferHandle {
         .await?
     }
 
+    pub async fn freeze_replay_segments(
+        &self,
+        context: ClipContext,
+        destination_dir: PathBuf,
+    ) -> anyhow::Result<FreezeReplayOutcome> {
+        let temp_dir = self.temp_dir.clone();
+        let keep_segments = self.keep_segments;
+        tokio::task::spawn_blocking(move || {
+            freeze_replay_segments(&temp_dir, keep_segments, context, &destination_dir)
+        })
+        .await?
+    }
+
     pub fn prune(&self) -> anyhow::Result<()> {
         prune_old_segments(&self.temp_dir, self.keep_segments)?;
         check_pipeline_bus(&self.pipeline)
@@ -283,6 +303,18 @@ impl ReplayBufferHandle {
             last_event_time: None,
         }
     }
+}
+
+pub async fn save_frozen_replay(
+    segment_dir: PathBuf,
+    output_dir: Option<PathBuf>,
+    keep_saved_segments: bool,
+    context: ClipContext,
+) -> anyhow::Result<SavedReplay> {
+    tokio::task::spawn_blocking(move || {
+        save_frozen_replay_clip(&segment_dir, output_dir, keep_saved_segments, context)
+    })
+    .await?
 }
 
 pub async fn run_replay_buffer(config: ReplayBufferConfig) -> anyhow::Result<()> {
@@ -520,6 +552,116 @@ fn save_replay_clip(
                 )
             })
         }
+    }
+}
+
+fn freeze_replay_segments(
+    temp_dir: &Path,
+    keep_segments: usize,
+    context: ClipContext,
+    destination_dir: &Path,
+) -> anyhow::Result<FreezeReplayOutcome> {
+    let snapshot = snapshot_stable_segments(
+        temp_dir,
+        keep_segments,
+        context.segment_seconds,
+        SystemTime::now(),
+    )?;
+    println!(
+        "[CLIP] freeze snapshot segments: found={} selected={}",
+        snapshot.found_count,
+        snapshot.selected.len()
+    );
+    let selected = match select_export_segments(&snapshot.selected, &context) {
+        SaveReplaySelection::Selected(selected) => selected,
+        SaveReplaySelection::NotReadyYet(reason) => {
+            println!("[CLIP] deferred freeze not ready yet: {reason}");
+            return Ok(FreezeReplayOutcome::NotReadyYet(reason));
+        }
+        SaveReplaySelection::TooOld(reason) => {
+            println!("[CLIP] deferred freeze expired: {reason}");
+            return Ok(FreezeReplayOutcome::SkippedTooOld(reason));
+        }
+    };
+
+    if destination_dir.exists() {
+        fs::remove_dir_all(destination_dir).with_context(|| {
+            format!(
+                "failed to reset pending segment directory {}",
+                destination_dir.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(destination_dir).with_context(|| {
+        format!(
+            "failed to create pending segment directory {}",
+            destination_dir.display()
+        )
+    })?;
+    copy_stable_segments(&selected, destination_dir, Duration::from_secs(2))?;
+    Ok(FreezeReplayOutcome::Frozen(copied_segment_paths(
+        destination_dir,
+    )?))
+}
+
+fn save_frozen_replay_clip(
+    segment_dir: &Path,
+    output_dir: Option<PathBuf>,
+    keep_saved_segments: bool,
+    context: ClipContext,
+) -> anyhow::Result<SavedReplay> {
+    let segment_paths = copied_segment_paths(segment_dir)?;
+    if segment_paths.is_empty() {
+        anyhow::bail!(
+            "no frozen replay segments available in {}",
+            segment_dir.display()
+        );
+    }
+    let created_at = Local::now();
+    let parent = resolve_clip_parent(output_dir)?;
+    let paths = resolve_clip_paths(&parent, &context, created_at)?;
+    let required_bytes = estimate_required_bytes(&context);
+    check_clip_disk_space(&parent, segment_dir, required_bytes)?;
+
+    println!(
+        "[EXPORT] using frozen segments count={}",
+        segment_paths.len()
+    );
+    match concatenate_segments_to_webm(
+        &segment_paths,
+        paths.final_video_path.clone(),
+        context.video_quality,
+    ) {
+        Ok(path) => {
+            let metadata = build_clip_metadata(
+                &context,
+                created_at,
+                &path,
+                keep_saved_segments.then_some(&paths.segments_dir),
+            );
+            write_clip_metadata(&paths.metadata_path, &metadata)?;
+            if keep_saved_segments {
+                copy_frozen_segments(segment_dir, &paths.segments_dir)?;
+                Ok(SavedReplay {
+                    final_video_path: Some(path),
+                    metadata_path: Some(paths.metadata_path),
+                    segments_dir: Some(paths.segments_dir),
+                })
+            } else {
+                Ok(SavedReplay {
+                    final_video_path: Some(path),
+                    metadata_path: Some(paths.metadata_path),
+                    segments_dir: None,
+                })
+            }
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to assemble final video at {} from {} frozen segments",
+                paths.final_video_path.display(),
+                segment_paths.len()
+            )
+        }),
     }
 }
 
@@ -955,7 +1097,30 @@ fn copy_stable_segments(
                 destination.display()
             )
         })?;
-        println!("[CLIP] copied stable segment: {}", destination.display());
+        println!(
+            "[CLIP] copied segment src={} dst={}",
+            segment.path.display(),
+            destination.display()
+        );
+    }
+    Ok(())
+}
+
+fn copy_frozen_segments(segment_dir: &Path, final_segment_dir: &Path) -> anyhow::Result<()> {
+    if final_segment_dir.exists() {
+        anyhow::bail!(
+            "segment output directory already exists: {}",
+            final_segment_dir.display()
+        );
+    }
+    fs::create_dir_all(final_segment_dir)?;
+    for entry in fs::read_dir(segment_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("webm") {
+            continue;
+        }
+        fs::copy(&path, final_segment_dir.join(entry.file_name()))?;
     }
     Ok(())
 }
