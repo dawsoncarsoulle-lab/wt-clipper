@@ -939,7 +939,7 @@ fn ensure_not_original(input_path: &Path, output_path: &Path) -> anyhow::Result<
 }
 
 fn output_base_dir(config: &AppConfig, mode: ClipEditorMode) -> anyhow::Result<PathBuf> {
-    let base = config.clip.output_dir_path()?;
+    let base = config.library.output_dir_path()?;
     Ok(match mode {
         ClipEditorMode::SocialVertical => base.join("Social"),
         ClipEditorMode::TrimOriginal | ClipEditorMode::YoutubeHorizontal => base.join("Edited"),
@@ -947,7 +947,7 @@ fn output_base_dir(config: &AppConfig, mode: ClipEditorMode) -> anyhow::Result<P
 }
 
 fn backup_output_dir(config: &AppConfig) -> anyhow::Result<PathBuf> {
-    Ok(config.clip.output_dir_path()?.join("Backups"))
+    Ok(config.library.output_dir_path()?.join("Backups"))
 }
 
 fn replacement_paths(

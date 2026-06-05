@@ -4,11 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::{
-    capture::{
-        buffer::{BufferStatus, ClipReason},
-        gpu_screen_recorder::GsrStatus,
-    },
-    config::AppConfig,
+    app::clip_types::ClipReason, capture::gpu_screen_recorder::GsrStatus, config::AppConfig,
     doctor::DoctorReport,
 };
 
@@ -19,47 +15,8 @@ pub enum ClipStatus {
     Recording,
     Encoding,
     Saving,
-    #[serde(rename = "pending_export")]
-    PendingExport,
-    #[serde(rename = "waiting_post_event")]
-    WaitingPostEvent,
-    #[serde(rename = "freezing_segments")]
-    FreezingSegments,
-    #[serde(rename = "ready_to_export")]
-    ReadyToExport,
-    Exporting,
     Ready,
     Failed,
-    Expired,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ExportProgressStep {
-    Preparing,
-    Extracting,
-    Assembling,
-    Encoding,
-    Metadata,
-    Thumbnail,
-    Saving,
-    Done,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExportProgressPayload {
-    pub active: bool,
-    pub total: usize,
-    pub completed: usize,
-    pub failed: usize,
-    pub current_clip_number: Option<usize>,
-    pub current_clip_id: Option<String>,
-    pub current_clip_title: Option<String>,
-    pub current_step: ExportProgressStep,
-    pub progress: u8,
-    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,14 +58,8 @@ pub enum AppEvent {
     ClipStatusChanged {
         payload: ClipStatusPayload,
     },
-    ExportProgressChanged {
-        payload: ExportProgressPayload,
-    },
     ClipFailed {
         message: String,
-    },
-    BufferProgress {
-        status: BufferStatus,
     },
     GsrStatusChanged {
         status: GsrStatus,
@@ -129,8 +80,7 @@ pub enum UiCommand {
     DeleteClip(PathBuf),
     OpenOutputFolder,
     UpdateConfig(AppConfig),
-    RestartReplayBuffer,
-    RestartBuffer,
+    RestartGpuRecorder,
     LoadClips,
     RunDiagnostics,
 }

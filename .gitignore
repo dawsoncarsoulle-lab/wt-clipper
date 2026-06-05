@@ -1,10 +1,15 @@
 /target
 /src-tauri/target/
 /serveur
+/serveur/video.mp4
 /release/
 frontend/node_modules/
 frontend/dist/
 frontend/.tmp-tests/
+wtclip-test/
+*.mp4
+*.webm
+*.mkv
 .env
 npm-debug.log*
 

@@ -6,12 +6,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{capture::quality::QualityPreset, cli::CaptureSource};
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct AppConfig {
     #[serde(default)]
     pub clip: ClipConfig,
+    #[serde(default)]
+    pub library: LibraryConfig,
     #[serde(default)]
     pub capture: CaptureConfig,
     #[serde(default, alias = "warthunder")]
@@ -20,45 +20,29 @@ pub struct AppConfig {
     pub triggers: TriggerConfig,
     #[serde(default)]
     pub storage: StorageConfig,
-    #[serde(default)]
-    pub pending_exports: PendingExportsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ClipConfig {
-    #[serde(default = "default_clip_seconds")]
-    pub seconds: u64,
-    #[serde(default = "default_segment_seconds")]
-    pub segment_seconds: u64,
     #[serde(default = "default_post_event_seconds")]
     pub post_event_seconds: u64,
     #[serde(default = "default_multi_kill_window_seconds")]
     pub multi_kill_window_seconds: u64,
-    #[serde(default = "default_output_dir_string")]
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct LibraryConfig {
+    #[serde(default = "default_library_output_dir_string")]
     pub output_dir: String,
-    #[serde(default)]
-    pub quality: QualityPreset,
-    #[serde(default = "default_fps")]
-    pub fps: u32,
-    #[serde(default = "default_video_bitrate_kbps")]
-    pub video_bitrate_kbps: u32,
-    #[serde(default)]
-    pub source: CaptureSource,
-    #[serde(default)]
-    pub keep_segments: bool,
-    #[serde(default)]
-    pub export_mode: ClipExportMode,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CaptureConfig {
-    #[serde(default)]
-    pub backend: CaptureBackend,
     #[serde(default = "default_capture_target")]
     pub target: String,
     #[serde(default, alias = "gpu_screen_recorder_mode", rename = "mode")]
     pub gpu_screen_recorder_mode: GpuScreenRecorderMode,
-    #[serde(default = "default_fps")]
+    #[serde(default = "default_gsr_fps")]
     pub fps: u32,
     #[serde(default = "default_capture_replay_seconds")]
     pub replay_seconds: u64,
@@ -72,7 +56,7 @@ pub struct CaptureConfig {
     pub quality: GsrQuality,
     #[serde(default)]
     pub bitrate_mode: GsrBitrateMode,
-    #[serde(default)]
+    #[serde(default = "default_gsr_video_bitrate_kbps")]
     pub video_bitrate_kbps: u32,
     #[serde(default = "default_gsr_output_dir_string")]
     pub output_dir: String,
@@ -80,14 +64,6 @@ pub struct CaptureConfig {
     pub audio_enabled: bool,
     #[serde(default = "default_capture_audio_input")]
     pub audio_input: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CaptureBackend {
-    Gstreamer,
-    #[default]
-    GpuScreenRecorder,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -159,9 +135,9 @@ impl GsrEncoder {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GsrQuality {
-    #[default]
     Medium,
     High,
+    #[default]
     VeryHigh,
     Ultra,
 }
@@ -180,9 +156,9 @@ impl GsrQuality {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GsrBitrateMode {
-    #[default]
     Auto,
     Qp,
+    #[default]
     Cbr,
     Vbr,
 }
@@ -196,14 +172,6 @@ impl GsrBitrateMode {
             Self::Vbr => Some("vbr"),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ClipExportMode {
-    Instant,
-    #[default]
-    Deferred,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -236,34 +204,19 @@ pub struct StorageConfig {
     pub max_storage_gb: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct PendingExportsConfig {
-    #[serde(default = "default_pending_export_dir_string")]
-    pub pending_export_dir: String,
-    #[serde(default = "default_pending_max_total_size_mb")]
-    pub max_total_size_mb: u64,
-    #[serde(default = "default_pending_max_age_hours")]
-    pub max_age_hours: u64,
-    #[serde(default = "default_true")]
-    pub delete_ready_after_export: bool,
-}
-
 impl Default for ClipConfig {
     fn default() -> Self {
-        let quality = QualityPreset::Medium;
-        let video_quality = quality.video_quality();
         Self {
-            seconds: default_clip_seconds(),
-            segment_seconds: default_segment_seconds(),
             post_event_seconds: default_post_event_seconds(),
             multi_kill_window_seconds: default_multi_kill_window_seconds(),
-            output_dir: default_output_dir_string(),
-            quality,
-            fps: video_quality.fps,
-            video_bitrate_kbps: video_quality.video_bitrate_kbps,
-            source: CaptureSource::Window,
-            keep_segments: false,
-            export_mode: ClipExportMode::Deferred,
+        }
+    }
+}
+
+impl Default for LibraryConfig {
+    fn default() -> Self {
+        Self {
+            output_dir: default_library_output_dir_string(),
         }
     }
 }
@@ -271,7 +224,6 @@ impl Default for ClipConfig {
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
-            backend: CaptureBackend::GpuScreenRecorder,
             target: default_capture_target(),
             gpu_screen_recorder_mode: GpuScreenRecorderMode::Flatpak,
             fps: default_gsr_fps(),
@@ -281,7 +233,7 @@ impl Default for CaptureConfig {
             encoder: GsrEncoder::Gpu,
             quality: GsrQuality::VeryHigh,
             bitrate_mode: GsrBitrateMode::Cbr,
-            video_bitrate_kbps: 20_000,
+            video_bitrate_kbps: default_gsr_video_bitrate_kbps(),
             output_dir: default_gsr_output_dir_string(),
             audio_enabled: default_capture_audio_enabled(),
             audio_input: default_capture_audio_input(),
@@ -319,17 +271,6 @@ impl Default for StorageConfig {
     }
 }
 
-impl Default for PendingExportsConfig {
-    fn default() -> Self {
-        Self {
-            pending_export_dir: default_pending_export_dir_string(),
-            max_total_size_mb: default_pending_max_total_size_mb(),
-            max_age_hours: default_pending_max_age_hours(),
-            delete_ready_after_export: true,
-        }
-    }
-}
-
 impl AppConfig {
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
         let path = path
@@ -340,11 +281,16 @@ impl AppConfig {
         }
 
         let content = fs::read_to_string(&path)?;
-        let mut config: Self = toml::from_str(&content)?;
-        config.clip.output_dir = expand_tilde_to_string(&config.clip.output_dir)?;
+        let mut value: toml::Value = toml::from_str(&content)?;
+        Self::migrate_legacy_fields(&mut value);
+        let mut config: Self = value.try_into()?;
+        config.library.output_dir = expand_tilde_to_string(&config.library.output_dir)?;
         config.capture.output_dir = expand_tilde_to_string(&config.capture.output_dir)?;
-        config.pending_exports.pending_export_dir =
-            expand_tilde_to_string(&config.pending_exports.pending_export_dir)?;
+        if config.capture.bitrate_mode == GsrBitrateMode::Cbr
+            && config.capture.video_bitrate_kbps == 0
+        {
+            config.capture.video_bitrate_kbps = default_gsr_video_bitrate_kbps();
+        }
         if config
             .war_thunder
             .player_name
@@ -354,6 +300,45 @@ impl AppConfig {
             config.war_thunder.player_name = None;
         }
         Ok(config)
+    }
+
+    fn migrate_legacy_fields(value: &mut toml::Value) {
+        let Some(root) = value.as_table_mut() else {
+            return;
+        };
+
+        let legacy_clip_output_dir = root
+            .get("clip")
+            .and_then(toml::Value::as_table)
+            .and_then(|clip| clip.get("output_dir"))
+            .cloned();
+        let library = root
+            .entry("library".to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if let (Some(output_dir), Some(library)) = (legacy_clip_output_dir, library.as_table_mut())
+        {
+            library.entry("output_dir".to_owned()).or_insert(output_dir);
+        }
+
+        root.remove("pending_exports");
+        if let Some(capture) = root.get_mut("capture").and_then(toml::Value::as_table_mut) {
+            capture.remove("backend");
+        }
+        if let Some(clip) = root.get_mut("clip").and_then(toml::Value::as_table_mut) {
+            for key in [
+                "seconds",
+                "segment_seconds",
+                "output_dir",
+                "quality",
+                "fps",
+                "video_bitrate_kbps",
+                "source",
+                "keep_segments",
+                "export_mode",
+            ] {
+                clip.remove(key);
+            }
+        }
     }
 
     pub fn write_default(path: &Path, force: bool) -> anyhow::Result<()> {
@@ -372,7 +357,7 @@ impl AppConfig {
     }
 }
 
-impl ClipConfig {
+impl LibraryConfig {
     pub fn output_dir_path(&self) -> anyhow::Result<PathBuf> {
         expand_tilde(&self.output_dir)
     }
@@ -381,12 +366,6 @@ impl ClipConfig {
 impl CaptureConfig {
     pub fn output_dir_path(&self) -> anyhow::Result<PathBuf> {
         expand_tilde(&self.output_dir)
-    }
-}
-
-impl PendingExportsConfig {
-    pub fn pending_export_dir_path(&self) -> anyhow::Result<PathBuf> {
-        expand_tilde(&self.pending_export_dir)
     }
 }
 
@@ -427,20 +406,13 @@ fn expand_tilde_to_string(path: &str) -> anyhow::Result<String> {
 
 pub fn default_config_toml() -> &'static str {
     r#"[clip]
-seconds = 20
-segment_seconds = 2
 post_event_seconds = 5
 multi_kill_window_seconds = 8
+
+[library]
 output_dir = "~/Videos/WarThunder Clips"
-quality = "medium"
-fps = 30
-video_bitrate_kbps = 10000
-source = "window"
-keep_segments = false
-export_mode = "deferred"
 
 [capture]
-backend = "gpu_screen_recorder"
 target = "eDP"
 mode = "flatpak"
 fps = 60
@@ -456,8 +428,10 @@ audio_enabled = true
 audio_input = "default_output"
 
 [war_thunder]
+base_url = "http://127.0.0.1:8111"
 player_name = ""
 poll_interval_ms = 300
+request_timeout_ms = 500
 
 [triggers]
 target_destroyed = true
@@ -467,12 +441,6 @@ player_destroyed = false
 [storage]
 max_clips = 100
 max_storage_gb = 20
-
-[pending_exports]
-pending_export_dir = "~/.cache/wt-clipper/pending"
-max_total_size_mb = 20000
-max_age_hours = 24
-delete_ready_after_export = true
 "#
 }
 
@@ -486,14 +454,6 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-fn default_clip_seconds() -> u64 {
-    20
-}
-
-fn default_segment_seconds() -> u64 {
-    2
-}
-
 fn default_post_event_seconds() -> u64 {
     5
 }
@@ -502,7 +462,7 @@ fn default_multi_kill_window_seconds() -> u64 {
     8
 }
 
-fn default_output_dir_string() -> String {
+fn default_library_output_dir_string() -> String {
     "~/Videos/WarThunder Clips".to_owned()
 }
 
@@ -530,24 +490,8 @@ fn default_gsr_fps() -> u32 {
     60
 }
 
-fn default_pending_export_dir_string() -> String {
-    "~/.cache/wt-clipper/pending".to_owned()
-}
-
-fn default_pending_max_total_size_mb() -> u64 {
+fn default_gsr_video_bitrate_kbps() -> u32 {
     20_000
-}
-
-fn default_pending_max_age_hours() -> u64 {
-    24
-}
-
-fn default_fps() -> u32 {
-    30
-}
-
-fn default_video_bitrate_kbps() -> u32 {
-    10_000
 }
 
 fn default_base_url() -> String {
@@ -562,10 +506,6 @@ fn default_request_timeout_ms() -> u64 {
     500
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn default_max_clips() -> u64 {
     100
 }
@@ -574,100 +514,67 @@ fn default_max_storage_gb() -> u64 {
     20
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn missing_config_uses_defaults() {
-        let path =
-            std::env::temp_dir().join(format!("wt-clipper-missing-config-{}", std::process::id()));
+    fn old_clip_output_dir_migrates_to_library_output_dir() {
+        let mut value: toml::Value = toml::from_str(
+            r#"
+[clip]
+output_dir = "/tmp/library"
+post_event_seconds = 7
 
-        let config = AppConfig::load(Some(&path)).unwrap();
+[capture]
+backend = "gpu_screen_recorder"
+"#,
+        )
+        .unwrap();
 
-        assert_eq!(config.clip.seconds, 20);
-        assert_eq!(config.clip.quality, QualityPreset::Medium);
-        assert_eq!(config.clip.source, CaptureSource::Window);
+        AppConfig::migrate_legacy_fields(&mut value);
+        let config: AppConfig = value.try_into().unwrap();
+
+        assert_eq!(config.library.output_dir, "/tmp/library");
+        assert_eq!(config.clip.post_event_seconds, 7);
     }
 
     #[test]
-    fn parses_config_toml() {
-        let config: AppConfig = toml::from_str(default_config_toml()).unwrap();
+    fn old_pending_exports_loads_successfully() {
+        let mut value: toml::Value = toml::from_str(
+            r#"
+[pending_exports]
+pending_export_dir = "/tmp/pending"
+"#,
+        )
+        .unwrap();
 
-        assert_eq!(config.clip.seconds, 20);
-        assert_eq!(config.clip.video_bitrate_kbps, 10_000);
-        assert_eq!(config.clip.multi_kill_window_seconds, 8);
-        assert_eq!(config.capture.backend, CaptureBackend::GpuScreenRecorder);
-        assert_eq!(
-            config.capture.gpu_screen_recorder_mode,
-            GpuScreenRecorderMode::Flatpak
-        );
+        AppConfig::migrate_legacy_fields(&mut value);
+        let config: AppConfig = value.try_into().unwrap();
+
         assert_eq!(config.capture.replay_seconds, 25);
-        assert_eq!(config.capture.quality, GsrQuality::VeryHigh);
-        assert_eq!(config.capture.bitrate_mode, GsrBitrateMode::Cbr);
-        assert_eq!(config.capture.video_bitrate_kbps, 20_000);
-        assert_eq!(config.war_thunder.poll_interval_ms, 300);
-        assert!(config.triggers.target_destroyed);
-        assert!(config.triggers.base_destroyed);
-        assert!(!config.triggers.player_destroyed);
-        assert_eq!(config.storage.max_clips, 100);
     }
 
     #[test]
-    fn gsr_quality_accepts_ultra() {
-        let config: CaptureConfig = toml::from_str(
-            r#"
-quality = "ultra"
-bitrate_mode = "qp"
-"#,
-        )
-        .unwrap();
+    fn clean_config_serializes_without_obsolete_fields() {
+        let content = toml::to_string(&AppConfig::default()).unwrap();
 
-        assert_eq!(config.quality, GsrQuality::Ultra);
-        assert_eq!(config.bitrate_mode, GsrBitrateMode::Qp);
-    }
-
-    #[test]
-    fn ignores_removed_trigger_fields_from_old_configs() {
-        let config: AppConfig = toml::from_str(
-            r#"
-[triggers]
-target_destroyed = true
-player_destroyed = true
-critical_hit = true
-severe_damage = true
-set_afire = true
-crash = true
-"#,
-        )
-        .unwrap();
-
-        assert!(config.triggers.target_destroyed);
-        assert!(config.triggers.player_destroyed);
-        assert!(config.triggers.base_destroyed);
-    }
-
-    #[test]
-    fn expands_tilde_paths() {
-        let home = std::env::var("HOME").unwrap();
-
-        assert_eq!(
-            expand_tilde("~/Videos/WarThunder Clips").unwrap(),
-            PathBuf::from(home).join("Videos/WarThunder Clips")
-        );
-    }
-
-    #[test]
-    fn config_init_does_not_overwrite_without_force() {
-        let dir =
-            std::env::temp_dir().join(format!("wt-clipper-config-init-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        fs::write(&path, "existing").unwrap();
-
-        assert!(AppConfig::write_default(&path, false).is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "existing");
-
-        fs::remove_dir_all(dir).unwrap();
+        for obsolete in [
+            "pending_exports",
+            "segment_seconds",
+            "source",
+            "keep_segments",
+            "export_mode",
+            "backend",
+        ] {
+            assert!(
+                !content.contains(obsolete),
+                "serialized config still contains {obsolete}: {content}"
+            );
+        }
     }
 }

@@ -1,22 +1,11 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::Duration,
 };
 
-use ashpd::desktop::screencast::Screencast;
-use gstreamer as gst;
 use serde::{Deserialize, Serialize};
-
-use crate::{
-    capture::{
-        audio::resolve_system_audio_source,
-        output::default_output_dir,
-        recorder::{choose_backend, CaptureBackend},
-        x11::resolve_x11_window_id,
-    },
-    cli::CaptureSource,
-};
 
 const ONE_GIB: u64 = 1024 * 1024 * 1024;
 const FIVE_GIB: u64 = 5 * ONE_GIB;
@@ -51,13 +40,6 @@ pub struct FreeSpaceReport {
     pub status: DoctorStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionKind {
-    Wayland,
-    X11,
-    Unknown,
-}
-
 pub async fn run_doctor(json: bool, output_dir: Option<PathBuf>) -> anyhow::Result<()> {
     let report = build_report(output_dir).await;
     if json {
@@ -70,284 +52,182 @@ pub async fn run_doctor(json: bool, output_dir: Option<PathBuf>) -> anyhow::Resu
 
 pub async fn build_report(output_dir: Option<PathBuf>) -> DoctorReport {
     let mut checks = Vec::new();
-    let (session_kind, session_check) = check_session();
-    checks.push(session_check);
-    checks.push(check_capture_backend(session_kind));
-    checks.extend(check_portal().await);
-    checks.extend(check_gstreamer(session_kind));
-    checks.push(check_x11_window(session_kind));
-    checks.push(check_audio_source());
+    checks.push(check_command("Flatpak", "flatpak"));
+    checks.push(check_gsr_native());
+    checks.push(check_gsr_flatpak_app());
+    checks.push(check_gsr_flatpak_help());
+    checks.push(check_gsr_list_monitors());
+    checks.push(check_command("ffmpeg", "ffmpeg"));
+    checks.push(check_command("ffprobe", "ffprobe"));
+    checks.push(check_audio_config());
     checks.push(check_war_thunder_localhost().await);
-    let output_dir = output_dir.map(Ok).unwrap_or_else(default_output_dir);
-    match output_dir {
-        Ok(output_dir) => {
-            checks.push(check_writable_dir(
-                "Output dir writable",
-                Ok(output_dir.clone()),
-            ));
-            checks.push(check_free_space_for_doctor(
-                "Output dir free space",
-                Ok(output_dir),
-                FIVE_GIB,
-            ));
-        }
-        Err(error) => {
-            let message = error.to_string();
-            checks.push(DoctorCheck::error(
-                "Output dir writable",
-                format!("could not resolve directory: {message}"),
-                Some("set HOME or pass an explicit output directory"),
-            ));
-            checks.push(DoctorCheck::error(
-                "Output dir free space",
-                format!("could not resolve directory: {message}"),
-                Some("set HOME or pass an explicit output directory"),
-            ));
-        }
-    }
+
+    let output_dir = output_dir.unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Videos")
+            .join("WarThunder Clips")
+    });
+    checks.push(check_writable_dir(
+        "Output dir writable",
+        Ok(output_dir.clone()),
+    ));
+    checks.push(check_free_space_for_doctor(
+        "Output dir free space",
+        Ok(output_dir),
+        FIVE_GIB,
+    ));
     checks.push(check_writable_dir(
         "Temp dir writable",
-        Ok(std::env::temp_dir().join("wt-clipper-buffer")),
+        Ok(std::env::temp_dir().join("wt-clipper")),
     ));
     checks.push(check_free_space_for_doctor(
         "Temp dir free space",
-        Ok(std::env::temp_dir().join("wt-clipper-buffer")),
+        Ok(std::env::temp_dir().join("wt-clipper")),
         FIVE_GIB,
+    ));
+    checks.push(DoctorCheck::ok(
+        "Config path",
+        crate::config::default_config_path().display().to_string(),
     ));
 
     let summary = summary_for_checks(&checks);
     DoctorReport { checks, summary }
 }
 
-fn check_capture_backend(session_kind: SessionKind) -> DoctorCheck {
-    let session = match session_kind {
-        SessionKind::X11 => "x11",
-        SessionKind::Wayland => "wayland",
-        SessionKind::Unknown => "",
-    };
-    match choose_backend(session) {
-        CaptureBackend::X11 => {
-            DoctorCheck::ok("Capture backend", "X11 window capture via ximagesrc")
-        }
-        CaptureBackend::PortalPipeWire => DoctorCheck::ok(
-            "Capture backend",
-            "Wayland/COSMIC portal capture via pipewiresrc",
-        ),
-        CaptureBackend::ManualPipeWirePath(path) => {
-            DoctorCheck::ok("Capture backend", format!("manual PipeWire path {path}"))
-        }
-        CaptureBackend::ManualPipeWireTarget(target) => DoctorCheck::ok(
-            "Capture backend",
-            format!("manual PipeWire target {target}"),
-        ),
-    }
-}
-
-fn check_x11_window(session_kind: SessionKind) -> DoctorCheck {
-    if session_kind != SessionKind::X11 {
-        return DoctorCheck::ok("X11 War Thunder window", "not needed for this session");
-    }
-
-    match resolve_x11_window_id(CaptureSource::Window) {
-        Ok(Some(window)) => DoctorCheck::ok(
-            "X11 War Thunder window",
-            format!(
-                "found {:#x}{}{}",
-                window.id,
-                window
-                    .title
-                    .as_deref()
-                    .map(|title| format!(" title={title:?}"))
-                    .unwrap_or_default(),
-                window
-                    .class
-                    .as_deref()
-                    .map(|class| format!(" class={class:?}"))
-                    .unwrap_or_default()
-            ),
-        ),
-        Ok(None) => DoctorCheck::warn(
-            "X11 War Thunder window",
-            "not selected",
-            Some("set source=window or use screen capture"),
+fn check_command(name: &str, program: &str) -> DoctorCheck {
+    match Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => DoctorCheck::ok(name, "available"),
+        Ok(status) => DoctorCheck::warn(
+            name,
+            format!("command exited with status {status}"),
+            Some(format!("verify `{program}` is installed correctly")),
         ),
         Err(error) => DoctorCheck::warn(
-            "X11 War Thunder window",
+            name,
             format!("not found: {error}"),
-            Some("launch War Thunder first, or set WT_CLIPPER_X11_WINDOW_ID"),
+            Some(format!("install `{program}` or ensure it is in PATH")),
         ),
     }
 }
 
-fn check_audio_source() -> DoctorCheck {
-    match resolve_system_audio_source() {
-        Some(source) => DoctorCheck::ok("System audio monitor", source.device),
-        None => DoctorCheck::warn(
-            "System audio monitor",
-            "not detected",
-            Some(
-                "install/use pactl, or set WT_CLIPPER_AUDIO_DEVICE; audio capture will be skipped",
-            ),
-        ),
-    }
-}
-
-fn check_session() -> (SessionKind, DoctorCheck) {
-    let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
-    let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
-    let display = std::env::var("DISPLAY").ok();
-    let display_suffix = match (wayland_display, display) {
-        (Some(wayland), Some(display)) => {
-            format!(" (WAYLAND_DISPLAY={wayland}, DISPLAY={display})")
+fn check_gsr_native() -> DoctorCheck {
+    match Command::new("gpu-screen-recorder")
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {
+            DoctorCheck::ok("GPU Screen Recorder native", "available")
         }
-        (Some(wayland), None) => format!(" (WAYLAND_DISPLAY={wayland})"),
-        (None, Some(display)) => format!(" (DISPLAY={display})"),
-        (None, None) => String::new(),
-    };
-
-    match session_type.to_ascii_lowercase().as_str() {
-        "wayland" => (
-            SessionKind::Wayland,
-            DoctorCheck::ok("Session", format!("Wayland{display_suffix}")),
+        Ok(status) => DoctorCheck::warn(
+            "GPU Screen Recorder native",
+            format!("command exited with status {status}"),
+            Some("Flatpak mode can still be used"),
         ),
-        "x11" => (
-            SessionKind::X11,
-            DoctorCheck::ok("Session", format!("X11{display_suffix}")),
-        ),
-        "" => (
-            SessionKind::Unknown,
-            DoctorCheck::warn(
-                "Session",
-                format!("unknown{display_suffix}"),
-                Some("XDG_SESSION_TYPE is not set"),
-            ),
-        ),
-        other => (
-            SessionKind::Unknown,
-            DoctorCheck::warn(
-                "Session",
-                format!("unknown ({other}){display_suffix}"),
-                Some("expected XDG_SESSION_TYPE=wayland or x11"),
-            ),
+        Err(error) => DoctorCheck::warn(
+            "GPU Screen Recorder native",
+            format!("not found: {error}"),
+            Some("install native gpu-screen-recorder or use Flatpak mode"),
         ),
     }
 }
 
-async fn check_portal() -> Vec<DoctorCheck> {
-    let mut checks = Vec::new();
-    match ashpd::zbus::Connection::session().await {
-        Ok(connection) => match ashpd::zbus::fdo::DBusProxy::new(&connection).await {
-            Ok(proxy) => {
-                match ashpd::zbus::names::BusName::try_from("org.freedesktop.portal.Desktop") {
-                    Ok(name) => match proxy.name_has_owner(name).await {
-                        Ok(true) => checks.push(DoctorCheck::ok(
-                            "xdg-desktop-portal available",
-                            "DBus name org.freedesktop.portal.Desktop has an owner",
-                        )),
-                        Ok(false) => checks.push(DoctorCheck::warn(
-                            "xdg-desktop-portal available",
-                            "DBus name org.freedesktop.portal.Desktop has no owner",
-                            Some("install/start xdg-desktop-portal and a desktop backend"),
-                        )),
-                        Err(error) => checks.push(DoctorCheck::warn(
-                            "xdg-desktop-portal available",
-                            format!("could not query DBus: {error}"),
-                            Some("doctor did not call SelectSources or open any portal dialog"),
-                        )),
-                    },
-                    Err(error) => checks.push(DoctorCheck::warn(
-                        "xdg-desktop-portal available",
-                        format!("invalid DBus name: {error}"),
-                        Some("doctor did not call SelectSources or open any portal dialog"),
-                    )),
-                }
-            }
-            Err(error) => checks.push(DoctorCheck::warn(
-                "xdg-desktop-portal available",
-                format!("could not create DBus proxy: {error}"),
-                Some("doctor did not call SelectSources or open any portal dialog"),
-            )),
-        },
-        Err(error) => checks.push(DoctorCheck::warn(
-            "xdg-desktop-portal available",
-            format!("could not connect to session DBus: {error}"),
-            Some("doctor did not call SelectSources or open any portal dialog"),
-        )),
+fn check_gsr_flatpak_app() -> DoctorCheck {
+    match Command::new("flatpak")
+        .args(["info", "com.dec05eba.gpu_screen_recorder"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => DoctorCheck::ok(
+            "GPU Screen Recorder Flatpak",
+            "com.dec05eba.gpu_screen_recorder installed",
+        ),
+        Ok(status) => DoctorCheck::warn(
+            "GPU Screen Recorder Flatpak",
+            format!("flatpak info exited with status {status}"),
+            Some("install com.dec05eba.gpu_screen_recorder from Flatpak"),
+        ),
+        Err(error) => DoctorCheck::warn(
+            "GPU Screen Recorder Flatpak",
+            format!("flatpak unavailable: {error}"),
+            Some("install Flatpak or use native mode"),
+        ),
     }
-
-    match Screencast::new().await {
-        Ok(_) => checks.push(DoctorCheck::ok(
-            "ScreenCast portal available",
-            "org.freedesktop.portal.ScreenCast proxy created",
-        )),
-        Err(error) => checks.push(DoctorCheck::warn(
-            "ScreenCast portal available",
-            format!("unavailable: {error}"),
-            Some("doctor did not create a ScreenCast session or open a selection dialog"),
-        )),
-    }
-    checks
 }
 
-fn check_gstreamer(session_kind: SessionKind) -> Vec<DoctorCheck> {
-    let mut checks = Vec::new();
-    match gst::init() {
-        Ok(()) => checks.push(DoctorCheck::ok("GStreamer initialized", "ready")),
-        Err(error) => {
-            checks.push(DoctorCheck::error(
-                "GStreamer initialized",
-                format!("failed: {error}"),
-                Some("install GStreamer runtime libraries"),
-            ));
-            return checks;
+fn check_gsr_flatpak_help() -> DoctorCheck {
+    match Command::new("flatpak")
+        .args([
+            "run",
+            "--command=gpu-screen-recorder",
+            "com.dec05eba.gpu_screen_recorder",
+            "--help",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => DoctorCheck::ok("GSR Flatpak command", "help works"),
+        Ok(status) => DoctorCheck::warn(
+            "GSR Flatpak command",
+            format!("help exited with status {status}"),
+            Some("check the Flatpak installation"),
+        ),
+        Err(error) => DoctorCheck::warn(
+            "GSR Flatpak command",
+            format!("could not run Flatpak GSR: {error}"),
+            Some("check flatpak permissions and installation"),
+        ),
+    }
+}
+
+fn check_gsr_list_monitors() -> DoctorCheck {
+    match Command::new("flatpak")
+        .args([
+            "run",
+            "--command=gpu-screen-recorder",
+            "com.dec05eba.gpu_screen_recorder",
+            "--list-monitors",
+        ])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let monitors = String::from_utf8_lossy(&output.stdout);
+            let first_line = monitors.lines().next().unwrap_or("no monitors listed");
+            DoctorCheck::ok("GSR monitors", first_line)
         }
+        Ok(output) => DoctorCheck::warn(
+            "GSR monitors",
+            format!("list-monitors exited with status {}", output.status),
+            Some("GSR may still work after the desktop grants access"),
+        ),
+        Err(error) => DoctorCheck::warn(
+            "GSR monitors",
+            format!("could not list monitors: {error}"),
+            Some("verify Flatpak GSR can run"),
+        ),
     }
-
-    for plugin in [
-        "pipewiresrc",
-        "ximagesrc",
-        "videoconvert",
-        "videorate",
-        "audioconvert",
-        "audioresample",
-        "vp8enc",
-        "opusenc",
-        "pulsesrc",
-        "webmmux",
-        "splitmuxsink",
-        "filesink",
-        "decodebin",
-        "concat",
-        "queue",
-    ] {
-        checks.push(check_gstreamer_plugin(plugin, session_kind));
-    }
-
-    checks
 }
 
-fn check_gstreamer_plugin(plugin: &str, session_kind: SessionKind) -> DoctorCheck {
-    if gst::ElementFactory::find(plugin).is_some() {
-        return DoctorCheck::ok(format!("plugin {plugin}"), "available");
+fn check_audio_config() -> DoctorCheck {
+    if std::env::var_os("WT_CLIPPER_AUDIO_DEVICE").is_some() {
+        return DoctorCheck::ok("Audio input", "WT_CLIPPER_AUDIO_DEVICE set");
     }
-
-    match (plugin, session_kind) {
-        ("ximagesrc", SessionKind::Wayland) => DoctorCheck::warn(
-            "plugin ximagesrc",
-            "missing",
-            Some("not needed for Wayland/COSMIC portal capture"),
-        ),
-        ("pipewiresrc", SessionKind::X11) => DoctorCheck::warn(
-            "plugin pipewiresrc",
-            "missing",
-            Some("not needed for X11 screen capture"),
-        ),
-        _ => DoctorCheck::error(
-            format!("plugin {plugin}"),
-            "missing",
-            Some("install the missing GStreamer plugin package"),
-        ),
-    }
+    DoctorCheck::ok("Audio input", "default_output")
 }
 
 async fn check_war_thunder_localhost() -> DoctorCheck {
@@ -595,7 +475,11 @@ mod tests {
     fn summary_reports_errors() {
         let checks = vec![
             DoctorCheck::ok("Session", "Wayland"),
-            DoctorCheck::error("plugin vp8enc", "missing", Some("install plugins")),
+            DoctorCheck::error(
+                "GSR Flatpak command",
+                "missing",
+                Some("install Flatpak GSR"),
+            ),
         ];
 
         assert_eq!(summary_for_checks(&checks), "Doctor completed with errors.");
@@ -603,7 +487,7 @@ mod tests {
 
     #[test]
     fn summary_reports_success() {
-        let checks = vec![DoctorCheck::ok("Session", "Wayland")];
+        let checks = vec![DoctorCheck::ok("GSR Flatpak command", "ready")];
 
         assert_eq!(
             summary_for_checks(&checks),
@@ -614,13 +498,13 @@ mod tests {
     #[test]
     fn formats_report_text() {
         let report = DoctorReport {
-            checks: vec![DoctorCheck::ok("Session", "Wayland")],
+            checks: vec![DoctorCheck::ok("GSR Flatpak command", "ready")],
             summary: "Doctor completed successfully.".to_owned(),
         };
 
         assert_eq!(
             format_report_text(&report),
-            "WT Clipper Doctor\n\n[OK] Session: Wayland\n\nSummary:\nDoctor completed successfully.\n"
+            "WT Clipper Doctor\n\n[OK] GSR Flatpak command: ready\n\nSummary:\nDoctor completed successfully.\n"
         );
     }
 }

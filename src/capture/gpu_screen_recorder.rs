@@ -14,10 +14,8 @@ use tokio::{sync::Mutex, time::sleep};
 use tracing::{debug, info, warn};
 
 use crate::{
-    capture::{
-        buffer::{ClipContext, ClipReason, SavedReplay},
-        output::slugify_filename_part,
-    },
+    app::clip_types::{ClipContext, ClipReason},
+    capture::output::slugify_filename_part,
     config::{CaptureConfig, GpuScreenRecorderMode, GsrBitrateMode},
     warthunder::events::WarThunderEvent,
 };
@@ -100,15 +98,7 @@ pub struct SavedGsrReplay {
     pub size_bytes: u64,
 }
 
-impl SavedGsrReplay {
-    pub fn into_saved_replay(self) -> SavedReplay {
-        SavedReplay {
-            final_video_path: Some(self.final_video_path),
-            metadata_path: Some(self.metadata_path),
-            segments_dir: None,
-        }
-    }
-}
+impl SavedGsrReplay {}
 
 pub struct GpuScreenRecorderHandle {
     inner: Arc<Mutex<GpuScreenRecorderInner>>,
@@ -1260,13 +1250,10 @@ pub fn suggested_clip_stem(context: &ClipContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        CaptureBackend, GsrBitrateMode, GsrCodec, GsrContainer, GsrEncoder, GsrQuality,
-    };
+    use crate::config::{GsrBitrateMode, GsrCodec, GsrContainer, GsrEncoder, GsrQuality};
 
     fn test_config(output_dir: PathBuf) -> CaptureConfig {
         CaptureConfig {
-            backend: CaptureBackend::GpuScreenRecorder,
             target: "eDP".to_owned(),
             gpu_screen_recorder_mode: GpuScreenRecorderMode::Flatpak,
             fps: 30,
@@ -1773,11 +1760,8 @@ mod tests {
             player_name: Some("dawson16800".to_owned()),
             pending_clip_id: None,
             pending_dedupe_key: None,
-            video_quality: Default::default(),
-            quality_preset: Default::default(),
             duration_seconds: 25,
             post_event_seconds: 0,
-            segment_seconds: 2,
             first_event_time: None,
             last_event_time: None,
         };
@@ -1807,11 +1791,8 @@ mod tests {
             player_name: None,
             pending_clip_id: None,
             pending_dedupe_key: None,
-            video_quality: Default::default(),
-            quality_preset: Default::default(),
             duration_seconds: 25,
             post_event_seconds: 0,
-            segment_seconds: 2,
             first_event_time: None,
             last_event_time: None,
         };

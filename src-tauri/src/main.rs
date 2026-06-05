@@ -19,19 +19,18 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 use uuid::Uuid;
 mod editor;
-mod export_queue;
 mod updater;
-use export_queue::{ExportSummary, PendingClipExportDto};
 use wt_clipper::{
-    app::auto::{run_auto_clip, AutoClipCommand, AutoClipConfig, RuntimeConfigUpdateResult},
-    capture::{
-        buffer::{BufferHealth, ClipReason},
-        gpu_screen_recorder::{GsrHealth, GsrStatus},
-        quality::VideoQuality,
+    app::{
+        auto::{run_auto_clip, AutoClipCommand, AutoClipConfig, RuntimeConfigUpdateResult},
+        clip_types::ClipReason,
+        events::{AppEvent, ClipInfo, UiCommand},
     },
-    config::{default_config_path, AppConfig, CaptureBackend, ClipConfig, ClipExportMode},
+    capture::{
+        gpu_screen_recorder::{GsrHealth, GsrStatus},
+    },
+    config::{default_config_path, AppConfig},
     doctor::{self, DoctorReport},
-    ui::bridge::{AppEvent, ClipInfo, ExportProgressPayload, UiCommand},
     warthunder::client::WarThunderClient,
 };
 
@@ -222,15 +221,6 @@ fn video_content_type(path: &Path) -> &'static str {
 #[serde(rename_all = "camelCase")]
 struct RuntimeStatus {
     wt_connected: bool,
-    active_capture_backend: CaptureBackend,
-    buffer_filled_secs: f32,
-    buffer_total_secs: f32,
-    buffer_health: BufferHealth,
-    buffer_last_segment_path: Option<PathBuf>,
-    buffer_last_segment_modified_at: Option<String>,
-    buffer_last_segment_age_secs: Option<u64>,
-    buffer_restart_count: u64,
-    last_gstreamer_error: Option<String>,
     gsr_available: bool,
     gsr_health: GsrHealth,
     gsr_pid: Option<u32>,
@@ -259,18 +249,13 @@ struct RuntimeStatus {
     gsr_video_bitrate_kbps: u32,
     gsr_effective_q_argument: String,
     auto_clip_running: bool,
-    active_export_mode: ClipExportMode,
     config_restart_required: bool,
-    pending_export_count: usize,
-    pending_export_dir: PathBuf,
-    pending_export_bytes: u64,
     clips_saved: usize,
     backend_fd_count: Option<usize>,
     gallery_scan_count: u64,
     gallery_last_scan_ms: u64,
     gallery_active_scans: usize,
     recent_events: Vec<RuntimeEvent>,
-    export_progress: Option<ExportProgressPayload>,
     last_error: Option<String>,
 }
 
@@ -293,15 +278,6 @@ impl RuntimeStatus {
     fn from_config(config: &AppConfig) -> Self {
         Self {
             wt_connected: false,
-            active_capture_backend: config.capture.backend,
-            buffer_filled_secs: 0.0,
-            buffer_total_secs: config.clip.seconds as f32,
-            buffer_health: BufferHealth::Starting,
-            buffer_last_segment_path: None,
-            buffer_last_segment_modified_at: None,
-            buffer_last_segment_age_secs: None,
-            buffer_restart_count: 0,
-            last_gstreamer_error: None,
             gsr_available: false,
             gsr_health: GsrHealth::Stopped,
             gsr_pid: None,
@@ -342,21 +318,13 @@ impl RuntimeStatus {
                 config.capture.quality.as_arg().to_owned()
             },
             auto_clip_running: false,
-            active_export_mode: config.clip.export_mode,
             config_restart_required: false,
-            pending_export_count: 0,
-            pending_export_dir: config
-                .pending_exports
-                .pending_export_dir_path()
-                .unwrap_or_else(|_| PathBuf::from("")),
-            pending_export_bytes: 0,
             clips_saved: 0,
             backend_fd_count: current_process_fd_count(),
             gallery_scan_count: 0,
             gallery_last_scan_ms: 0,
             gallery_active_scans: 0,
             recent_events: Vec::new(),
-            export_progress: None,
             last_error: None,
         }
     }
@@ -381,8 +349,6 @@ async fn save_config(
         .map_err(|error| error.to_string())?;
     let result = response.await.map_err(|error| error.to_string())?;
     if let Ok(mut status) = state.runtime_status.lock() {
-        status.active_capture_backend = status_config.capture.backend;
-        status.active_export_mode = result.active_export_mode;
         status.config_restart_required = result.restart_required;
         status.gsr_target = status_config.capture.target.clone();
         status.gsr_replay_seconds = status_config.capture.replay_seconds;
@@ -409,11 +375,6 @@ async fn save_config(
             .gsr_output_dir
             .as_ref()
             .map(|path| path.join("wtclip"));
-        status.pending_export_dir = status_config
-            .pending_exports
-            .pending_export_dir_path()
-            .unwrap_or_else(|_| status.pending_export_dir.clone());
-        status.pending_export_bytes = directory_size(&status.pending_export_dir);
         status.last_error = None;
     }
     Ok(result)
@@ -450,7 +411,7 @@ fn open_output_folder(state: State<'_, BackendState>) -> Result<(), String> {
 #[tauri::command]
 async fn run_diagnostics(state: State<'_, BackendState>) -> Result<DoctorReport, String> {
     let config = AppConfig::load(Some(&state.config_path)).map_err(|error| error.to_string())?;
-    let output_dir = config.clip.output_dir_path().ok();
+    let output_dir = config.capture.output_dir_path().ok();
     Ok(doctor::build_report(output_dir).await)
 }
 
@@ -476,56 +437,11 @@ async fn test_gsr_save_replay(state: State<'_, BackendState>) -> Result<String, 
 }
 
 #[tauri::command]
-async fn export_pending_clips(state: State<'_, BackendState>) -> Result<ExportSummary, String> {
-    let (respond_to, response) = oneshot::channel();
-    state
-        .auto_cmd_tx
-        .send(AutoClipCommand::ExportPendingClips { respond_to })
-        .map_err(|error| error.to_string())?;
-    response.await.map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-async fn get_pending_export_clips(
-    state: State<'_, BackendState>,
-) -> Result<Vec<PendingClipExportDto>, String> {
-    let (respond_to, response) = oneshot::channel();
-    state
-        .auto_cmd_tx
-        .send(AutoClipCommand::GetPendingExportClips { respond_to })
-        .map_err(|error| error.to_string())?;
-    let clips = response.await.map_err(|error| error.to_string())?;
-    if let Ok(mut status) = state.runtime_status.lock() {
-        status.pending_export_count = clips.len();
-        status.pending_export_bytes = directory_size(&status.pending_export_dir);
-    }
-    Ok(clips)
-}
-
-#[tauri::command]
-async fn delete_pending_export_clip(
-    id: String,
-    state: State<'_, BackendState>,
-) -> Result<(), String> {
-    let (respond_to, response) = oneshot::channel();
-    state
-        .auto_cmd_tx
-        .send(AutoClipCommand::DeletePendingClip { id, respond_to })
-        .map_err(|error| error.to_string())?;
-    response.await.map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-fn restart_replay_buffer(state: State<'_, BackendState>) -> Result<(), String> {
+fn restart_gpu_recorder(state: State<'_, BackendState>) -> Result<(), String> {
     state
         .cmd_tx
-        .send(UiCommand::RestartReplayBuffer)
+        .send(UiCommand::RestartGpuRecorder)
         .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn restart_buffer(state: State<'_, BackendState>) -> Result<(), String> {
-    restart_replay_buffer(state)
 }
 
 #[tauri::command]
@@ -607,11 +523,7 @@ fn main() {
             run_diagnostics,
             save_manual_clip,
             test_gsr_save_replay,
-            export_pending_clips,
-            get_pending_export_clips,
-            delete_pending_export_clip,
-            restart_replay_buffer,
-            restart_buffer,
+            restart_gpu_recorder,
             updater::check_for_updates,
             get_runtime_status,
             export_edited_clip,
@@ -666,7 +578,7 @@ fn spawn_backend(
         };
 
         runtime.block_on(async move {
-            let output_dir = match config.clip.output_dir_path() {
+            let output_dir = match config.library.output_dir_path() {
                 Ok(path) => path,
                 Err(error) => {
                     emit_app_event(
@@ -736,47 +648,21 @@ fn spawn_backend(
 
 async fn run_auto_backend(
     config: AppConfig,
-    output_dir: PathBuf,
+    _output_dir: PathBuf,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     auto_cmd_rx: mpsc::UnboundedReceiver<AutoClipCommand>,
 ) -> anyhow::Result<()> {
     let client = WarThunderClient::new(config.war_thunder.clone())?;
-    let quality_preset = config.clip.quality;
-    let mut quality = resolve_configured_video_quality(&config.clip)?;
-    let capture_backend = config.capture.backend;
-    if capture_backend == CaptureBackend::GpuScreenRecorder {
-        quality.fps = config.capture.fps;
-    }
-    let buffer_seconds = if capture_backend == CaptureBackend::GpuScreenRecorder {
-        config.capture.replay_seconds
-    } else {
-        config.clip.seconds
-    };
-    let export_mode = if capture_backend == CaptureBackend::GpuScreenRecorder {
-        ClipExportMode::Instant
-    } else {
-        config.clip.export_mode
-    };
     run_auto_clip(
         client,
         config.war_thunder.clone(),
         AutoClipConfig {
-            buffer_seconds,
-            segment_seconds: config.clip.segment_seconds,
-            output_dir: Some(output_dir),
-            source: config.clip.source,
-            keep_segments: config.clip.keep_segments,
-            quality_preset,
-            quality,
             cooldown: Duration::from_secs(3),
             post_event_delay: Duration::from_secs(config.clip.post_event_seconds),
             multi_kill_window: Duration::from_secs(config.clip.multi_kill_window_seconds),
             include_history: false,
             triggers: config.triggers.clone(),
             ui_events: Some(event_tx),
-            export_mode,
-            pending_export_dir: config.pending_exports.pending_export_dir_path()?,
-            delete_ready_after_export: config.pending_exports.delete_ready_after_export,
             command_rx: Some(auto_cmd_rx),
             capture: config.capture.clone(),
         },
@@ -847,12 +733,7 @@ fn emit_app_event(
             let _ = app.emit("clip_status_changed", payload.clone());
             app.emit("clip-status-changed", payload)
         }
-        AppEvent::ExportProgressChanged { payload } => {
-            let _ = app.emit("export-progress-changed", payload.clone());
-            app.emit("export_progress_changed", payload)
-        }
         AppEvent::ClipFailed { message } => app.emit("clip-failed", json!({ "message": message })),
-        AppEvent::BufferProgress { status } => app.emit("buffer-progress", status),
         AppEvent::GsrStatusChanged { status } => app.emit("gsr-status-changed", status),
         AppEvent::DiskUsage { used_bytes } => {
             app.emit("disk-usage", json!({ "usedBytes": used_bytes }))
@@ -882,9 +763,7 @@ fn tauri_event_name(event: &AppEvent) -> &'static str {
         AppEvent::KillDetected { .. } => "kill-detected",
         AppEvent::ClipSaved { .. } => "clip-saved",
         AppEvent::ClipStatusChanged { .. } => "clip-status-changed",
-        AppEvent::ExportProgressChanged { .. } => "export_progress_changed",
         AppEvent::ClipFailed { .. } => "clip-failed",
-        AppEvent::BufferProgress { .. } => "buffer-progress",
         AppEvent::GsrStatusChanged { .. } => "gsr-status-changed",
         AppEvent::DiskUsage { .. } => "disk-usage",
         AppEvent::ClipsLoaded { .. } => "clips-loaded",
@@ -898,13 +777,6 @@ fn log_bridge_event_received(event: &AppEvent) {
         AppEvent::WtDisconnected => {
             debug!("AppEvent::WtDisconnected received from backend")
         }
-        AppEvent::BufferProgress { status } => debug!(
-            health = ?status.health,
-            filled_secs = status.filled_secs,
-            total_secs = status.total_secs,
-            restart_count = status.restart_count,
-            "AppEvent::BufferProgress received from backend"
-        ),
         AppEvent::GsrStatusChanged { status } => debug!(
             health = ?status.health,
             pid = ?status.pid,
@@ -928,18 +800,6 @@ fn log_bridge_event_received(event: &AppEvent) {
                 ?payload.status,
                 ?payload.reason,
                 "AppEvent::ClipStatusChanged received from backend"
-            )
-        }
-        AppEvent::ExportProgressChanged { payload } => {
-            debug!(
-                active = payload.active,
-                total = payload.total,
-                completed = payload.completed,
-                failed = payload.failed,
-                ?payload.current_clip_number,
-                progress = payload.progress,
-                ?payload.current_step,
-                "AppEvent::ExportProgressChanged received from backend"
             )
         }
         AppEvent::ClipFailed { message } => {
@@ -967,18 +827,6 @@ fn update_runtime_status(runtime_status: &Arc<Mutex<RuntimeStatus>>, event: &App
     match event {
         AppEvent::WtConnected => status.wt_connected = true,
         AppEvent::WtDisconnected => status.wt_connected = false,
-        AppEvent::BufferProgress {
-            status: buffer_status,
-        } => {
-            status.buffer_filled_secs = buffer_status.filled_secs;
-            status.buffer_total_secs = buffer_status.total_secs;
-            status.buffer_health = buffer_status.health;
-            status.buffer_last_segment_path = buffer_status.last_segment_path.clone();
-            status.buffer_last_segment_modified_at = buffer_status.last_segment_modified_at.clone();
-            status.buffer_last_segment_age_secs = buffer_status.last_segment_age_secs;
-            status.buffer_restart_count = buffer_status.restart_count;
-            status.last_gstreamer_error = buffer_status.last_gstreamer_error.clone();
-        }
         AppEvent::GsrStatusChanged { status: gsr } => {
             apply_gsr_runtime_status(&mut status, gsr);
         }
@@ -1002,9 +850,6 @@ fn update_runtime_status(runtime_status: &Arc<Mutex<RuntimeStatus>>, event: &App
         AppEvent::ClipSaved { .. } => {
             status.clips_saved = status.clips_saved.saturating_add(1);
             status.last_error = None;
-        }
-        AppEvent::ExportProgressChanged { payload } => {
-            status.export_progress = Some(payload.clone());
         }
         AppEvent::ClipsLoaded { clips, .. } => status.clips_saved = clips.len(),
         _ => {}
@@ -1062,19 +907,6 @@ fn runtime_event_time() -> String {
         (seconds / 60) % 60,
         seconds % 60
     )
-}
-
-fn directory_size(path: &Path) -> u64 {
-    if !path.exists() {
-        return 0;
-    }
-    walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| metadata.len())
-        .sum()
 }
 
 fn refresh_resource_diagnostics(status: &mut RuntimeStatus) {
@@ -1200,10 +1032,10 @@ async fn command_loop(
                     });
                 }
             }
-            UiCommand::RestartReplayBuffer | UiCommand::RestartBuffer => {
-                if let Err(error) = auto_cmd_tx.send(AutoClipCommand::RestartReplayBuffer) {
+            UiCommand::RestartGpuRecorder => {
+                if let Err(error) = auto_cmd_tx.send(AutoClipCommand::RestartGpuRecorder) {
                     let _ = event_tx.send(AppEvent::ClipFailed {
-                        message: format!("Redémarrage buffer: {error}"),
+                        message: format!("Redémarrage GPU Screen Recorder: {error}"),
                     });
                 }
             }
@@ -1295,10 +1127,10 @@ async fn scan_clips(
 }
 
 fn gallery_scan_roots_for_config(config: &AppConfig) -> anyhow::Result<Vec<PathBuf>> {
-    let mut base_dirs = vec![config.clip.output_dir_path()?];
-    if config.capture.backend == CaptureBackend::GpuScreenRecorder {
-        base_dirs.push(config.capture.output_dir_path()?);
-    }
+    let base_dirs = vec![
+        config.capture.output_dir_path()?,
+        config.library.output_dir_path()?,
+    ];
     Ok(gallery_scan_roots_for_base_dirs(base_dirs))
 }
 
@@ -1378,9 +1210,4 @@ fn write_config(path: &Path, config: &AppConfig) -> anyhow::Result<()> {
     }
     std::fs::write(path, toml::to_string_pretty(config)?)?;
     Ok(())
-}
-
-fn resolve_configured_video_quality(config: &ClipConfig) -> anyhow::Result<VideoQuality> {
-    let base = config.quality.video_quality();
-    VideoQuality::new(config.fps, config.video_bitrate_kbps, base.encoder_cpu_used)
 }
