@@ -896,6 +896,68 @@ select {
   opacity: .48;
 }
 
+.editor-save-mode-list {
+  display: grid;
+  gap: 8px;
+}
+
+.editor-save-mode-list label {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 10px;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 8px;
+  background: rgba(255,255,255,.04);
+  padding: 11px;
+  color: #d7dde8;
+}
+
+.editor-save-mode-list label.active {
+  border-color: rgba(255, 90, 47, .48);
+  background: rgba(255, 90, 47, .12);
+}
+
+.editor-save-mode-list label.destructive.active {
+  border-color: rgba(255, 141, 122, .44);
+  background: rgba(53, 23, 17, .58);
+}
+
+.editor-save-mode-list input {
+  margin-top: 2px;
+  accent-color: #ff5a2f;
+}
+
+.editor-save-mode-list strong,
+.editor-save-mode-list small {
+  display: block;
+}
+
+.editor-save-mode-list strong {
+  color: white;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.editor-save-mode-list small {
+  margin-top: 4px;
+  color: #8b95a7;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.editor-warning {
+  display: flex;
+  gap: 9px;
+  margin-top: 10px;
+  border: 1px solid rgba(255, 141, 122, .28);
+  border-radius: 8px;
+  background: rgba(53, 23, 17, .45);
+  padding: 10px;
+  color: #ffb7aa;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .editor-field-stack {
   display: grid;
   gap: 10px;
@@ -1034,4 +1096,59 @@ select {
 .editor-progress-state.failed {
   border-color: rgba(255, 141, 122, .28);
   background: rgba(53, 23, 17, .45);
+}
+
+.editor-confirm-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 85;
+  display: grid;
+  place-items: center;
+  background: rgba(4, 7, 12, .62);
+  backdrop-filter: blur(6px);
+}
+
+.editor-confirm-card {
+  display: grid;
+  width: min(460px, calc(100vw - 64px));
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 14px;
+  border: 1px solid rgba(255, 141, 122, .3);
+  border-radius: 8px;
+  background: rgba(17,23,34,.98);
+  box-shadow: 0 24px 80px rgba(0,0,0,.44);
+  padding: 18px;
+}
+
+.editor-confirm-icon {
+  display: grid;
+  height: 42px;
+  width: 42px;
+  place-items: center;
+  border: 1px solid rgba(255, 141, 122, .28);
+  border-radius: 8px;
+  background: rgba(53, 23, 17, .54);
+  color: #ffb7aa;
+}
+
+.editor-confirm-card h3 {
+  margin-top: 2px;
+  color: white;
+  font-size: 18px;
+  font-weight: 950;
+}
+
+.editor-confirm-card p {
+  margin: 8px 0 0;
+  color: #b8c0cf;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.editor-confirm-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
 }

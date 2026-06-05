@@ -7,7 +7,8 @@ use std::{
 
 use anyhow::Context;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{json, Value};
 use tauri::Emitter;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -49,6 +50,32 @@ impl OutputFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SaveMode {
+    CreateCopy,
+    ReplaceOriginal,
+}
+
+impl Default for SaveMode {
+    fn default() -> Self {
+        Self::CreateCopy
+    }
+}
+
+impl<'de> Deserialize<'de> for SaveMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<String>::deserialize(deserializer)?;
+        Ok(match value.as_deref() {
+            Some("replace_original") => Self::ReplaceOriginal,
+            _ => Self::CreateCopy,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipEditRequest {
@@ -64,6 +91,10 @@ pub struct ClipEditRequest {
     pub watermark: bool,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    #[serde(default)]
+    pub save_mode: SaveMode,
+    #[serde(default = "default_backup_original")]
+    pub backup_original: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +105,11 @@ pub struct EditedClipResult {
     pub thumbnail_path: Option<String>,
     pub duration_seconds: f64,
     pub size_bytes: u64,
+    pub save_mode: SaveMode,
+    pub replaced_original: bool,
+    pub backup_path: Option<String>,
+    pub backup_metadata_path: Option<String>,
+    pub backup_thumbnail_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,6 +166,27 @@ struct EditedClipMetadata {
     bitrate_kbps: u32,
     created_at: String,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BackupPaths {
+    video_path: PathBuf,
+    metadata_path: Option<PathBuf>,
+    thumbnail_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct ReplacementPaths {
+    original_video_path: PathBuf,
+    original_metadata_path: PathBuf,
+    original_thumbnail_path: PathBuf,
+    target_video_path: PathBuf,
+    target_metadata_path: PathBuf,
+    target_thumbnail_path: PathBuf,
+    tmp_video_path: PathBuf,
+    tmp_metadata_path: PathBuf,
+    tmp_thumbnail_path: PathBuf,
+    backup_dir: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,11 +266,16 @@ fn export_edited_clip_blocking(
     let result = export_edited_clip_inner(&request, &config, &app);
     match result {
         Ok(result) => {
+            let message = if result.replaced_original {
+                "Clip original remplace"
+            } else {
+                "Export termine"
+            };
             emit_editor_progress(
                 &app,
                 EditorExportProgressStep::Done,
                 100,
-                "Export termine",
+                message,
                 false,
                 Some(result.output_path.clone()),
                 None,
@@ -254,9 +316,21 @@ fn export_edited_clip_inner(
         media_info.duration_seconds,
     )?;
 
+    match request.save_mode {
+        SaveMode::CreateCopy => export_edited_copy(request, config, &input_path, app),
+        SaveMode::ReplaceOriginal => replace_original_clip_safely(request, config, &input_path, app),
+    }
+}
+
+fn export_edited_copy(
+    request: &ClipEditRequest,
+    config: &AppConfig,
+    input_path: &Path,
+    app: &tauri::AppHandle,
+) -> anyhow::Result<EditedClipResult> {
     let output_base_dir = output_base_dir(config, request.mode)?;
-    let output_path = resolve_output_path(request, &input_path, &output_base_dir)?;
-    ensure_not_original(&input_path, &output_path)?;
+    let output_path = resolve_output_path(request, input_path, &output_base_dir)?;
+    ensure_not_original(input_path, &output_path)?;
     fs::create_dir_all(&output_base_dir)
         .with_context(|| format!("Impossible de creer {}", output_base_dir.display()))?;
 
@@ -275,7 +349,7 @@ fn export_edited_clip_inner(
         None,
     );
 
-    let export_result = run_video_export(request, &input_path, &tmp_path, app);
+    let export_result = run_video_export(request, input_path, &tmp_path, app);
     if let Err(error) = export_result {
         cleanup_export_failure(&tmp_path, &metadata_path, &thumbnail_path);
         return Err(error);
@@ -308,11 +382,11 @@ fn export_edited_clip_inner(
         None,
         None,
     );
-    let source_reason = read_source_reason(request, &input_path);
+    let source_reason = read_source_reason(request, input_path);
     write_edited_metadata(
         &metadata_path,
         request,
-        &input_path,
+        input_path,
         &output_path,
         source_reason,
     )?;
@@ -330,12 +404,15 @@ fn export_edited_clip_inner(
         cleanup_export_failure(&tmp_path, &metadata_path, &thumbnail_path);
         anyhow::bail!("Le fichier de sortie existe deja: {}", output_path.display());
     }
-    fs::rename(&tmp_path, &output_path).with_context(|| {
+    if let Err(error) = fs::rename(&tmp_path, &output_path).with_context(|| {
         format!(
             "Impossible de finaliser l'export {}",
             output_path.display()
         )
-    })?;
+    }) {
+        cleanup_export_failure(&tmp_path, &metadata_path, &thumbnail_path);
+        return Err(error);
+    }
 
     let size_bytes = fs::metadata(&output_path)
         .with_context(|| format!("Impossible de lire {}", output_path.display()))?
@@ -347,6 +424,110 @@ fn export_edited_clip_inner(
         thumbnail_path: thumbnail.map(|path| path.display().to_string()),
         duration_seconds: edited_duration(request),
         size_bytes,
+        save_mode: SaveMode::CreateCopy,
+        replaced_original: false,
+        backup_path: None,
+        backup_metadata_path: None,
+        backup_thumbnail_path: None,
+    })
+}
+
+fn replace_original_clip_safely(
+    request: &ClipEditRequest,
+    config: &AppConfig,
+    input_path: &Path,
+    app: &tauri::AppHandle,
+) -> anyhow::Result<EditedClipResult> {
+    let paths = replacement_paths(config, input_path, request)?;
+    fs::create_dir_all(&paths.backup_dir)
+        .with_context(|| format!("Impossible de creer {}", paths.backup_dir.display()))?;
+    if !request.backup_original {
+        debug!("backup_original=false ignored for replace_original; backup remains mandatory");
+    }
+
+    let backup = backup_original_files(&paths)?;
+
+    emit_editor_progress(
+        app,
+        EditorExportProgressStep::Trimming,
+        15,
+        "Application du trim...",
+        true,
+        None,
+        None,
+    );
+
+    let export_result = run_video_export(request, input_path, &paths.tmp_video_path, app);
+    if let Err(error) = export_result {
+        cleanup_replacement_temps(&paths);
+        return Err(error);
+    }
+    if let Err(error) = validate_replacement_temp_video(&paths.tmp_video_path) {
+        cleanup_replacement_temps(&paths);
+        return Err(error);
+    }
+
+    emit_editor_progress(
+        app,
+        EditorExportProgressStep::Thumbnail,
+        80,
+        "Generation de la miniature...",
+        true,
+        None,
+        None,
+    );
+    if let Err(error) = generate_thumbnail(&paths.tmp_video_path, &paths.tmp_thumbnail_path) {
+        cleanup_replacement_temps(&paths);
+        return Err(error);
+    }
+
+    emit_editor_progress(
+        app,
+        EditorExportProgressStep::Metadata,
+        90,
+        "Mise a jour des metadata...",
+        true,
+        None,
+        None,
+    );
+    if let Err(error) = write_replacement_metadata(&paths.tmp_metadata_path, request, &paths, &backup)
+    {
+        cleanup_replacement_temps(&paths);
+        return Err(error);
+    }
+
+    emit_editor_progress(
+        app,
+        EditorExportProgressStep::Saving,
+        95,
+        "Remplacement securise du clip original...",
+        true,
+        Some(paths.target_video_path.display().to_string()),
+        None,
+    );
+    commit_replacement_files(&paths, &backup)?;
+
+    let size_bytes = fs::metadata(&paths.target_video_path)
+        .with_context(|| format!("Impossible de lire {}", paths.target_video_path.display()))?
+        .len();
+
+    Ok(EditedClipResult {
+        output_path: paths.target_video_path.display().to_string(),
+        metadata_path: Some(paths.target_metadata_path.display().to_string()),
+        thumbnail_path: Some(paths.target_thumbnail_path.display().to_string()),
+        duration_seconds: edited_duration(request),
+        size_bytes,
+        save_mode: SaveMode::ReplaceOriginal,
+        replaced_original: true,
+        backup_path: Some(backup.video_path.display().to_string()),
+        backup_metadata_path: backup
+            .metadata_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        backup_thumbnail_path: backup
+            .thumbnail_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
     })
 }
 
@@ -765,6 +946,112 @@ fn output_base_dir(config: &AppConfig, mode: ClipEditorMode) -> anyhow::Result<P
     })
 }
 
+fn backup_output_dir(config: &AppConfig) -> anyhow::Result<PathBuf> {
+    Ok(config.clip.output_dir_path()?.join("Backups"))
+}
+
+fn replacement_paths(
+    config: &AppConfig,
+    input_path: &Path,
+    request: &ClipEditRequest,
+) -> anyhow::Result<ReplacementPaths> {
+    let original_video_path = input_path.to_path_buf();
+    let target_video_path = replacement_target_path(input_path, request);
+    if target_video_path != original_video_path && target_video_path.exists() {
+        anyhow::bail!(
+            "Impossible de remplacer l'original: {} existe deja.",
+            target_video_path.display()
+        );
+    }
+    let original_metadata_path = original_video_path.with_extension("json");
+    let original_thumbnail_path = original_video_path.with_extension("jpg");
+    let target_metadata_path = target_video_path.with_extension("json");
+    let target_thumbnail_path = target_video_path.with_extension("jpg");
+    Ok(ReplacementPaths {
+        tmp_video_path: temporary_output_path(&target_video_path),
+        tmp_metadata_path: temporary_sidecar_path(&target_metadata_path),
+        tmp_thumbnail_path: temporary_sidecar_path(&target_thumbnail_path),
+        backup_dir: backup_output_dir(config)?,
+        original_video_path,
+        original_metadata_path,
+        original_thumbnail_path,
+        target_video_path,
+        target_metadata_path,
+        target_thumbnail_path,
+    })
+}
+
+fn replacement_target_path(input_path: &Path, request: &ClipEditRequest) -> PathBuf {
+    let extension = effective_output_format(request).extension();
+    if input_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+    {
+        input_path.to_path_buf()
+    } else {
+        input_path.with_extension(extension)
+    }
+}
+
+fn backup_original_files(paths: &ReplacementPaths) -> anyhow::Result<BackupPaths> {
+    let backup_video_path = backup_video_path(paths)?;
+    fs::copy(&paths.original_video_path, &backup_video_path).with_context(|| {
+        format!(
+            "Impossible de sauvegarder la video originale vers {}",
+            backup_video_path.display()
+        )
+    })?;
+    let backup_metadata_path = if paths.original_metadata_path.is_file() {
+        let path = backup_video_path.with_extension("json");
+        fs::copy(&paths.original_metadata_path, &path).with_context(|| {
+            format!(
+                "Impossible de sauvegarder les metadata originales vers {}",
+                path.display()
+            )
+        })?;
+        Some(path)
+    } else {
+        None
+    };
+    let backup_thumbnail_path = if paths.original_thumbnail_path.is_file() {
+        let path = backup_video_path.with_extension("jpg");
+        fs::copy(&paths.original_thumbnail_path, &path).with_context(|| {
+            format!(
+                "Impossible de sauvegarder la miniature originale vers {}",
+                path.display()
+            )
+        })?;
+        Some(path)
+    } else {
+        None
+    };
+
+    Ok(BackupPaths {
+        video_path: backup_video_path,
+        metadata_path: backup_metadata_path,
+        thumbnail_path: backup_thumbnail_path,
+    })
+}
+
+fn backup_video_path(paths: &ReplacementPaths) -> anyhow::Result<PathBuf> {
+    let stem = paths
+        .original_video_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(sanitize_file_stem)
+        .unwrap_or_else(|| "clip".to_owned());
+    let extension = paths
+        .original_video_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("video");
+    let timestamp = Utc::now().format("%Y-%m-%d-%H-%M-%S");
+    ensure_unique_path(paths.backup_dir.join(format!(
+        "{stem}-original-backup-{timestamp}.{extension}"
+    )))
+}
+
 fn resolve_output_path(
     request: &ClipEditRequest,
     input_path: &Path,
@@ -831,6 +1118,21 @@ fn temporary_output_path(output_path: &Path) -> PathBuf {
     parent.join(format!(".{stem}.{}.tmp.{extension}", Uuid::new_v4()))
 }
 
+fn temporary_sidecar_path(output_path: &Path) -> PathBuf {
+    temporary_output_path(output_path)
+}
+
+fn validate_replacement_temp_video(path: &Path) -> anyhow::Result<()> {
+    validate_non_empty_file(path, "Fichier temporaire de remplacement invalide")?;
+    let media = probe_media_info(path)?;
+    if media.duration_seconds <= 0.0 {
+        anyhow::bail!(
+            "Fichier temporaire de remplacement invalide: duree video nulle"
+        );
+    }
+    Ok(())
+}
+
 fn generate_thumbnail(video_path: &Path, thumbnail_path: &Path) -> anyhow::Result<PathBuf> {
     let mut command = Command::new("ffmpeg");
     command
@@ -874,6 +1176,77 @@ fn write_edited_metadata(
         .with_context(|| format!("Impossible d'ecrire les metadata {}", metadata_path.display()))
 }
 
+fn write_replacement_metadata(
+    metadata_path: &Path,
+    request: &ClipEditRequest,
+    paths: &ReplacementPaths,
+    backup: &BackupPaths,
+) -> anyhow::Result<()> {
+    let original_metadata = read_json_value(&paths.original_metadata_path);
+    let metadata = replacement_metadata_value(original_metadata, request, paths, backup);
+    let json = serde_json::to_string_pretty(&metadata)?;
+    fs::write(metadata_path, json)
+        .with_context(|| format!("Impossible d'ecrire les metadata {}", metadata_path.display()))
+}
+
+fn replacement_metadata_value(
+    original_metadata: Option<Value>,
+    request: &ClipEditRequest,
+    paths: &ReplacementPaths,
+    backup: &BackupPaths,
+) -> Value {
+    let mut root = original_metadata
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let edited_at = Utc::now().to_rfc3339();
+    let original_duration_seconds = root.get("duration_seconds").cloned();
+    root.entry("created_by".to_owned())
+        .or_insert_with(|| json!("wt-clipper"));
+    root.insert("kind".to_owned(), json!("edited_replacement"));
+    root.insert(
+        "source_video_path".to_owned(),
+        json!(paths.original_video_path.display().to_string()),
+    );
+    root.insert(
+        "output_video_path".to_owned(),
+        json!(paths.target_video_path.display().to_string()),
+    );
+    root.insert("replaced_original".to_owned(), json!(true));
+    root.insert(
+        "backup_video_path".to_owned(),
+        json!(backup.video_path.display().to_string()),
+    );
+    root.insert("duration_seconds".to_owned(), json!(edited_duration(request)));
+    root.insert("edited_at".to_owned(), json!(edited_at));
+    root.insert(
+        "edit".to_owned(),
+        json!({
+            "replaced_original": true,
+            "backup_video_path": backup.video_path.display().to_string(),
+            "backup_metadata_path": backup.metadata_path.as_ref().map(|path| path.display().to_string()),
+            "backup_thumbnail_path": backup.thumbnail_path.as_ref().map(|path| path.display().to_string()),
+            "start_seconds": request.start_seconds,
+            "end_seconds": request.end_seconds,
+            "duration_seconds": edited_duration(request),
+            "mode": request.mode,
+            "layout": request.layout,
+            "title": request.title.as_deref(),
+            "subtitle": request.subtitle.as_deref(),
+            "watermark": request.watermark,
+            "fps": sanitized_fps(request.fps),
+            "bitrate_kbps": sanitized_bitrate(request.bitrate_kbps),
+            "edited_at": edited_at,
+            "original_duration_seconds": original_duration_seconds,
+        }),
+    );
+    Value::Object(root)
+}
+
+fn read_json_value(path: &Path) -> Option<Value> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 fn read_source_reason(request: &ClipEditRequest, input_path: &Path) -> Option<String> {
     let metadata_path = request
         .metadata_path
@@ -884,6 +1257,92 @@ fn read_source_reason(request: &ClipEditRequest, input_path: &Path) -> Option<St
     serde_json::from_str::<SourceClipMetadata>(&content)
         .ok()
         .and_then(|metadata| metadata.reason)
+}
+
+fn commit_replacement_files(paths: &ReplacementPaths, backup: &BackupPaths) -> anyhow::Result<()> {
+    let result = commit_replacement_files_inner(paths);
+    if let Err(error) = result {
+        let rollback_error = restore_original_from_backup(paths, backup).err();
+        cleanup_replacement_temps(paths);
+        if let Some(rollback_error) = rollback_error {
+            anyhow::bail!(
+                "Remplacement annule apres erreur ({error}); restauration incomplete: {rollback_error}"
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn commit_replacement_files_inner(paths: &ReplacementPaths) -> anyhow::Result<()> {
+    if paths.target_video_path != paths.original_video_path && paths.target_video_path.exists() {
+        anyhow::bail!(
+            "Impossible de remplacer l'original: {} existe deja.",
+            paths.target_video_path.display()
+        );
+    }
+
+    fs::rename(&paths.tmp_video_path, &paths.target_video_path).with_context(|| {
+        format!(
+            "Impossible de remplacer la video par {}",
+            paths.target_video_path.display()
+        )
+    })?;
+    fs::rename(&paths.tmp_metadata_path, &paths.target_metadata_path).with_context(|| {
+        format!(
+            "Impossible de remplacer les metadata par {}",
+            paths.target_metadata_path.display()
+        )
+    })?;
+    fs::rename(&paths.tmp_thumbnail_path, &paths.target_thumbnail_path).with_context(|| {
+        format!(
+            "Impossible de remplacer la miniature par {}",
+            paths.target_thumbnail_path.display()
+        )
+    })?;
+
+    if paths.target_video_path != paths.original_video_path {
+        remove_if_exists(&paths.original_video_path)?;
+        remove_if_exists(&paths.original_metadata_path)?;
+        remove_if_exists(&paths.original_thumbnail_path)?;
+    }
+    Ok(())
+}
+
+fn restore_original_from_backup(paths: &ReplacementPaths, backup: &BackupPaths) -> anyhow::Result<()> {
+    if paths.target_video_path != paths.original_video_path {
+        let _ = remove_if_exists(&paths.target_video_path);
+        let _ = remove_if_exists(&paths.target_metadata_path);
+        let _ = remove_if_exists(&paths.target_thumbnail_path);
+    }
+
+    fs::copy(&backup.video_path, &paths.original_video_path).with_context(|| {
+        format!(
+            "Impossible de restaurer la video originale depuis {}",
+            backup.video_path.display()
+        )
+    })?;
+    restore_optional_backup_file(&backup.metadata_path, &paths.original_metadata_path)?;
+    restore_optional_backup_file(&backup.thumbnail_path, &paths.original_thumbnail_path)?;
+    Ok(())
+}
+
+fn restore_optional_backup_file(backup_path: &Option<PathBuf>, original_path: &Path) -> anyhow::Result<()> {
+    match backup_path {
+        Some(backup_path) => {
+            fs::copy(backup_path, original_path).with_context(|| {
+                format!(
+                    "Impossible de restaurer {} depuis {}",
+                    original_path.display(),
+                    backup_path.display()
+                )
+            })?;
+        }
+        None => {
+            let _ = remove_if_exists(original_path);
+        }
+    }
+    Ok(())
 }
 
 fn run_command(mut command: Command, label: &str) -> anyhow::Result<()> {
@@ -962,12 +1421,24 @@ fn cleanup_export_failure(tmp_path: &Path, metadata_path: &Path, thumbnail_path:
     }
 }
 
+fn cleanup_replacement_temps(paths: &ReplacementPaths) {
+    cleanup_export_failure(
+        &paths.tmp_video_path,
+        &paths.tmp_metadata_path,
+        &paths.tmp_thumbnail_path,
+    );
+}
+
 fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
     if path.exists() {
         fs::remove_file(path)
             .with_context(|| format!("Impossible de supprimer {}", path.display()))?;
     }
     Ok(())
+}
+
+fn default_backup_original() -> bool {
+    true
 }
 
 fn sanitize_file_stem(input: &str) -> String {
@@ -1109,6 +1580,8 @@ mod tests {
             watermark: true,
             fps: 30,
             bitrate_kbps: 10_000,
+            save_mode: SaveMode::CreateCopy,
+            backup_original: true,
         }
     }
 
@@ -1230,5 +1703,201 @@ mod tests {
             output.with_extension("jpg").extension().and_then(|value| value.to_str()),
             Some("jpg")
         );
+    }
+
+    #[test]
+    fn create_copy_does_not_modify_original() {
+        let dir = temp_dir("copy-original");
+        let input = dir.join("clip.webm");
+        fs::write(&input, b"source").unwrap();
+        let output = resolve_output_path(&request(ClipEditorMode::TrimOriginal), &input, &dir)
+            .unwrap();
+
+        assert!(input.exists());
+        assert_ne!(input, output);
+        assert_eq!(fs::read(&input).unwrap(), b"source");
+    }
+
+    #[test]
+    fn replace_original_creates_backup() {
+        let dir = temp_dir("backup");
+        let backup_dir = dir.join("Backups");
+        let input = dir.join("clip.webm");
+        let metadata = input.with_extension("json");
+        let thumbnail = input.with_extension("jpg");
+        fs::write(&input, b"source").unwrap();
+        fs::write(&metadata, br#"{"reason":"manual"}"#).unwrap();
+        fs::write(&thumbnail, b"thumb").unwrap();
+        let mut request = request(ClipEditorMode::TrimOriginal);
+        request.save_mode = SaveMode::ReplaceOriginal;
+        let paths = replacement_paths_for_test(&input, &backup_dir, &request);
+        fs::create_dir_all(&paths.backup_dir).unwrap();
+
+        let backup = backup_original_files(&paths).unwrap();
+
+        assert!(backup.video_path.exists());
+        assert!(backup.metadata_path.as_ref().is_some_and(|path| path.exists()));
+        assert!(backup.thumbnail_path.as_ref().is_some_and(|path| path.exists()));
+    }
+
+    #[test]
+    fn replace_original_uses_temp_file() {
+        let dir = temp_dir("temp");
+        let input = dir.join("clip.webm");
+        fs::write(&input, b"source").unwrap();
+        let mut request = request(ClipEditorMode::TrimOriginal);
+        request.save_mode = SaveMode::ReplaceOriginal;
+        let paths = replacement_paths_for_test(&input, &dir.join("Backups"), &request);
+
+        assert_ne!(paths.tmp_video_path, paths.original_video_path);
+        assert!(paths
+            .tmp_video_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap()
+            .contains(".tmp."));
+    }
+
+    #[test]
+    fn replace_original_preserves_original_on_failure() {
+        let dir = temp_dir("rollback");
+        let input = dir.join("clip.webm");
+        let metadata = input.with_extension("json");
+        let thumbnail = input.with_extension("jpg");
+        fs::write(&input, b"source").unwrap();
+        fs::write(&metadata, b"old-meta").unwrap();
+        fs::write(&thumbnail, b"old-thumb").unwrap();
+        let mut request = request(ClipEditorMode::TrimOriginal);
+        request.save_mode = SaveMode::ReplaceOriginal;
+        let paths = replacement_paths_for_test(&input, &dir.join("Backups"), &request);
+        fs::create_dir_all(&paths.backup_dir).unwrap();
+        let backup = backup_original_files(&paths).unwrap();
+        fs::write(&paths.tmp_video_path, b"edited").unwrap();
+
+        let error = commit_replacement_files(&paths, &backup).unwrap_err();
+
+        assert!(error.to_string().contains("metadata"));
+        assert_eq!(fs::read(&input).unwrap(), b"source");
+        assert_eq!(fs::read(&metadata).unwrap(), b"old-meta");
+        assert_eq!(fs::read(&thumbnail).unwrap(), b"old-thumb");
+    }
+
+    #[test]
+    fn replace_original_updates_metadata() {
+        let dir = temp_dir("replace-metadata");
+        let input = dir.join("kill.webm");
+        let backup = BackupPaths {
+            video_path: dir.join("Backups").join("kill-original-backup.webm"),
+            metadata_path: Some(dir.join("Backups").join("kill-original-backup.json")),
+            thumbnail_path: None,
+        };
+        let paths = replacement_paths_for_test(
+            &input,
+            &dir.join("Backups"),
+            &request(ClipEditorMode::TrimOriginal),
+        );
+        let original = json!({
+            "reason": "target-destroyed",
+            "player_name": "Dawson",
+            "vehicle": "F-16",
+            "duration_seconds": 20
+        });
+
+        let metadata = replacement_metadata_value(
+            Some(original),
+            &request(ClipEditorMode::TrimOriginal),
+            &paths,
+            &backup,
+        );
+
+        assert_eq!(metadata["kind"], "edited_replacement");
+        assert_eq!(metadata["reason"], "target-destroyed");
+        assert_eq!(metadata["player_name"], "Dawson");
+        assert_eq!(metadata["edit"]["replaced_original"], true);
+        assert_eq!(metadata["duration_seconds"], 11.0);
+    }
+
+    #[test]
+    fn replace_original_updates_thumbnail() {
+        let dir = temp_dir("replace-thumb");
+        let input = dir.join("clip.webm");
+        let thumbnail = input.with_extension("jpg");
+        fs::write(&input, b"source").unwrap();
+        fs::write(&thumbnail, b"old-thumb").unwrap();
+        let mut request = request(ClipEditorMode::TrimOriginal);
+        request.save_mode = SaveMode::ReplaceOriginal;
+        let paths = replacement_paths_for_test(&input, &dir.join("Backups"), &request);
+        fs::create_dir_all(&paths.backup_dir).unwrap();
+        let backup = backup_original_files(&paths).unwrap();
+        fs::write(&paths.tmp_video_path, b"edited").unwrap();
+        fs::write(&paths.tmp_metadata_path, b"new-meta").unwrap();
+        fs::write(&paths.tmp_thumbnail_path, b"new-thumb").unwrap();
+
+        commit_replacement_files(&paths, &backup).unwrap();
+
+        assert_eq!(fs::read(&thumbnail).unwrap(), b"new-thumb");
+        assert_eq!(
+            fs::read(backup.thumbnail_path.expect("thumbnail backup")).unwrap(),
+            b"old-thumb"
+        );
+    }
+
+    #[test]
+    fn replace_original_result_contains_backup_path() {
+        let result = EditedClipResult {
+            output_path: "/tmp/clip.webm".to_owned(),
+            metadata_path: Some("/tmp/clip.json".to_owned()),
+            thumbnail_path: Some("/tmp/clip.jpg".to_owned()),
+            duration_seconds: 10.0,
+            size_bytes: 42,
+            save_mode: SaveMode::ReplaceOriginal,
+            replaced_original: true,
+            backup_path: Some("/tmp/Backups/clip-backup.webm".to_owned()),
+            backup_metadata_path: None,
+            backup_thumbnail_path: None,
+        };
+
+        assert!(result.replaced_original);
+        assert!(result.backup_path.is_some());
+    }
+
+    #[test]
+    fn replace_original_does_not_duplicate_gallery_entry() {
+        let dir = temp_dir("no-duplicate");
+        let input = dir.join("clip.webm");
+        fs::write(&input, b"source").unwrap();
+        let mut request = request(ClipEditorMode::SocialVertical);
+        request.save_mode = SaveMode::ReplaceOriginal;
+        let paths = replacement_paths_for_test(&input, &dir.join("Backups"), &request);
+        fs::create_dir_all(&paths.backup_dir).unwrap();
+        let backup = backup_original_files(&paths).unwrap();
+        fs::write(&paths.tmp_video_path, b"edited-mp4").unwrap();
+        fs::write(&paths.tmp_metadata_path, b"new-meta").unwrap();
+        fs::write(&paths.tmp_thumbnail_path, b"new-thumb").unwrap();
+
+        commit_replacement_files(&paths, &backup).unwrap();
+
+        assert!(!input.exists());
+        assert!(dir.join("clip.mp4").exists());
+    }
+
+    fn replacement_paths_for_test(
+        input: &Path,
+        backup_dir: &Path,
+        request: &ClipEditRequest,
+    ) -> ReplacementPaths {
+        let target_video_path = replacement_target_path(input, request);
+        ReplacementPaths {
+            original_video_path: input.to_path_buf(),
+            original_metadata_path: input.with_extension("json"),
+            original_thumbnail_path: input.with_extension("jpg"),
+            target_metadata_path: target_video_path.with_extension("json"),
+            target_thumbnail_path: target_video_path.with_extension("jpg"),
+            tmp_video_path: temporary_output_path(&target_video_path),
+            tmp_metadata_path: temporary_sidecar_path(&target_video_path.with_extension("json")),
+            tmp_thumbnail_path: temporary_sidecar_path(&target_video_path.with_extension("jpg")),
+            target_video_path,
+            backup_dir: backup_dir.to_path_buf(),
+        }
     }
 }

@@ -6,6 +6,21 @@ export type ClipReason =
   | "manual"
   | "unknown";
 
+export type BufferHealth = "starting" | "healthy" | "stalled" | "error" | "restarting";
+export type CaptureBackend = "gstreamer" | "gpu_screen_recorder";
+export type GsrHealth = "not_available" | "stopped" | "starting" | "running" | "saving_replay" | "error";
+
+export type BufferStatus = {
+  health: BufferHealth;
+  filledSecs: number;
+  totalSecs: number;
+  lastSegmentPath?: string | null;
+  lastSegmentModifiedAt?: string | null;
+  lastSegmentAgeSecs?: number | null;
+  restartCount: number;
+  lastGstreamerError?: string | null;
+};
+
 export type ClipStatus =
   | "detected"
   | "recording"
@@ -31,6 +46,8 @@ export type SocialLayout =
   | "vertical_blur"
   | "vertical_crop";
 
+export type SaveMode = "create_copy" | "replace_original";
+
 export type ClipEditRequest = {
   clipPath: string;
   metadataPath?: string;
@@ -44,6 +61,8 @@ export type ClipEditRequest = {
   watermark: boolean;
   fps: number;
   bitrateKbps: number;
+  saveMode: SaveMode;
+  backupOriginal: boolean;
 };
 
 export type EditedClipResult = {
@@ -52,6 +71,11 @@ export type EditedClipResult = {
   thumbnailPath?: string;
   durationSeconds: number;
   sizeBytes: number;
+  saveMode: SaveMode;
+  replacedOriginal: boolean;
+  backupPath?: string;
+  backupMetadataPath?: string;
+  backupThumbnailPath?: string;
 };
 
 export type ClipMediaInfo = {
@@ -194,6 +218,18 @@ export type AppConfig = {
     keep_segments: boolean;
     export_mode: ExportMode;
   };
+  capture: {
+    backend: CaptureBackend;
+    target: string;
+    mode: "auto" | "native" | "flatpak";
+    fps: number;
+    replay_seconds: number;
+    container: "mp4" | "mkv";
+    codec: "h264" | "hevc" | "av1";
+    encoder: "gpu" | "cpu";
+    quality: "medium" | "high" | "very_high";
+    output_dir: string;
+  };
   war_thunder: {
     base_url: string;
     player_name: string | null;
@@ -231,8 +267,30 @@ export type DoctorReport = {
 
 export type RuntimeStatus = {
   wtConnected: boolean;
+  activeCaptureBackend: CaptureBackend;
   bufferFilledSecs: number;
   bufferTotalSecs: number;
+  bufferHealth: BufferHealth;
+  bufferLastSegmentPath?: string | null;
+  bufferLastSegmentModifiedAt?: string | null;
+  bufferLastSegmentAgeSecs?: number | null;
+  bufferRestartCount: number;
+  lastGstreamerError?: string | null;
+  gsrAvailable: boolean;
+  gsrHealth: GsrHealth;
+  gsrPid?: number | null;
+  gsrMode?: string | null;
+  gsrTarget: string;
+  gsrMonitors: string[];
+  gsrCommandLine?: string | null;
+  gsrOutputDir?: string | null;
+  gsrOutputPrefix?: string | null;
+  gsrLastOutput?: string | null;
+  gsrLastError?: string | null;
+  gsrRestartCount: number;
+  gsrReplaySeconds: number;
+  gsrFps: number;
+  gsrQuality: string;
   autoClipRunning: boolean;
   activeExportMode: ExportMode;
   configRestartRequired: boolean;

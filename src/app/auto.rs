@@ -17,11 +17,14 @@ use crate::{
             save_frozen_replay, ClipContext, ClipReason, FreezeReplayOutcome, ReplayBufferConfig,
             ReplayBufferHandle, SaveReplayOutcome, SavedReplay,
         },
+        gpu_screen_recorder::{GpuScreenRecorderHandle, SavedGsrReplay},
         output::default_output_dir,
         quality::{QualityPreset, VideoQuality},
     },
     cli::CaptureSource,
-    config::{AppConfig, ClipExportMode, TriggerConfig, WarThunderConfig},
+    config::{
+        AppConfig, CaptureBackend, CaptureConfig, ClipExportMode, TriggerConfig, WarThunderConfig,
+    },
     ui::bridge::{
         AppEvent, ClipStatus, ClipStatusPayload, ExportProgressPayload, ExportProgressStep,
     },
@@ -56,11 +59,17 @@ pub struct AutoClipConfig {
     pub pending_export_dir: PathBuf,
     pub delete_ready_after_export: bool,
     pub command_rx: Option<mpsc::UnboundedReceiver<AutoClipCommand>>,
+    pub capture: CaptureConfig,
 }
 
 #[derive(Debug)]
 pub enum AutoClipCommand {
     SaveManualClip,
+    TestGsrSaveReplay {
+        respond_to: oneshot::Sender<Result<PathBuf, String>>,
+    },
+    RestartReplayBuffer,
+    Shutdown,
     ExportPendingClips {
         respond_to: oneshot::Sender<ExportSummary>,
     },
@@ -1267,7 +1276,8 @@ fn apply_runtime_config(
         || auto_config.source != config.clip.source
         || auto_config.quality_preset != config.clip.quality
         || auto_config.quality.fps != config.clip.fps
-        || auto_config.quality.video_bitrate_kbps != config.clip.video_bitrate_kbps;
+        || auto_config.quality.video_bitrate_kbps != config.clip.video_bitrate_kbps
+        || auto_config.capture != config.capture;
 
     auto_config.export_mode = config.clip.export_mode;
     auto_config.triggers = config.triggers.clone();
@@ -1277,6 +1287,12 @@ fn apply_runtime_config(
         auto_config.pending_export_dir = pending_export_dir;
     }
     auto_config.delete_ready_after_export = config.pending_exports.delete_ready_after_export;
+    auto_config.capture = config.capture.clone();
+    if auto_config.capture.backend == CaptureBackend::GpuScreenRecorder {
+        auto_config.buffer_seconds = auto_config.capture.replay_seconds;
+        auto_config.quality.fps = auto_config.capture.fps;
+        auto_config.export_mode = ClipExportMode::Instant;
+    }
 
     let message = if restart_required {
         "Configuration appliquée partiellement; les paramètres vidéo seront actifs après redémarrage du buffer."
@@ -1304,6 +1320,18 @@ fn replay_buffer_seconds_for_auto(auto_config: &AutoClipConfig) -> u64 {
 pub async fn run_auto_clip(
     client: WarThunderClient,
     warthunder_config: WarThunderConfig,
+    auto_config: AutoClipConfig,
+) -> anyhow::Result<()> {
+    if auto_config.capture.backend == CaptureBackend::GpuScreenRecorder {
+        run_auto_clip_gsr(client, warthunder_config, auto_config).await
+    } else {
+        run_auto_clip_gstreamer(client, warthunder_config, auto_config).await
+    }
+}
+
+async fn run_auto_clip_gstreamer(
+    client: WarThunderClient,
+    warthunder_config: WarThunderConfig,
     mut auto_config: AutoClipConfig,
 ) -> anyhow::Result<()> {
     let mut command_rx = auto_config.command_rx.take();
@@ -1326,6 +1354,7 @@ pub async fn run_auto_clip(
     println!("Video target: {}", auto_config.quality.log_summary());
     println!("Auto-clip armed for personal War Thunder kills.");
     println!("Press Ctrl+C to stop.");
+    send_buffer_status(&auto_config, &buffer);
 
     let player_name = warthunder_config.player_name.as_deref();
     let mut configured_post_event_delay = auto_config.post_event_delay;
@@ -1353,7 +1382,6 @@ pub async fn run_auto_clip(
     wt_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut cleanup_tick = interval(Duration::from_secs(1));
     cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let buffer_started_at = Instant::now();
     let mut last_wt_connected = None;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -1366,17 +1394,20 @@ pub async fn run_auto_clip(
                 break Ok(());
             }
             _ = cleanup_tick.tick() => {
-                if let Some(buffer) = &buffer {
-                    if let Err(error) = buffer.prune() {
-                        break Err(error);
+                if let Some(buffer) = buffer.as_mut() {
+                    let restart_reason = match buffer.prune() {
+                        Ok(reason) => reason,
+                        Err(error) => Some(error.to_string()),
+                    };
+                    send_buffer_status(&auto_config, buffer);
+                    if let Some(reason) = restart_reason {
+                        let reason = buffer.begin_restart(reason);
+                        send_buffer_status(&auto_config, buffer);
+                        if let Err(error) = buffer.restart(reason).await {
+                            break Err(error);
+                        }
+                        send_buffer_status(&auto_config, buffer);
                     }
-                    send_ui_event(&auto_config, AppEvent::BufferProgress {
-                        filled_secs: buffer_started_at
-                            .elapsed()
-                            .as_secs_f32()
-                            .min(replay_buffer_seconds as f32),
-                        total_secs: replay_buffer_seconds as f32,
-                    });
                     if let Err(error) = save_ready_pending_clips(
                         buffer,
                         &mut pending_clips,
@@ -1397,10 +1428,14 @@ pub async fn run_auto_clip(
                     command_rx = None;
                     continue;
                 };
-                let Some(buffer) = &buffer else {
+                let Some(buffer) = buffer.as_mut() else {
                     continue;
                 };
                 match command {
+                    AutoClipCommand::Shutdown => {
+                        info!("received backend shutdown command");
+                        break Ok(());
+                    }
                     AutoClipCommand::SaveManualClip => {
                         handle_manual_clip_command(
                             buffer,
@@ -1409,6 +1444,19 @@ pub async fn run_auto_clip(
                             &auto_config,
                             configured_post_event_delay,
                         ).await;
+                    }
+                    AutoClipCommand::TestGsrSaveReplay { respond_to } => {
+                        let _ = respond_to.send(Err(
+                            "Le backend actif n'est pas GPU Screen Recorder.".to_owned(),
+                        ));
+                    }
+                    AutoClipCommand::RestartReplayBuffer => {
+                        let reason = buffer.begin_restart("manual buffer restart request");
+                        send_buffer_status(&auto_config, buffer);
+                        if let Err(error) = buffer.restart(reason).await {
+                            break Err(error);
+                        }
+                        send_buffer_status(&auto_config, buffer);
                     }
                     AutoClipCommand::ExportPendingClips { respond_to } => {
                         let summary = export_queue.export_pending_clips(buffer, &auto_config).await;
@@ -1635,6 +1683,281 @@ pub async fn run_auto_clip(
         }
     }
 
+    result
+}
+
+async fn run_auto_clip_gsr(
+    client: WarThunderClient,
+    warthunder_config: WarThunderConfig,
+    mut auto_config: AutoClipConfig,
+) -> anyhow::Result<()> {
+    let mut command_rx = auto_config.command_rx.take();
+    let gsr = GpuScreenRecorderHandle::new(auto_config.capture.clone());
+    if let Err(error) = gsr.start().await {
+        let message = format!("GPU Screen Recorder: {error}");
+        error!(%message, "failed to start GSR backend");
+        send_ui_event(
+            &auto_config,
+            AppEvent::ClipFailed {
+                message: message.clone(),
+            },
+        );
+    }
+    send_gsr_status(&auto_config, &gsr).await;
+
+    println!("GPU Replay armed for War Thunder clips.");
+    println!("Auto-clip armed for personal War Thunder kills.");
+    println!("Press Ctrl+C to stop.");
+
+    let player_name = warthunder_config.player_name.as_deref();
+    let mut configured_post_event_delay = auto_config.post_event_delay;
+    let mut effective_save_delay = configured_post_event_delay;
+    let mut state = AutoWatchState::new();
+    if auto_config.include_history {
+        println!("[WT] include-history enabled: processing existing events");
+    } else {
+        bootstrap(&client, &mut state).await;
+        println!(
+            "[WT] initialized cursors: chat={}, hud_evt={}, hud_dmg={}",
+            state.last_chat_id, state.last_evt_msg_id, state.last_dmg_msg_id
+        );
+        println!("[WT] watching for new events only");
+    }
+
+    let mut cooldown = Cooldown::new(auto_config.cooldown);
+    let mut pending_clips = Vec::<PendingClip>::new();
+    let mut export_queue = ExportQueue::default();
+    if let Err(error) = export_queue.load_from_pending_dir(&auto_config) {
+        error!(%error, "failed to load pending exports on startup");
+    }
+    let mut wt_tick = interval(warthunder_config.poll_interval());
+    wt_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut cleanup_tick = interval(Duration::from_secs(1));
+    cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_wt_connected = None;
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
+    let result = loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("received Ctrl+C, stopping GSR auto-clip");
+                break Ok(());
+            }
+            _ = cleanup_tick.tick() => {
+                gsr.refresh_status().await;
+                send_gsr_status(&auto_config, &gsr).await;
+                save_ready_pending_clips_gsr(
+                    &gsr,
+                    &mut pending_clips,
+                    &mut cooldown,
+                    Instant::now(),
+                    player_name,
+                    &auto_config,
+                    configured_post_event_delay,
+                ).await;
+            }
+            command = recv_auto_command(&mut command_rx), if command_rx.is_some() => {
+                let Some(command) = command else {
+                    command_rx = None;
+                    continue;
+                };
+                match command {
+                    AutoClipCommand::Shutdown => {
+                        info!("received backend shutdown command");
+                        break Ok(());
+                    }
+                    AutoClipCommand::SaveManualClip => {
+                        handle_manual_clip_command_gsr(
+                            &gsr,
+                            player_name,
+                            &auto_config,
+                        ).await;
+                    }
+                    AutoClipCommand::TestGsrSaveReplay { respond_to } => {
+                        let result =
+                            handle_test_gsr_save_replay_command(&gsr, player_name, &auto_config)
+                                .await
+                                .map(|replay| replay.final_video_path);
+                        let _ = respond_to.send(result.map_err(|error| error.to_string()));
+                    }
+                    AutoClipCommand::RestartReplayBuffer => {
+                        if let Err(error) = gsr.restart(None, "manual GPU Screen Recorder restart request").await {
+                            send_ui_event(
+                                &auto_config,
+                                AppEvent::ClipFailed {
+                                    message: format!("Redémarrage GPU Screen Recorder: {error}"),
+                                },
+                            );
+                        }
+                        send_gsr_status(&auto_config, &gsr).await;
+                    }
+                    AutoClipCommand::ExportPendingClips { respond_to } => {
+                        send_ui_event(
+                            &auto_config,
+                            AppEvent::ClipFailed {
+                                message: "Le backend GPU Replay ne crée pas de pending exports. Les anciens pending ne sont pas supprimés.".to_owned(),
+                            },
+                        );
+                        let _ = respond_to.send(ExportSummary::default());
+                    }
+                    AutoClipCommand::GetPendingExportClips { respond_to } => {
+                        let _ = respond_to.send(export_queue.pending_dtos(&auto_config));
+                    }
+                    AutoClipCommand::DeletePendingClip { id, respond_to } => {
+                        let _ = respond_to.send(export_queue.delete_pending_clip(&id));
+                    }
+                    AutoClipCommand::UpdateConfig { config, respond_to } => {
+                        let capture_config = config.capture.clone();
+                        let result = apply_runtime_config(&mut auto_config, &config);
+                        configured_post_event_delay = auto_config.post_event_delay;
+                        effective_save_delay = configured_post_event_delay;
+                        let mut response = result.clone();
+                        if capture_config.backend == CaptureBackend::GpuScreenRecorder {
+                            match gsr.update_config_and_restart_if_needed(capture_config).await {
+                                Ok(restarted) => {
+                                    response.restart_required = false;
+                                    response.message = if restarted {
+                                        "Configuration appliquée; GPU Screen Recorder redémarré avec la nouvelle commande.".to_owned()
+                                    } else {
+                                        "Configuration appliquée au backend GPU Screen Recorder.".to_owned()
+                                    };
+                                }
+                                Err(error) => {
+                                    response.restart_required = true;
+                                    response.message = format!("Configuration sauvegardée; redémarrage GPU Screen Recorder impossible: {error}");
+                                    send_ui_event(
+                                        &auto_config,
+                                        AppEvent::ClipFailed {
+                                            message: response.message.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        send_gsr_status(&auto_config, &gsr).await;
+                        let _ = respond_to.send(response);
+                    }
+                }
+            }
+            _ = wt_tick.tick() => {
+                let (events, wt_connected) = poll_personal_events(&client, &mut state, player_name, &auto_config.triggers).await;
+                if last_wt_connected != Some(wt_connected) {
+                    send_ui_event(
+                        &auto_config,
+                        if wt_connected {
+                            AppEvent::WtConnected
+                        } else {
+                            AppEvent::WtDisconnected
+                        },
+                    );
+                    last_wt_connected = Some(wt_connected);
+                }
+                for detected in events {
+                    let event = detected.event;
+                    let summary = event_summary(&event);
+                    let reason = detected.reason;
+                    println!("[WT] event detected ({reason:?}): {summary}");
+                    let (vehicle, target) = event_vehicle_target(&event);
+                    send_ui_event(&auto_config, AppEvent::KillDetected {
+                        reason,
+                        vehicle,
+                        target,
+                        description: summary.clone(),
+                    });
+                    let now = detected.detected_at;
+                    if pending_clips
+                        .iter()
+                        .any(|pending| pending.event_keys.contains(&detected.canonical_key))
+                    {
+                        debug!(
+                            canonical_key = %detected.canonical_key,
+                            "duplicate event already exists in pending GSR clip"
+                        );
+                        continue;
+                    }
+                    if let Some(pending_index) = pending_index_for_multi_kill(
+                        &pending_clips,
+                        reason,
+                        now,
+                        detected.game_time,
+                        auto_config.multi_kill_window,
+                    ) {
+                        let pending = &mut pending_clips[pending_index];
+                        if pending.add_event(
+                            event,
+                            detected.canonical_key,
+                            now,
+                            detected.game_time,
+                            detected.detected_wall_time,
+                            effective_save_delay,
+                            summary,
+                        ) {
+                            send_ui_event(
+                                &auto_config,
+                                AppEvent::ClipStatusChanged {
+                                    payload: status_payload(
+                                        pending,
+                                        ClipStatus::Detected,
+                                        pending.reason,
+                                        format!(
+                                            "Multi-kill GPU en attente : {} kills, sauvegarde dans {}s",
+                                            pending.kill_count(),
+                                            effective_save_delay.as_secs()
+                                        ),
+                                        Some(15),
+                                        None,
+                                    ),
+                                },
+                            );
+                        }
+                        continue;
+                    }
+                    if !cooldown.allows(now) {
+                        debug!(?event, "[CLIP] cooldown active, scheduling distinct GSR clip");
+                    }
+                    let pending = schedule_pending_clip(
+                        event,
+                        detected.canonical_key,
+                        reason,
+                        summary.clone(),
+                        now,
+                        detected.game_time,
+                        detected.detected_wall_time,
+                        effective_save_delay,
+                    );
+                    println!(
+                        "[CLIP] scheduled GPU replay save in {}s...",
+                        effective_save_delay.as_secs()
+                    );
+                    send_ui_event(
+                        &auto_config,
+                        AppEvent::ClipStatusChanged {
+                            payload: status_payload(
+                                &pending,
+                                ClipStatus::Detected,
+                                reason,
+                                format!(
+                                    "Clip GPU programmé: {summary} (sauvegarde dans {}s)",
+                                    effective_save_delay.as_secs()
+                                ),
+                                Some(10),
+                                None,
+                            ),
+                        },
+                    );
+                    pending_clips.push(pending);
+                }
+            }
+        }
+    };
+
+    if let Err(error) = gsr.stop().await {
+        if result.is_ok() {
+            return Err(error);
+        }
+        debug!(%error, "failed to stop GPU Screen Recorder after auto-clip error");
+    }
     result
 }
 
@@ -2454,6 +2777,265 @@ async fn handle_manual_clip_command(
     }
 }
 
+async fn save_ready_pending_clips_gsr(
+    gsr: &GpuScreenRecorderHandle,
+    pending_clips: &mut Vec<PendingClip>,
+    cooldown: &mut Cooldown,
+    now: Instant,
+    player_name: Option<&str>,
+    auto_config: &AutoClipConfig,
+    configured_post_event_delay: Duration,
+) {
+    let ready_indices = ready_pending_indices(pending_clips, now);
+    for index in ready_indices.into_iter().rev() {
+        let pending = pending_clips.remove(index);
+        println!(
+            "[GSR_AUTO] post_event elapsed id={} reason={}",
+            pending.clip_id,
+            pending.reason.slug()
+        );
+        let context = clip_context_for_pending(
+            &pending,
+            player_name,
+            auto_config,
+            configured_post_event_delay,
+        );
+        send_ui_event(
+            auto_config,
+            AppEvent::ClipStatusChanged {
+                payload: status_payload(
+                    &pending,
+                    ClipStatus::Recording,
+                    pending.reason,
+                    "Sauvegarde GPU Replay...".to_owned(),
+                    Some(35),
+                    None,
+                ),
+            },
+        );
+        println!("[GSR_AUTO] calling gsr.save_replay id={}", pending.clip_id);
+        match gsr.save_replay(context).await {
+            Ok(replay) => {
+                emit_gsr_replay_saved(auto_config, &pending, replay);
+                cooldown.record_save(now);
+            }
+            Err(error) => {
+                let message = format!("GPU Screen Recorder n'a pas sauvegardé le clip: {error}");
+                send_ui_event(
+                    auto_config,
+                    AppEvent::ClipStatusChanged {
+                        payload: status_payload(
+                            &pending,
+                            ClipStatus::Failed,
+                            pending.reason,
+                            "Erreur GPU Replay".to_owned(),
+                            None,
+                            Some(message.clone()),
+                        ),
+                    },
+                );
+                send_ui_event(auto_config, AppEvent::ClipFailed { message });
+                cooldown.record_save(now);
+            }
+        }
+        send_gsr_status(auto_config, gsr).await;
+    }
+}
+
+async fn handle_manual_clip_command_gsr(
+    gsr: &GpuScreenRecorderHandle,
+    player_name: Option<&str>,
+    auto_config: &AutoClipConfig,
+) {
+    let mut status = ClipStatusPayload {
+        id: format!("clip_{}", Uuid::new_v4()),
+        status: ClipStatus::Recording,
+        reason: ClipReason::Manual,
+        title: "Sauvegarde GPU Replay...".to_owned(),
+        created_at: Utc::now().to_rfc3339(),
+        file_path: None,
+        thumbnail_path: None,
+        duration_seconds: None,
+        size_bytes: None,
+        progress: Some(35),
+        error: None,
+        exportable_at: None,
+        can_export: false,
+        retryable: false,
+    };
+    send_ui_event(
+        auto_config,
+        AppEvent::ClipStatusChanged {
+            payload: status.clone(),
+        },
+    );
+
+    let mut context = ClipContext {
+        reason: ClipReason::Manual,
+        event: None,
+        events: Vec::new(),
+        player_name: player_name.map(str::to_owned),
+        pending_clip_id: Some(status.id.clone()),
+        pending_dedupe_key: Some(format!("manual|{}", status.id)),
+        video_quality: auto_config.quality,
+        quality_preset: auto_config.quality_preset,
+        duration_seconds: auto_config.buffer_seconds,
+        post_event_seconds: 0,
+        segment_seconds: auto_config.segment_seconds,
+        first_event_time: None,
+        last_event_time: None,
+    };
+    context.duration_seconds = auto_config.capture.replay_seconds;
+
+    match gsr.save_replay(context).await {
+        Ok(replay) => {
+            status.status = ClipStatus::Ready;
+            status.title = "Clip prêt".to_owned();
+            status.file_path = Some(replay.final_video_path.clone());
+            status.thumbnail_path = replay.thumbnail_path.clone();
+            status.duration_seconds = Some(replay.duration_seconds);
+            status.size_bytes = Some(replay.size_bytes);
+            status.progress = Some(100);
+            send_ui_event(auto_config, AppEvent::ClipStatusChanged { payload: status });
+            send_ui_event(
+                auto_config,
+                AppEvent::ClipSaved {
+                    path: replay.final_video_path,
+                    reason: ClipReason::Manual,
+                    duration_seconds: replay.duration_seconds,
+                    size_bytes: replay.size_bytes,
+                },
+            );
+        }
+        Err(error) => {
+            let message = format!("Clip manuel GPU Replay: {error}");
+            status.status = ClipStatus::Failed;
+            status.title = "Erreur GPU Replay".to_owned();
+            status.progress = None;
+            status.error = Some(message.clone());
+            send_ui_event(auto_config, AppEvent::ClipStatusChanged { payload: status });
+            send_ui_event(auto_config, AppEvent::ClipFailed { message });
+        }
+    }
+    send_gsr_status(auto_config, gsr).await;
+}
+
+async fn handle_test_gsr_save_replay_command(
+    gsr: &GpuScreenRecorderHandle,
+    player_name: Option<&str>,
+    auto_config: &AutoClipConfig,
+) -> anyhow::Result<SavedGsrReplay> {
+    let id = format!("gsr_test_{}", Uuid::new_v4());
+    let mut status = ClipStatusPayload {
+        id: id.clone(),
+        status: ClipStatus::Recording,
+        reason: ClipReason::Manual,
+        title: "Test sauvegarde GPU Replay...".to_owned(),
+        created_at: Utc::now().to_rfc3339(),
+        file_path: None,
+        thumbnail_path: None,
+        duration_seconds: None,
+        size_bytes: None,
+        progress: Some(35),
+        error: None,
+        exportable_at: None,
+        can_export: false,
+        retryable: false,
+    };
+    send_ui_event(
+        auto_config,
+        AppEvent::ClipStatusChanged {
+            payload: status.clone(),
+        },
+    );
+
+    let context = ClipContext {
+        reason: ClipReason::Manual,
+        event: None,
+        events: Vec::new(),
+        player_name: player_name.map(str::to_owned),
+        pending_clip_id: Some(id.clone()),
+        pending_dedupe_key: Some(format!("gsr-test|{id}")),
+        video_quality: auto_config.quality,
+        quality_preset: auto_config.quality_preset,
+        duration_seconds: auto_config.capture.replay_seconds,
+        post_event_seconds: 0,
+        segment_seconds: auto_config.segment_seconds,
+        first_event_time: None,
+        last_event_time: None,
+    };
+
+    println!("[GSR_AUTO] calling gsr.save_replay id={id}");
+    match gsr.save_replay(context).await {
+        Ok(replay) => {
+            status.status = ClipStatus::Ready;
+            status.title = "Test GPU Replay prêt".to_owned();
+            status.file_path = Some(replay.final_video_path.clone());
+            status.thumbnail_path = replay.thumbnail_path.clone();
+            status.duration_seconds = Some(replay.duration_seconds);
+            status.size_bytes = Some(replay.size_bytes);
+            status.progress = Some(100);
+            send_ui_event(auto_config, AppEvent::ClipStatusChanged { payload: status });
+            send_ui_event(
+                auto_config,
+                AppEvent::ClipSaved {
+                    path: replay.final_video_path.clone(),
+                    reason: ClipReason::Manual,
+                    duration_seconds: replay.duration_seconds,
+                    size_bytes: replay.size_bytes,
+                },
+            );
+            send_gsr_status(auto_config, gsr).await;
+            Ok(replay)
+        }
+        Err(error) => {
+            let message = format!("Test sauvegarde GPU Replay: {error}");
+            status.status = ClipStatus::Failed;
+            status.title = "Erreur GPU Replay".to_owned();
+            status.progress = None;
+            status.error = Some(message.clone());
+            send_ui_event(auto_config, AppEvent::ClipStatusChanged { payload: status });
+            send_ui_event(
+                auto_config,
+                AppEvent::ClipFailed {
+                    message: message.clone(),
+                },
+            );
+            send_gsr_status(auto_config, gsr).await;
+            Err(anyhow::anyhow!(message))
+        }
+    }
+}
+
+fn emit_gsr_replay_saved(
+    auto_config: &AutoClipConfig,
+    pending: &PendingClip,
+    replay: SavedGsrReplay,
+) {
+    let mut ready = status_payload(
+        pending,
+        ClipStatus::Ready,
+        pending.reason,
+        "Clip prêt".to_owned(),
+        Some(100),
+        None,
+    );
+    ready.file_path = Some(replay.final_video_path.clone());
+    ready.thumbnail_path = replay.thumbnail_path.clone();
+    ready.duration_seconds = Some(replay.duration_seconds);
+    ready.size_bytes = Some(replay.size_bytes);
+    send_ui_event(auto_config, AppEvent::ClipStatusChanged { payload: ready });
+    send_ui_event(
+        auto_config,
+        AppEvent::ClipSaved {
+            path: replay.final_video_path,
+            reason: pending.reason,
+            duration_seconds: replay.duration_seconds,
+            size_bytes: replay.size_bytes,
+        },
+    );
+}
+
 async fn bootstrap(client: &WarThunderClient, state: &mut AutoWatchState) {
     if let Ok(chat) = client.fetch_gamechat(0).await {
         state.last_chat_id = chat.next_last_id;
@@ -3133,6 +3715,32 @@ fn export_progress_step_log(step: ExportProgressStep) -> &'static str {
     }
 }
 
+fn send_buffer_status(auto_config: &AutoClipConfig, buffer: &ReplayBufferHandle) {
+    let status = buffer.status();
+    debug!(
+        health = ?status.health,
+        filled_secs = status.filled_secs,
+        total_secs = status.total_secs,
+        last_segment_path = ?status.last_segment_path,
+        last_segment_age_secs = ?status.last_segment_age_secs,
+        restart_count = status.restart_count,
+        last_gstreamer_error = ?status.last_gstreamer_error,
+        "queueing buffer status from auto backend"
+    );
+    send_ui_event(auto_config, AppEvent::BufferProgress { status });
+}
+
+async fn send_gsr_status(auto_config: &AutoClipConfig, gsr: &GpuScreenRecorderHandle) {
+    let status = gsr.status().await;
+    debug!(
+        health = ?status.health,
+        pid = ?status.pid,
+        command = ?status.command_line,
+        "queueing GSR status from auto backend"
+    );
+    send_ui_event(auto_config, AppEvent::GsrStatusChanged { status });
+}
+
 fn send_ui_event(auto_config: &AutoClipConfig, event: AppEvent) {
     if let Some(sender) = &auto_config.ui_events {
         debug!(?event, "queueing AppEvent from auto backend");
@@ -3220,6 +3828,10 @@ mod tests {
             pending_export_dir: std::env::temp_dir().join("wt-clipper-test-pending"),
             delete_ready_after_export: true,
             command_rx: None,
+            capture: CaptureConfig {
+                backend: CaptureBackend::Gstreamer,
+                ..CaptureConfig::default()
+            },
         }
     }
 
@@ -4369,6 +4981,7 @@ mod tests {
         let mut auto_config = test_auto_config(5, 2);
         auto_config.export_mode = ClipExportMode::Instant;
         let mut app_config = AppConfig::default();
+        app_config.capture.backend = CaptureBackend::Gstreamer;
         app_config.clip.export_mode = ClipExportMode::Deferred;
         app_config.clip.post_event_seconds = 9;
         app_config.clip.multi_kill_window_seconds = 12;
@@ -4388,6 +5001,7 @@ mod tests {
     fn update_config_marks_capture_changes_restart_required() {
         let mut auto_config = test_auto_config(5, 2);
         let mut app_config = AppConfig::default();
+        app_config.capture.backend = CaptureBackend::Gstreamer;
         app_config.clip.export_mode = ClipExportMode::Deferred;
         app_config.clip.seconds = auto_config.buffer_seconds + 5;
 
@@ -4396,6 +5010,24 @@ mod tests {
         assert!(result.restart_required);
         assert_eq!(auto_config.export_mode, ClipExportMode::Deferred);
         assert_ne!(auto_config.buffer_seconds, app_config.clip.seconds);
+    }
+
+    #[test]
+    fn gsr_config_forces_direct_replay_without_pending_mode() {
+        let mut auto_config = test_auto_config(5, 2);
+        auto_config.capture.backend = CaptureBackend::GpuScreenRecorder;
+        let mut app_config = AppConfig::default();
+        app_config.capture.backend = CaptureBackend::GpuScreenRecorder;
+        app_config.capture.replay_seconds = 40;
+        app_config.capture.fps = 60;
+        app_config.clip.export_mode = ClipExportMode::Deferred;
+
+        let result = apply_runtime_config(&mut auto_config, &app_config);
+
+        assert_eq!(auto_config.export_mode, ClipExportMode::Instant);
+        assert_eq!(auto_config.buffer_seconds, 40);
+        assert_eq!(auto_config.quality.fps, 60);
+        assert!(result.restart_required);
     }
 
     #[test]

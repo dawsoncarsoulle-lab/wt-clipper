@@ -5293,6 +5293,7 @@ dependencies = [
  "enumflags2",
  "fs2",
  "gstreamer",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

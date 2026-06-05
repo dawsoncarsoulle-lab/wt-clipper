@@ -14,7 +14,8 @@ use wt_clipper::capture::quality::{QualityPreset, VideoQuality};
 use wt_clipper::capture::recorder::{record, RecordingRequest};
 use wt_clipper::cli::{CaptureSource, Cli, Command, ConfigCommand, DumpEndpoint};
 use wt_clipper::config::{
-    default_config_path, expand_tilde, AppConfig, ClipConfig, WarThunderConfig,
+    default_config_path, expand_tilde, AppConfig, CaptureBackend, ClipConfig, ClipExportMode,
+    WarThunderConfig,
 };
 use wt_clipper::doctor;
 use wt_clipper::ui::{
@@ -130,14 +131,28 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let config = AppConfig::load(cli.config.as_deref())?;
             let client = WarThunderClient::new(config.war_thunder.clone())?;
             let quality_preset = quality.unwrap_or(config.clip.quality);
-            let quality =
+            let mut quality =
                 resolve_configured_video_quality(&config.clip, quality, fps, video_bitrate)?;
+            let capture_backend = config.capture.backend;
+            if capture_backend == CaptureBackend::GpuScreenRecorder {
+                quality.fps = config.capture.fps;
+            }
+            let buffer_seconds = if capture_backend == CaptureBackend::GpuScreenRecorder {
+                config.capture.replay_seconds
+            } else {
+                seconds.unwrap_or(config.clip.seconds)
+            };
+            let export_mode = if capture_backend == CaptureBackend::GpuScreenRecorder {
+                ClipExportMode::Instant
+            } else {
+                config.clip.export_mode
+            };
 
             run_auto_clip(
                 client,
                 config.war_thunder,
                 AutoClipConfig {
-                    buffer_seconds: seconds.unwrap_or(config.clip.seconds),
+                    buffer_seconds,
                     segment_seconds: segment_seconds.unwrap_or(config.clip.segment_seconds),
                     output_dir: Some(resolve_output_dir(output_dir, &config.clip)?),
                     source: source.unwrap_or(config.clip.source),
@@ -152,10 +167,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     include_history,
                     triggers: config.triggers.clone(),
                     ui_events: None,
-                    export_mode: config.clip.export_mode,
+                    export_mode,
                     pending_export_dir: config.pending_exports.pending_export_dir_path()?,
                     delete_ready_after_export: config.pending_exports.delete_ready_after_export,
                     command_rx: None,
+                    capture: config.capture.clone(),
                 },
             )
             .await
@@ -269,7 +285,8 @@ fn spawn_gui_runtime(
                 }
             };
             let quality_preset = config.clip.quality;
-            let quality = match resolve_configured_video_quality(&config.clip, None, None, None) {
+            let mut quality = match resolve_configured_video_quality(&config.clip, None, None, None)
+            {
                 Ok(quality) => quality,
                 Err(error) => {
                     let _ = event_tx.send(AppEvent::ClipFailed {
@@ -303,11 +320,26 @@ fn spawn_gui_runtime(
                 command_loop(cmd_rx, command_events, command_output_dir, config_path).await;
             });
 
+            let capture_backend = config.capture.backend;
+            if capture_backend == CaptureBackend::GpuScreenRecorder {
+                quality.fps = config.capture.fps;
+            }
+            let buffer_seconds = if capture_backend == CaptureBackend::GpuScreenRecorder {
+                config.capture.replay_seconds
+            } else {
+                config.clip.seconds
+            };
+            let export_mode = if capture_backend == CaptureBackend::GpuScreenRecorder {
+                ClipExportMode::Instant
+            } else {
+                config.clip.export_mode
+            };
+
             let auto = run_auto_clip(
                 client,
                 config.war_thunder.clone(),
                 AutoClipConfig {
-                    buffer_seconds: config.clip.seconds,
+                    buffer_seconds,
                     segment_seconds: config.clip.segment_seconds,
                     output_dir: Some(output_dir),
                     source: config.clip.source,
@@ -320,10 +352,11 @@ fn spawn_gui_runtime(
                     include_history: false,
                     triggers: config.triggers.clone(),
                     ui_events: Some(event_tx.clone()),
-                    export_mode: config.clip.export_mode,
+                    export_mode,
                     pending_export_dir,
                     delete_ready_after_export: config.pending_exports.delete_ready_after_export,
                     command_rx: None,
+                    capture: config.capture.clone(),
                 },
             );
 
@@ -409,7 +442,7 @@ async fn command_loop(
                     message: "Clip manuel indisponible pendant cette session".to_owned(),
                 });
             }
-            UiCommand::RestartBuffer => {
+            UiCommand::RestartReplayBuffer | UiCommand::RestartBuffer => {
                 let _ = event_tx.send(AppEvent::ClipFailed {
                     message: "Redémarrage appliqué au prochain lancement".to_owned(),
                 });

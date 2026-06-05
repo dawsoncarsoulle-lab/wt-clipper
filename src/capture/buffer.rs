@@ -2,11 +2,11 @@ use std::{
     fs,
     os::fd::AsRawFd,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Context;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use gst::prelude::*;
 use gstreamer as gst;
 use serde::{Deserialize, Serialize};
@@ -29,10 +29,10 @@ use crate::{
             x11_source_chain, CaptureBackend, PipelineSource,
         },
         segments::{
-            prune_old_segments, segment_file_name, segment_location_pattern, segments_to_keep,
-            select_segments_around_event, select_segments_for_duration, selected_segments_duration,
-            snapshot_stable_segments, wait_until_segment_stable, EventSegmentSelection,
-            ReplaySegment,
+            list_segments, prune_old_segments, segment_file_name, segment_location_pattern,
+            segments_to_keep, select_segments_around_event, select_segments_for_duration,
+            selected_segments_duration, snapshot_stable_segments, wait_until_segment_stable,
+            EventSegmentSelection, ReplaySegment,
         },
         x11::resolve_x11_window_id,
     },
@@ -40,6 +40,35 @@ use crate::{
     doctor::check_free_space,
     warthunder::events::WarThunderEvent,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BufferHealth {
+    Starting,
+    Healthy,
+    Stalled,
+    Error,
+    Restarting,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BufferStatus {
+    pub health: BufferHealth,
+    pub filled_secs: f32,
+    pub total_secs: f32,
+    pub last_segment_path: Option<PathBuf>,
+    pub last_segment_modified_at: Option<String>,
+    pub last_segment_age_secs: Option<u64>,
+    pub restart_count: u64,
+    pub last_gstreamer_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BufferMaintenance {
+    None,
+    Restart { reason: String },
+}
 
 #[derive(Debug, Clone)]
 pub struct ReplayBufferConfig {
@@ -135,6 +164,14 @@ pub struct ReplayBufferHandle {
     config: ReplayBufferConfig,
     temp_dir: PathBuf,
     keep_segments: usize,
+    pipeline: Option<gst::Pipeline>,
+    portal_session: Option<PortalScreencastSession>,
+    started_at: Instant,
+    status: BufferStatus,
+}
+
+struct ReplayBufferRuntime {
+    temp_dir: PathBuf,
     pipeline: gst::Pipeline,
     portal_session: Option<PortalScreencastSession>,
 }
@@ -150,6 +187,160 @@ impl ReplayBufferHandle {
 
         gst::init().context("failed to initialize GStreamer")?;
         info!(video = %config.quality.log_summary(), "replay buffer video target");
+
+        let keep_segments = segments_to_keep(config.buffer_seconds, config.segment_seconds);
+        let buffer_seconds = config.buffer_seconds as f32;
+        let runtime = Self::build_runtime(&config, keep_segments).await?;
+
+        Ok(Self {
+            config,
+            temp_dir: runtime.temp_dir,
+            keep_segments,
+            pipeline: Some(runtime.pipeline),
+            portal_session: runtime.portal_session,
+            started_at: Instant::now(),
+            status: BufferStatus {
+                health: BufferHealth::Starting,
+                filled_secs: 0.0,
+                total_secs: buffer_seconds,
+                last_segment_path: None,
+                last_segment_modified_at: None,
+                last_segment_age_secs: None,
+                restart_count: 0,
+                last_gstreamer_error: None,
+            },
+        })
+    }
+
+    pub async fn save_replay(&self, context: ClipContext) -> anyhow::Result<SaveReplayOutcome> {
+        let temp_dir = self.temp_dir.clone();
+        let keep_segments = self.keep_segments;
+        let output_dir = self.config.output_dir.clone();
+        let keep_saved_segments = self.config.keep_segments;
+        tokio::task::spawn_blocking(move || {
+            save_replay_clip(
+                &temp_dir,
+                keep_segments,
+                output_dir,
+                keep_saved_segments,
+                context,
+            )
+        })
+        .await?
+    }
+
+    pub async fn freeze_replay_segments(
+        &self,
+        context: ClipContext,
+        destination_dir: PathBuf,
+    ) -> anyhow::Result<FreezeReplayOutcome> {
+        let temp_dir = self.temp_dir.clone();
+        let keep_segments = self.keep_segments;
+        tokio::task::spawn_blocking(move || {
+            freeze_replay_segments(&temp_dir, keep_segments, context, &destination_dir)
+        })
+        .await?
+    }
+
+    pub fn status(&self) -> BufferStatus {
+        self.status.clone()
+    }
+
+    pub fn prune(&mut self) -> anyhow::Result<Option<String>> {
+        prune_old_segments(&self.temp_dir, self.keep_segments)?;
+        let maintenance = self.refresh_status()?;
+        if let BufferMaintenance::Restart { reason } = maintenance {
+            return Ok(Some(reason));
+        }
+        Ok(None)
+    }
+
+    pub fn temp_dir(&self) -> &std::path::Path {
+        &self.temp_dir
+    }
+
+    pub fn output_dir(&self) -> Option<&std::path::Path> {
+        self.config.output_dir.as_deref()
+    }
+
+    pub async fn stop(self) -> anyhow::Result<()> {
+        let mut this = self;
+        this.stop_current_runtime().await
+    }
+
+    pub async fn restart(&mut self, reason: impl Into<String>) -> anyhow::Result<()> {
+        let reason = self.begin_restart(reason);
+        info!(reason = %reason, "restarting replay buffer");
+        if let Err(error) = self.stop_current_runtime().await {
+            debug!(%error, "failed to stop replay buffer cleanly before restart");
+        }
+        let runtime = Self::build_runtime(&self.config, self.keep_segments).await?;
+        self.temp_dir = runtime.temp_dir;
+        self.pipeline = Some(runtime.pipeline);
+        self.portal_session = runtime.portal_session;
+        self.started_at = Instant::now();
+        self.status.health = BufferHealth::Starting;
+        self.status.filled_secs = 0.0;
+        self.status.total_secs = self.config.buffer_seconds as f32;
+        self.status.last_segment_path = None;
+        self.status.last_segment_modified_at = None;
+        self.status.last_segment_age_secs = None;
+        self.status.restart_count = self.status.restart_count.saturating_add(1);
+        self.status.last_gstreamer_error = Some(reason.clone());
+        info!(restart_count = self.status.restart_count, reason = %reason, "replay buffer restarted");
+        Ok(())
+    }
+
+    pub fn begin_restart(&mut self, reason: impl Into<String>) -> String {
+        let reason = reason.into();
+        self.status.health = BufferHealth::Restarting;
+        self.status.last_gstreamer_error = Some(reason.clone());
+        reason
+    }
+
+    async fn stop_current_runtime(&mut self) -> anyhow::Result<()> {
+        let mut stop_error: Option<anyhow::Error> = None;
+        if let Some(pipeline) = self.pipeline.take() {
+            info!("sending EOS to replay buffer pipeline");
+            pipeline.send_event(gst::event::Eos::new());
+            let result = wait_for_eos_or_error(&pipeline);
+            if let Err(error) = pipeline.set_state(gst::State::Null) {
+                let error_text = error.to_string();
+                if result.is_ok() {
+                    stop_error = Some(
+                        anyhow::anyhow!(error_text.clone())
+                            .context("failed to stop replay buffer pipeline"),
+                    );
+                }
+                debug!(error = %error_text, "failed to stop replay buffer pipeline after buffer error");
+            }
+            if let Err(error) = result {
+                stop_error = Some(error);
+            }
+        }
+        if let Some(session) = self.portal_session.take() {
+            if let Err(error) = session.close().await {
+                debug!(%error, "failed to close portal session after buffer error");
+            }
+        }
+        remove_buffer_temp_dir(&self.temp_dir);
+        if let Some(error) = stop_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn build_runtime(
+        config: &ReplayBufferConfig,
+        keep_segments: usize,
+    ) -> anyhow::Result<ReplayBufferRuntime> {
+        let temp_dir = std::env::temp_dir()
+            .join("wt-clipper-buffer")
+            .join(format!("session-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir)
+            .with_context(|| format!("failed to create buffer directory {}", temp_dir.display()))?;
+
         let audio_source = resolve_system_audio_source();
         if let Some(audio_source) = &audio_source {
             info!(device = %audio_source.device, "replay buffer system audio target");
@@ -157,15 +348,8 @@ impl ReplayBufferHandle {
             info!("replay buffer running without audio");
         }
 
-        let temp_dir = std::env::temp_dir()
-            .join("wt-clipper-buffer")
-            .join(format!("session-{}", Uuid::new_v4()));
-        fs::create_dir_all(&temp_dir)
-            .with_context(|| format!("failed to create buffer directory {}", temp_dir.display()))?;
-
-        let keep_segments = segments_to_keep(config.buffer_seconds, config.segment_seconds);
-        let mut portal_session = None;
         let backend = choose_backend(&std::env::var("XDG_SESSION_TYPE").unwrap_or_default());
+        let mut portal_session = None;
         let source = match backend {
             CaptureBackend::X11 => {
                 let window = resolve_x11_window_id(config.source)?;
@@ -217,80 +401,135 @@ impl ReplayBufferHandle {
             .set_state(gst::State::Playing)
             .context("failed to start replay buffer pipeline")?;
 
-        Ok(Self {
-            config,
+        Ok(ReplayBufferRuntime {
             temp_dir,
-            keep_segments,
             pipeline,
             portal_session,
         })
     }
 
-    pub async fn save_replay(&self, context: ClipContext) -> anyhow::Result<SaveReplayOutcome> {
-        let temp_dir = self.temp_dir.clone();
-        let keep_segments = self.keep_segments;
-        let output_dir = self.config.output_dir.clone();
-        let keep_saved_segments = self.config.keep_segments;
-        tokio::task::spawn_blocking(move || {
-            save_replay_clip(
-                &temp_dir,
-                keep_segments,
-                output_dir,
-                keep_saved_segments,
-                context,
-            )
-        })
-        .await?
-    }
-
-    pub async fn freeze_replay_segments(
-        &self,
-        context: ClipContext,
-        destination_dir: PathBuf,
-    ) -> anyhow::Result<FreezeReplayOutcome> {
-        let temp_dir = self.temp_dir.clone();
-        let keep_segments = self.keep_segments;
-        tokio::task::spawn_blocking(move || {
-            freeze_replay_segments(&temp_dir, keep_segments, context, &destination_dir)
-        })
-        .await?
-    }
-
-    pub fn prune(&self) -> anyhow::Result<()> {
-        prune_old_segments(&self.temp_dir, self.keep_segments)?;
-        check_pipeline_bus(&self.pipeline)
-    }
-
-    pub fn temp_dir(&self) -> &std::path::Path {
-        &self.temp_dir
-    }
-
-    pub fn output_dir(&self) -> Option<&std::path::Path> {
-        self.config.output_dir.as_deref()
-    }
-
-    pub async fn stop(self) -> anyhow::Result<()> {
-        info!("sending EOS to replay buffer pipeline");
-        self.pipeline.send_event(gst::event::Eos::new());
-        let result = wait_for_eos_or_error(&self.pipeline);
-        if let Err(error) = self.pipeline.set_state(gst::State::Null) {
-            if result.is_ok() {
-                return Err(error).context("failed to stop replay buffer pipeline");
-            }
-            debug!(%error, "failed to stop replay buffer pipeline after buffer error");
+    fn refresh_status(&mut self) -> anyhow::Result<BufferMaintenance> {
+        if self.status.health == BufferHealth::Restarting {
+            return Ok(BufferMaintenance::None);
         }
-        if let Some(session) = &self.portal_session {
-            if let Err(error) = session.close().await {
-                if result.is_ok() {
-                    return Err(error);
+
+        let now = SystemTime::now();
+        self.status.filled_secs = self
+            .started_at
+            .elapsed()
+            .as_secs_f32()
+            .min(self.config.buffer_seconds as f32);
+        self.status.total_secs = self.config.buffer_seconds as f32;
+
+        let segments = list_segments(&self.temp_dir)?;
+        let newest = segments.last().cloned();
+        let stall_threshold = buffer_stall_threshold(self.config.segment_seconds);
+        let mut maintenance = BufferMaintenance::None;
+
+        self.status.health = buffer_health_from_segments(
+            self.started_at,
+            self.config.segment_seconds,
+            now,
+            newest.as_ref(),
+        );
+
+        if let Some(segment) = newest {
+            let age = now
+                .duration_since(segment.modified)
+                .unwrap_or_else(|_| Duration::from_secs(0));
+            self.status.last_segment_path = Some(segment.path.clone());
+            self.status.last_segment_modified_at =
+                Some(DateTime::<Utc>::from(segment.modified).to_rfc3339());
+            self.status.last_segment_age_secs = Some(age.as_secs());
+            if age > stall_threshold {
+                maintenance = BufferMaintenance::Restart {
+                    reason: format!(
+                        "replay buffer stalled: last segment {} is {}s old",
+                        segment.path.display(),
+                        age.as_secs()
+                    ),
+                };
+            }
+        } else {
+            self.status.last_segment_path = None;
+            self.status.last_segment_modified_at = None;
+            self.status.last_segment_age_secs = None;
+            if self.status.health == BufferHealth::Stalled {
+                maintenance = BufferMaintenance::Restart {
+                    reason: "replay buffer stalled: no segment has been written yet".to_owned(),
+                };
+            }
+        }
+
+        if let Some(pipeline_issue) = self.poll_pipeline_bus()? {
+            self.status.health = BufferHealth::Error;
+            self.status.last_gstreamer_error = Some(pipeline_issue.clone());
+            maintenance = BufferMaintenance::Restart {
+                reason: pipeline_issue,
+            };
+        } else if self.status.health == BufferHealth::Healthy {
+            self.status.last_gstreamer_error = None;
+        }
+
+        Ok(maintenance)
+    }
+
+    fn poll_pipeline_bus(&mut self) -> anyhow::Result<Option<String>> {
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            anyhow::bail!("replay buffer pipeline is not running");
+        };
+        let Some(bus) = pipeline.bus() else {
+            return Ok(None);
+        };
+
+        while let Some(message) = bus.timed_pop(gst::ClockTime::ZERO) {
+            use gst::MessageView;
+            match message.view() {
+                MessageView::Error(error) => {
+                    let source = error.src().map(|src| src.path_string());
+                    let message = error.error().to_string();
+                    let debug_msg = error.debug().map(|debug| debug.to_string());
+                    error!(
+                        source = ?source,
+                        error = %message,
+                        debug = ?debug_msg,
+                        "[BUFFER_PIPELINE] GStreamer error"
+                    );
+                    return Ok(Some(format!(
+                        "GStreamer error from {:?}: {} ({:?})",
+                        source, message, debug_msg
+                    )));
                 }
-                debug!(%error, "failed to close portal session after buffer error");
+                MessageView::Warning(warning) => {
+                    let source = warning.src().map(|src| src.path_string());
+                    let message = warning.error().to_string();
+                    let debug_msg = warning.debug().map(|debug| debug.to_string());
+                    warn!(
+                        source = ?source,
+                        error = %message,
+                        debug = ?debug_msg,
+                        "[BUFFER_PIPELINE] GStreamer warning"
+                    );
+                    if gstreamer_warning_is_fatal(&message, debug_msg.as_deref()) {
+                        return Ok(Some(format!(
+                            "GStreamer warning from {:?}: {} ({:?})",
+                            source, message, debug_msg
+                        )));
+                    }
+                }
+                MessageView::Eos(_) => {
+                    return Ok(Some("replay buffer pipeline ended unexpectedly".to_owned()));
+                }
+                _ => {}
             }
         }
-        if let Err(error) = fs::remove_dir_all(&self.temp_dir) {
-            debug!(%error, path = %self.temp_dir.display(), "failed to remove temporary buffer directory");
-        }
-        result
+
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    fn should_restart_for_health(health: BufferHealth) -> bool {
+        matches!(health, BufferHealth::Stalled | BufferHealth::Error)
     }
 
     pub fn manual_clip_context(&self) -> ClipContext {
@@ -312,6 +551,57 @@ impl ReplayBufferHandle {
     }
 }
 
+fn buffer_stall_threshold(segment_seconds: u64) -> Duration {
+    Duration::from_secs(segment_seconds.saturating_mul(3).max(10))
+}
+
+fn buffer_health_from_segments(
+    started_at: Instant,
+    segment_seconds: u64,
+    now: SystemTime,
+    newest: Option<&ReplaySegment>,
+) -> BufferHealth {
+    let stall_threshold = buffer_stall_threshold(segment_seconds);
+    match newest {
+        Some(segment) => {
+            let age = now
+                .duration_since(segment.modified)
+                .unwrap_or_else(|_| Duration::from_secs(0));
+            if age > stall_threshold {
+                BufferHealth::Stalled
+            } else {
+                BufferHealth::Healthy
+            }
+        }
+        None => {
+            if started_at.elapsed() > stall_threshold {
+                BufferHealth::Stalled
+            } else {
+                BufferHealth::Starting
+            }
+        }
+    }
+}
+
+fn remove_buffer_temp_dir(path: &Path) {
+    if let Err(error) = fs::remove_dir_all(path) {
+        debug!(%error, path = %path.display(), "failed to remove temporary buffer directory");
+    }
+}
+
+fn buffer_health_message(status: &BufferStatus) -> String {
+    match status.health {
+        BufferHealth::Healthy => format!(
+            "Buffer {:.0}%",
+            (status.filled_secs / status.total_secs.max(1.0) * 100.0).clamp(0.0, 100.0)
+        ),
+        BufferHealth::Starting => "Buffer starting".to_owned(),
+        BufferHealth::Stalled => "Buffer stalled".to_owned(),
+        BufferHealth::Error => "Buffer error".to_owned(),
+        BufferHealth::Restarting => "Buffer restarting".to_owned(),
+    }
+}
+
 pub async fn save_frozen_replay(
     segment_dir: PathBuf,
     output_dir: Option<PathBuf>,
@@ -329,7 +619,7 @@ pub async fn run_replay_buffer(config: ReplayBufferConfig) -> anyhow::Result<()>
     run_buffer_loop(handle).await
 }
 
-async fn run_buffer_loop(handle: ReplayBufferHandle) -> anyhow::Result<()> {
+async fn run_buffer_loop(mut handle: ReplayBufferHandle) -> anyhow::Result<()> {
     println!("Replay buffer active: {}s", handle.config.buffer_seconds);
     println!("Video target: {}", handle.config.quality.log_summary());
     println!("Press Enter to save a replay clip.");
@@ -363,7 +653,13 @@ async fn run_buffer_loop(handle: ReplayBufferHandle) -> anyhow::Result<()> {
                 }
             }
             _ = cleanup.tick() => {
-                handle.prune()?;
+                if let Some(reason) = handle.prune()? {
+                    warn!(reason = %reason, "replay buffer maintenance requested restart");
+                    let reason = handle.begin_restart(reason);
+                    let status = handle.status();
+                    println!("[BUFFER] {}", buffer_health_message(&status));
+                    handle.restart(reason).await?;
+                }
             }
         }
     }
@@ -1195,6 +1491,7 @@ pub fn print_saved_replay(replay: &SavedReplay) {
     }
 }
 
+#[allow(dead_code)]
 fn check_pipeline_bus(pipeline: &gst::Pipeline) -> anyhow::Result<()> {
     let Some(bus) = pipeline.bus() else {
         return Ok(());
@@ -1291,8 +1588,17 @@ pub(crate) fn buffer_pipeline_description(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::time::{Duration, Instant, SystemTime};
 
     use super::*;
+
+    fn segment_at(index: u64, modified: SystemTime) -> ReplaySegment {
+        ReplaySegment {
+            index,
+            path: Path::new(&format!("segment-{index:06}.webm")).to_path_buf(),
+            modified,
+        }
+    }
 
     #[test]
     fn builds_splitmux_pipeline() {
@@ -1376,6 +1682,66 @@ mod tests {
         assert!(pipeline.contains("splitmuxsink name=muxer"));
         assert!(pipeline.contains("pulsesrc device=\"alsa_output.test.monitor\""));
         assert!(pipeline.contains("opusenc bitrate=128000"));
+    }
+
+    #[test]
+    fn buffer_healthy_when_segments_advance() {
+        let now = SystemTime::now();
+        let health =
+            buffer_health_from_segments(Instant::now(), 2, now, Some(&segment_at(12, now)));
+
+        assert_eq!(health, BufferHealth::Healthy);
+    }
+
+    #[test]
+    fn buffer_stalled_when_no_segment_written() {
+        let health = buffer_health_from_segments(
+            Instant::now() - Duration::from_secs(11),
+            2,
+            SystemTime::now(),
+            None,
+        );
+
+        assert_eq!(health, BufferHealth::Stalled);
+    }
+
+    #[test]
+    fn splitmuxsink_warning_marks_buffer_error() {
+        assert!(gstreamer_warning_is_fatal(
+            "Could not add sink_39 element - splitmuxsink will not work",
+            Some("splitmuxsink will not work")
+        ));
+    }
+
+    #[test]
+    fn stalled_buffer_triggers_restart() {
+        assert!(ReplayBufferHandle::should_restart_for_health(
+            BufferHealth::Stalled
+        ));
+        assert!(ReplayBufferHandle::should_restart_for_health(
+            BufferHealth::Error
+        ));
+        assert!(!ReplayBufferHandle::should_restart_for_health(
+            BufferHealth::Healthy
+        ));
+    }
+
+    #[test]
+    fn restart_does_not_delete_pending_exports() {
+        let base =
+            std::env::temp_dir().join(format!("wt-clipper-buffer-test-{}", std::process::id()));
+        let buffer_dir = base.join("buffer");
+        let pending_dir = base.join("pending");
+        fs::create_dir_all(&buffer_dir).unwrap();
+        fs::create_dir_all(&pending_dir).unwrap();
+        fs::write(pending_dir.join("export.json"), b"pending").unwrap();
+
+        remove_buffer_temp_dir(&buffer_dir);
+
+        assert!(!buffer_dir.exists());
+        assert!(pending_dir.join("export.json").exists());
+
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

@@ -3,6 +3,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { AnimatePresence, motion } from "framer-motion";
 import {
+  AlertTriangle,
   Download,
   Film,
   FolderOpen,
@@ -23,6 +24,7 @@ import type {
   ClipMediaInfo,
   EditedClipResult,
   EditorExportProgressPayload,
+  SaveMode,
   SocialLayout,
 } from "../types";
 import { EditorExportProgressModal } from "./EditorExportProgressModal";
@@ -70,6 +72,8 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
   const [title, setTitle] = useState(defaultEditorTitle(clip));
   const [subtitle, setSubtitle] = useState("War Thunder");
   const [quality, setQuality] = useState<QualityPreset>("standard");
+  const [saveMode, setSaveMode] = useState<SaveMode>("create_copy");
+  const [confirmReplaceOpen, setConfirmReplaceOpen] = useState(false);
   const [openFolderAfterExport, setOpenFolderAfterExport] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [progress, setProgress] = useState<EditorExportProgressPayload | null>(null);
@@ -90,6 +94,8 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
     setStartSeconds(0);
     setEndSeconds(Math.max(MIN_TRIM_GAP_SECONDS, clip.durationSeconds));
     setTitle(defaultEditorTitle(clip));
+    setSaveMode("create_copy");
+    setConfirmReplaceOpen(false);
   }, [clip]);
 
   useEffect(() => {
@@ -218,10 +224,22 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
     );
   }
 
+  function requestExport() {
+    if (!canExport) {
+      return;
+    }
+    if (saveMode === "replace_original") {
+      setConfirmReplaceOpen(true);
+      return;
+    }
+    void exportClip();
+  }
+
   async function exportClip() {
     if (!canExport) {
       return;
     }
+    setConfirmReplaceOpen(false);
     setExporting(true);
     setResult(null);
     setProgress({
@@ -241,6 +259,7 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
       subtitle,
       watermark,
       quality,
+      saveMode,
     });
     try {
       const nextResult = await invoke<EditedClipResult>("export_edited_clip", { request });
@@ -249,7 +268,7 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
         active: false,
         step: "done",
         progress: 100,
-        message: "Export terminé",
+        message: nextResult.replacedOriginal ? "Clip original remplacé" : "Export terminé",
         outputPath: nextResult.outputPath,
       });
       await onExportComplete();
@@ -452,6 +471,56 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
                 </div>
               </section>
 
+              <section className="editor-panel">
+                <div className="editor-panel-heading">
+                  <div>
+                    <div className="editor-kicker">Sauvegarde</div>
+                    <h3>Mode de sortie</h3>
+                  </div>
+                  <FolderOpen className="h-5 w-5 text-ember" />
+                </div>
+                <div className="editor-save-mode-list">
+                  <label className={saveMode === "create_copy" ? "active" : ""}>
+                    <input
+                      checked={saveMode === "create_copy"}
+                      disabled={exporting}
+                      name="editor-save-mode"
+                      onChange={() => setSaveMode("create_copy")}
+                      type="radio"
+                    />
+                    <span>
+                      <strong>Créer une copie</strong>
+                      <small>
+                        Le clip original reste intact. La nouvelle vidéo sera créée dans Edited/ ou Social/.
+                      </small>
+                    </span>
+                  </label>
+                  <label className={saveMode === "replace_original" ? "active destructive" : "destructive"}>
+                    <input
+                      checked={saveMode === "replace_original"}
+                      disabled={exporting}
+                      name="editor-save-mode"
+                      onChange={() => setSaveMode("replace_original")}
+                      type="radio"
+                    />
+                    <span>
+                      <strong>Remplacer l’original</strong>
+                      <small>
+                        Le clip original sera remplacé. Une sauvegarde sera créée automatiquement.
+                      </small>
+                    </span>
+                  </label>
+                </div>
+                {saveMode === "replace_original" && (
+                  <div className="editor-warning">
+                    <AlertTriangle className="h-4 w-4" />
+                    <span>
+                      Attention : cette action remplacera le clip original. Une sauvegarde sera créée dans Backups/.
+                    </span>
+                  </div>
+                )}
+              </section>
+
               <SocialExportPreview
                 layout={socialLayout}
                 mode={mode}
@@ -486,14 +555,60 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
               <button
                 className="primary-action w-fit px-5"
                 disabled={!canExport}
-                onClick={() => void exportClip()}
+                onClick={requestExport}
               >
                 <Download className="h-4 w-4" />
-                {exporting ? "Export en cours..." : `Exporter ${formatClipDuration(exportDuration)}`}
+                {exporting
+                  ? "Export en cours..."
+                  : saveMode === "replace_original"
+                    ? `Remplacer ${formatClipDuration(exportDuration)}`
+                    : `Exporter ${formatClipDuration(exportDuration)}`}
               </button>
             </div>
           </footer>
         </motion.section>
+        {confirmReplaceOpen && (
+          <motion.div
+            animate={{ opacity: 1 }}
+            className="editor-confirm-layer"
+            exit={{ opacity: 0 }}
+            initial={{ opacity: 0 }}
+          >
+            <motion.section
+              animate={{ scale: 1, y: 0 }}
+              className="editor-confirm-card"
+              exit={{ scale: 0.98, y: 12 }}
+              initial={{ scale: 0.98, y: 12 }}
+            >
+              <div className="editor-confirm-icon">
+                <AlertTriangle className="h-5 w-5" />
+              </div>
+              <div>
+                <div className="editor-kicker">Confirmation</div>
+                <h3>Remplacer l’original ?</h3>
+                <p>
+                  Voulez-vous vraiment remplacer ce clip ? Le fichier original sera sauvegardé avant modification.
+                </p>
+              </div>
+              <div className="editor-confirm-actions">
+                <button
+                  className="ghost-button"
+                  disabled={exporting}
+                  onClick={() => setConfirmReplaceOpen(false)}
+                >
+                  Annuler
+                </button>
+                <button
+                  className="primary-action w-fit px-5"
+                  disabled={exporting}
+                  onClick={() => void exportClip()}
+                >
+                  Remplacer l’original
+                </button>
+              </div>
+            </motion.section>
+          </motion.div>
+        )}
         <EditorExportProgressModal
           progress={progress}
           result={result}
@@ -515,6 +630,7 @@ function buildEditRequest({
   subtitle,
   watermark,
   quality,
+  saveMode,
 }: {
   clip: ClipInfo;
   mode: ClipEditorMode;
@@ -526,6 +642,7 @@ function buildEditRequest({
   subtitle: string;
   watermark: boolean;
   quality: QualityPreset;
+  saveMode: SaveMode;
 }): ClipEditRequest {
   const social = mode === "social_vertical";
   return {
@@ -541,6 +658,8 @@ function buildEditRequest({
     watermark: social && watermark,
     fps: 30,
     bitrateKbps: quality === "high" ? 12_000 : 8_000,
+    saveMode,
+    backupOriginal: true,
   };
 }
 

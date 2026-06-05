@@ -21,6 +21,8 @@ export function EditorExportProgressModal({
   const finished = !progress.active || progress.step === "done" || progress.step === "failed";
   const failed = progress.step === "failed";
   const outputPath = result?.outputPath ?? progress.outputPath;
+  const replacedOriginal = result?.replacedOriginal === true;
+  const backupPath = result?.backupPath;
 
   function close() {
     if (!finished) {
@@ -49,7 +51,13 @@ export function EditorExportProgressModal({
                 {finished ? "Export éditeur" : "Export en cours"}
               </div>
               <h2 className="mt-1 text-xl font-black text-white">
-                {failed ? "Export impossible" : finished ? "Export terminé" : "Création du clip"}
+                {failed
+                  ? "Export impossible"
+                  : finished && replacedOriginal
+                    ? "Clip original remplacé"
+                    : finished
+                      ? "Export terminé"
+                      : "Création du clip"}
               </h2>
             </div>
             <button className="icon-button" disabled={!finished} onClick={close} title="Fermer">
@@ -67,6 +75,11 @@ export function EditorExportProgressModal({
             )}
             <div className="min-w-0">
               <div className="text-sm font-bold text-white">{progress.message}</div>
+              {finished && replacedOriginal && (
+                <div className="mt-1 text-sm text-zinc-300">
+                  Une sauvegarde a été créée dans Backups/.
+                </div>
+              )}
               <div className="mt-1 text-xs uppercase text-zinc-500">{progress.step}</div>
             </div>
           </div>
@@ -88,25 +101,42 @@ export function EditorExportProgressModal({
             <p className="mt-4 break-words text-xs text-zinc-500">{outputPath}</p>
           )}
 
+          {finished && replacedOriginal && backupPath && (
+            <p className="mt-2 break-words text-xs text-[#ffd0c3]">
+              Sauvegarde : {backupPath}
+            </p>
+          )}
+
           {finished && (
             <div className="mt-5 flex justify-end gap-2">
               {outputPath && (
                 <>
-                  <button
-                    className="ghost-button"
-                    onClick={() => void invoke("open_parent_folder", { path: outputPath })}
-                  >
-                    <FolderOpen className="h-4 w-4" />
-                    Ouvrir le dossier
-                  </button>
+                  {!replacedOriginal && (
+                    <button
+                      className="ghost-button"
+                      onClick={() => void invoke("open_parent_folder", { path: outputPath })}
+                    >
+                      <FolderOpen className="h-4 w-4" />
+                      Ouvrir le dossier
+                    </button>
+                  )}
                   <button
                     className="ghost-button"
                     onClick={() => void invoke("open_path", { path: outputPath })}
                   >
                     <FileVideo className="h-4 w-4" />
-                    Ouvrir le fichier
+                    {replacedOriginal ? "Ouvrir clip" : "Ouvrir le fichier"}
                   </button>
                 </>
+              )}
+              {replacedOriginal && backupPath && (
+                <button
+                  className="ghost-button"
+                  onClick={() => void invoke("open_path", { path: backupPath })}
+                >
+                  <FolderOpen className="h-4 w-4" />
+                  Ouvrir sauvegarde
+                </button>
               )}
               <button className="primary-action w-fit px-5" onClick={close}>
                 Fermer

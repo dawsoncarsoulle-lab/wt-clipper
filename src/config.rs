@@ -12,6 +12,8 @@ use crate::{capture::quality::QualityPreset, cli::CaptureSource};
 pub struct AppConfig {
     #[serde(default)]
     pub clip: ClipConfig,
+    #[serde(default)]
+    pub capture: CaptureConfig,
     #[serde(default, alias = "warthunder")]
     pub war_thunder: WarThunderConfig,
     #[serde(default)]
@@ -46,6 +48,123 @@ pub struct ClipConfig {
     pub keep_segments: bool,
     #[serde(default)]
     pub export_mode: ClipExportMode,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CaptureConfig {
+    #[serde(default)]
+    pub backend: CaptureBackend,
+    #[serde(default = "default_capture_target")]
+    pub target: String,
+    #[serde(default, alias = "gpu_screen_recorder_mode", rename = "mode")]
+    pub gpu_screen_recorder_mode: GpuScreenRecorderMode,
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+    #[serde(default = "default_capture_replay_seconds")]
+    pub replay_seconds: u64,
+    #[serde(default)]
+    pub container: GsrContainer,
+    #[serde(default)]
+    pub codec: GsrCodec,
+    #[serde(default)]
+    pub encoder: GsrEncoder,
+    #[serde(default)]
+    pub quality: GsrQuality,
+    #[serde(default = "default_gsr_output_dir_string")]
+    pub output_dir: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureBackend {
+    Gstreamer,
+    #[default]
+    GpuScreenRecorder,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuScreenRecorderMode {
+    Auto,
+    Native,
+    #[default]
+    Flatpak,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GsrContainer {
+    #[default]
+    Mp4,
+    Mkv,
+}
+
+impl GsrContainer {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::Mkv => "mkv",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        self.as_arg()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GsrCodec {
+    #[default]
+    H264,
+    Hevc,
+    Av1,
+}
+
+impl GsrCodec {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+            Self::Av1 => "av1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GsrEncoder {
+    #[default]
+    Gpu,
+    Cpu,
+}
+
+impl GsrEncoder {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Gpu => "gpu",
+            Self::Cpu => "cpu",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GsrQuality {
+    #[default]
+    Medium,
+    High,
+    VeryHigh,
+}
+
+impl GsrQuality {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::VeryHigh => "very_high",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -118,6 +237,23 @@ impl Default for ClipConfig {
     }
 }
 
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self {
+            backend: CaptureBackend::GpuScreenRecorder,
+            target: default_capture_target(),
+            gpu_screen_recorder_mode: GpuScreenRecorderMode::Flatpak,
+            fps: default_fps(),
+            replay_seconds: default_capture_replay_seconds(),
+            container: GsrContainer::Mp4,
+            codec: GsrCodec::H264,
+            encoder: GsrEncoder::Gpu,
+            quality: GsrQuality::Medium,
+            output_dir: default_gsr_output_dir_string(),
+        }
+    }
+}
+
 impl Default for WarThunderConfig {
     fn default() -> Self {
         Self {
@@ -171,6 +307,7 @@ impl AppConfig {
         let content = fs::read_to_string(&path)?;
         let mut config: Self = toml::from_str(&content)?;
         config.clip.output_dir = expand_tilde_to_string(&config.clip.output_dir)?;
+        config.capture.output_dir = expand_tilde_to_string(&config.capture.output_dir)?;
         config.pending_exports.pending_export_dir =
             expand_tilde_to_string(&config.pending_exports.pending_export_dir)?;
         if config
@@ -201,6 +338,12 @@ impl AppConfig {
 }
 
 impl ClipConfig {
+    pub fn output_dir_path(&self) -> anyhow::Result<PathBuf> {
+        expand_tilde(&self.output_dir)
+    }
+}
+
+impl CaptureConfig {
     pub fn output_dir_path(&self) -> anyhow::Result<PathBuf> {
         expand_tilde(&self.output_dir)
     }
@@ -261,6 +404,18 @@ source = "window"
 keep_segments = false
 export_mode = "deferred"
 
+[capture]
+backend = "gpu_screen_recorder"
+target = "eDP"
+mode = "flatpak"
+fps = 30
+replay_seconds = 25
+container = "mp4"
+codec = "h264"
+encoder = "gpu"
+quality = "medium"
+output_dir = "~/Videos/WarThunder Clips/GSR"
+
 [war_thunder]
 player_name = ""
 poll_interval_ms = 300
@@ -310,6 +465,18 @@ fn default_multi_kill_window_seconds() -> u64 {
 
 fn default_output_dir_string() -> String {
     "~/Videos/WarThunder Clips".to_owned()
+}
+
+fn default_gsr_output_dir_string() -> String {
+    "~/Videos/WarThunder Clips/GSR".to_owned()
+}
+
+fn default_capture_target() -> String {
+    "eDP".to_owned()
+}
+
+fn default_capture_replay_seconds() -> u64 {
+    25
 }
 
 fn default_pending_export_dir_string() -> String {
@@ -379,6 +546,12 @@ mod tests {
         assert_eq!(config.clip.seconds, 20);
         assert_eq!(config.clip.video_bitrate_kbps, 10_000);
         assert_eq!(config.clip.multi_kill_window_seconds, 8);
+        assert_eq!(config.capture.backend, CaptureBackend::GpuScreenRecorder);
+        assert_eq!(
+            config.capture.gpu_screen_recorder_mode,
+            GpuScreenRecorderMode::Flatpak
+        );
+        assert_eq!(config.capture.replay_seconds, 25);
         assert_eq!(config.war_thunder.poll_interval_ms, 300);
         assert!(config.triggers.target_destroyed);
         assert!(config.triggers.base_destroyed);

@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod buffer;
 pub mod concat;
+pub mod gpu_screen_recorder;
 pub mod output;
 pub mod portal;
 pub mod quality;

@@ -41,7 +41,17 @@ import {
   mapExportProgressPayload,
   shouldShowExportButton,
 } from "./exportLogic";
-import type { AppConfig, ClipInfo, ClipReason, DoctorReport, RuntimeStatus } from "./types";
+import type {
+  AppConfig,
+  BufferHealth,
+  BufferStatus,
+  CaptureBackend,
+  ClipInfo,
+  ClipReason,
+  DoctorReport,
+  GsrHealth,
+  RuntimeStatus,
+} from "./types";
 import type {
   ClipStatus,
   ClipStatusChangedPayload,
@@ -80,6 +90,57 @@ const processingReasonLabel: Record<ClipReason, string> = {
 
 function formatExportMode(mode: AppConfig["clip"]["export_mode"]) {
   return mode === "deferred" ? "Différé" : "Instantané";
+}
+
+function bufferHealthLabel(health: BufferHealth) {
+  switch (health) {
+    case "healthy":
+      return "Healthy";
+    case "starting":
+      return "Démarrage buffer...";
+    case "stalled":
+      return "Buffer bloqué";
+    case "error":
+      return "Erreur buffer";
+    case "restarting":
+      return "Redémarrage buffer...";
+  }
+}
+
+function captureBackendLabel(backend?: CaptureBackend | null) {
+  return backend === "gpu_screen_recorder" ? "GPU Replay" : "GStreamer";
+}
+
+function gsrHealthLabel(health?: GsrHealth | null) {
+  switch (health) {
+    case "running":
+      return "Replay GPU armé";
+    case "saving_replay":
+      return "Sauvegarde GPU...";
+    case "starting":
+      return "Démarrage GPU Replay...";
+    case "stopped":
+      return "Replay GPU arrêté";
+    case "not_available":
+      return "GPU Replay indisponible";
+    case "error":
+      return "Erreur GPU Replay";
+    default:
+      return "Replay GPU arrêté";
+  }
+}
+
+function activeCaptureBackend(config?: AppConfig | null, runtimeStatus?: RuntimeStatus | null) {
+  return runtimeStatus?.activeCaptureBackend ?? config?.capture.backend ?? "gstreamer";
+}
+
+function replayStatusLabel(config?: AppConfig | null, runtimeStatus?: RuntimeStatus | null, buffer?: BufferStatus) {
+  if (activeCaptureBackend(config, runtimeStatus) === "gpu_screen_recorder") {
+    return gsrHealthLabel(runtimeStatus?.gsrHealth);
+  }
+  if (!buffer) return "Buffer starting";
+  const progress = Math.round((buffer.filledSecs / Math.max(1, buffer.totalSecs)) * 100);
+  return buffer.health === "healthy" ? `Buffer ${Math.min(100, progress)}%` : bufferHealthLabel(buffer.health);
 }
 
 export function App() {
@@ -189,9 +250,9 @@ export function App() {
         console.info("[FRONTEND] received clip-failed", event.payload);
         store.showToast(event.payload.message);
       }),
-      listen<{ filledSecs: number; totalSecs: number }>("buffer-progress", (event) => {
+      listen<BufferStatus>("buffer-progress", (event) => {
         console.info("[FRONTEND] received buffer-progress", event.payload);
-        store.setBuffer(event.payload.filledSecs, event.payload.totalSecs);
+        store.setBuffer(event.payload);
       }),
       listen<{ usedBytes: number }>("disk-usage", (event) =>
         store.setDiskUsedBytes(event.payload.usedBytes),
@@ -244,7 +305,16 @@ export function App() {
   function applyRuntimeStatus(status: RuntimeStatus) {
     store.setRuntimeStatus(status);
     store.setWtConnected(status.wtConnected);
-    store.setBuffer(status.bufferFilledSecs, status.bufferTotalSecs);
+    store.setBuffer({
+      health: status.bufferHealth,
+      filledSecs: status.bufferFilledSecs,
+      totalSecs: status.bufferTotalSecs,
+      lastSegmentPath: status.bufferLastSegmentPath ?? null,
+      lastSegmentModifiedAt: status.bufferLastSegmentModifiedAt ?? null,
+      lastSegmentAgeSecs: status.bufferLastSegmentAgeSecs ?? null,
+      restartCount: status.bufferRestartCount,
+      lastGstreamerError: status.lastGstreamerError ?? null,
+    });
     const progress = mapExportProgressPayload(status.exportProgress);
     if (progress) {
       const current = useAppStore.getState();
@@ -359,8 +429,13 @@ function Sidebar() {
 }
 
 function Topbar() {
-  const { wtConnected, bufferFilledSecs, bufferTotalSecs } = useAppStore();
-  const progress = Math.round((bufferFilledSecs / Math.max(1, bufferTotalSecs)) * 100);
+  const { wtConnected, bufferFilledSecs, bufferTotalSecs, bufferHealth, config, runtimeStatus } = useAppStore();
+  const bufferLabel = replayStatusLabel(config, runtimeStatus, {
+    health: bufferHealth,
+    filledSecs: bufferFilledSecs,
+    totalSecs: bufferTotalSecs,
+    restartCount: runtimeStatus?.bufferRestartCount ?? 0,
+  });
   return (
     <header className="z-10 flex h-[66px] shrink-0 items-center justify-between border-b border-line bg-[#0b0e14]/72 px-7 backdrop-blur">
       <div className="flex items-center gap-3">
@@ -368,7 +443,7 @@ function Topbar() {
         <div className="h-4 w-px bg-white/10" />
         <div className="flex items-center gap-2 text-sm text-zinc-400">
           <Gauge className="h-4 w-4 text-amberline" />
-          Buffer {progress}%
+          {bufferLabel}
         </div>
       </div>
       <div className="flex items-center gap-2 text-sm text-zinc-500">
@@ -397,6 +472,13 @@ function StatusPill({ connected }: { connected: boolean }) {
 function Dashboard() {
   const state = useAppStore();
   const progress = Math.min(100, (state.bufferFilledSecs / Math.max(1, state.bufferTotalSecs)) * 100);
+  const backend = activeCaptureBackend(state.config, state.runtimeStatus);
+  const bufferLabel = replayStatusLabel(state.config, state.runtimeStatus, {
+    health: state.bufferHealth,
+    filledSecs: state.bufferFilledSecs,
+    totalSecs: state.bufferTotalSecs,
+    restartCount: state.bufferRestartCount,
+  });
   return (
     <div className="space-y-6">
       <section className="hero-panel">
@@ -406,10 +488,15 @@ function Dashboard() {
             <span className="rounded-full border border-line bg-white/5 px-3 py-1.5 text-sm text-zinc-400">
               {state.config?.clip.quality.toUpperCase()} · {state.config?.clip.fps} FPS
             </span>
+            <span className="rounded-full border border-line bg-white/5 px-3 py-1.5 text-sm text-zinc-400">
+              {bufferLabel}
+            </span>
           </div>
-          <h1 className="text-4xl font-black tracking-normal text-white">Replay buffer armé</h1>
+          <h1 className="text-4xl font-black tracking-normal text-white">
+            {backend === "gpu_screen_recorder" ? "Replay GPU armé" : "Replay buffer armé"}
+          </h1>
           <p className="mt-3 max-w-xl text-sm leading-6 text-zinc-400">
-            Capture automatique des kills personnels, génération de clips WebM et suivi temps réel
+            Capture automatique des kills personnels, génération de clips et suivi temps réel
             du serveur War Thunder local.
           </p>
           <button className="primary-action mt-7 w-fit px-5" onClick={() => void invoke("save_manual_clip")}>
@@ -428,13 +515,17 @@ function Dashboard() {
               strokeWidth="10"
               fill="none"
               strokeLinecap="round"
-              strokeDasharray={`${progress * 3.015} 301.5`}
+              strokeDasharray={`${(backend === "gpu_screen_recorder" ? 100 : progress) * 3.015} 301.5`}
               transform="rotate(-90 60 60)"
             />
           </svg>
           <div className="absolute text-center">
-            <div className="text-3xl font-black text-white">{Math.round(progress)}%</div>
-            <div className="text-xs uppercase text-zinc-500">buffer</div>
+            <div className="text-3xl font-black text-white">
+              {backend === "gpu_screen_recorder" ? "GPU" : `${Math.round(progress)}%`}
+            </div>
+            <div className="text-xs uppercase text-zinc-500">
+              {backend === "gpu_screen_recorder" ? "replay" : "buffer"}
+            </div>
           </div>
         </div>
       </section>
@@ -446,7 +537,7 @@ function Dashboard() {
         <Metric
           icon={Download}
           label="Mode actif"
-          value={formatExportMode(state.runtimeStatus?.activeExportMode ?? state.config?.clip.export_mode ?? "deferred")}
+          value={captureBackendLabel(backend)}
         />
       </div>
       <section>
@@ -663,6 +754,7 @@ function Metric({ icon: Icon, label, value }: { icon: typeof Zap; label: string;
 function Clips() {
   const {
     activeView,
+    config,
     clips,
     processingClips,
     isExporting,
@@ -671,6 +763,7 @@ function Clips() {
     setIsExporting,
     setPendingExportClips,
     showToast,
+    runtimeStatus,
   } = useAppStore();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | ClipReason>("all");
@@ -714,7 +807,8 @@ function Clips() {
   const waitingPostEventCount = processingClips.filter((clip) => clip.status === "waiting_post_event").length;
   const freezingSegmentsCount = processingClips.filter((clip) => clip.status === "freezing_segments").length;
   const pendingExportReadyCount = exportableCount(processingClips);
-  const showExportButton = shouldShowExportButton(processingClips, isExporting);
+  const backend = activeCaptureBackend(config, runtimeStatus);
+  const showExportButton = backend !== "gpu_screen_recorder" && shouldShowExportButton(processingClips, isExporting);
 
   async function refresh() {
     const [clips, pending] = await Promise.all([
@@ -862,7 +956,7 @@ function Clips() {
           Préservation des segments pour {freezingSegmentsCount} clip{freezingSegmentsCount > 1 ? "s" : ""}...
         </div>
       )}
-      {pendingExportReadyCount > 0 && (
+      {backend !== "gpu_screen_recorder" && pendingExportReadyCount > 0 && (
         <div className="processing-banner pending-export-banner">
           {pendingExportReadyCount} clip{pendingExportReadyCount > 1 ? "s" : ""} prêt
           {pendingExportReadyCount > 1 ? "s" : ""} à exporter
@@ -1196,6 +1290,8 @@ function Configuration() {
 
   const updateClip = <K extends keyof AppConfig["clip"]>(key: K, value: AppConfig["clip"][K]) =>
     setDraft({ ...draft, clip: { ...draft.clip, [key]: value } });
+  const updateCapture = <K extends keyof AppConfig["capture"]>(key: K, value: AppConfig["capture"][K]) =>
+    setDraft({ ...draft, capture: { ...draft.capture, [key]: value } });
   const updateWt = <K extends keyof AppConfig["war_thunder"]>(
     key: K,
     value: AppConfig["war_thunder"][K],
@@ -1240,7 +1336,7 @@ function Configuration() {
           <h1 className="text-2xl font-black text-white">Configuration</h1>
           <p className="text-sm text-zinc-500">Capture, qualité, triggers et profil joueur</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           <button className="ghost-button w-fit px-5" onClick={() => void checkForUpdates()} disabled={checkingUpdate}>
             <RefreshCcw className={`h-4 w-4 ${checkingUpdate ? "animate-spin" : ""}`} />
             Vérifier les mises à jour
@@ -1263,7 +1359,7 @@ function Configuration() {
           <Cpu className="h-5 w-5 text-amberline" />
           <div>
             <div className="text-lg font-black text-white">
-              {formatExportMode(runtimeStatus?.activeExportMode ?? draft.clip.export_mode)}
+              {captureBackendLabel(runtimeStatus?.activeCaptureBackend ?? draft.capture.backend)}
             </div>
             <div className="text-xs uppercase text-zinc-500">Mode actif backend</div>
           </div>
@@ -1280,6 +1376,88 @@ function Configuration() {
         </div>
       )}
       <div className="settings-grid">
+        <Field label="Capture backend">
+          <select
+            value={draft.capture.backend}
+            onChange={(e) => updateCapture("backend", e.target.value as AppConfig["capture"]["backend"])}
+          >
+            <option value="gpu_screen_recorder">GPU Screen Recorder expérimental</option>
+            <option value="gstreamer">GStreamer legacy/fallback</option>
+          </select>
+        </Field>
+        <Field label="Target capture">
+          <select value={draft.capture.target} onChange={(e) => updateCapture("target", e.target.value)}>
+            <option value="eDP">eDP</option>
+            <option value="HDMI-A-1-0">HDMI-A-1-0</option>
+            <option value="portal">portal</option>
+            <option value="focused">focused</option>
+          </select>
+        </Field>
+        <Field label="Mode GSR">
+          <select
+            value={draft.capture.mode}
+            onChange={(e) => updateCapture("mode", e.target.value as AppConfig["capture"]["mode"])}
+          >
+            <option value="flatpak">flatpak</option>
+            <option value="native">native</option>
+            <option value="auto">auto</option>
+          </select>
+        </Field>
+        <Field label="Durée replay GSR">
+          <input
+            type="number"
+            value={draft.capture.replay_seconds}
+            onChange={(e) => updateCapture("replay_seconds", Number(e.target.value))}
+          />
+        </Field>
+        <Field label="FPS GSR">
+          <input
+            type="number"
+            value={draft.capture.fps}
+            onChange={(e) => updateCapture("fps", Number(e.target.value))}
+          />
+        </Field>
+        <Field label="Quality GSR">
+          <select
+            value={draft.capture.quality}
+            onChange={(e) => updateCapture("quality", e.target.value as AppConfig["capture"]["quality"])}
+          >
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="very_high">very_high</option>
+          </select>
+        </Field>
+        <Field label="Codec GSR">
+          <select
+            value={draft.capture.codec}
+            onChange={(e) => updateCapture("codec", e.target.value as AppConfig["capture"]["codec"])}
+          >
+            <option value="h264">h264</option>
+            <option value="hevc">hevc</option>
+            <option value="av1">av1</option>
+          </select>
+        </Field>
+        <Field label="Container GSR">
+          <select
+            value={draft.capture.container}
+            onChange={(e) => updateCapture("container", e.target.value as AppConfig["capture"]["container"])}
+          >
+            <option value="mp4">mp4</option>
+            <option value="mkv">mkv</option>
+          </select>
+        </Field>
+        <Field label="Encoder GSR">
+          <select
+            value={draft.capture.encoder}
+            onChange={(e) => updateCapture("encoder", e.target.value as AppConfig["capture"]["encoder"])}
+          >
+            <option value="gpu">gpu</option>
+            <option value="cpu">cpu</option>
+          </select>
+        </Field>
+        <Field label="Output directory GSR">
+          <input value={draft.capture.output_dir} onChange={(e) => updateCapture("output_dir", e.target.value)} />
+        </Field>
         <Field label="player_name">
           <input value={draft.war_thunder.player_name ?? ""} onChange={(e) => updateWt("player_name", e.target.value || null)} />
         </Field>
@@ -1355,7 +1533,16 @@ function Configuration() {
 }
 
 function Diagnostics() {
-  const { diagnostics, diagnosticsRunning, runtimeStatus, setDiagnostics, setDiagnosticsRunning, setRuntimeStatus } = useAppStore();
+  const {
+    diagnostics,
+    diagnosticsRunning,
+    runtimeStatus,
+    setDiagnostics,
+    setDiagnosticsRunning,
+    setRuntimeStatus,
+    showToast,
+  } = useAppStore();
+  const [gsrTestRunning, setGsrTestRunning] = useState(false);
   async function run() {
     setDiagnosticsRunning(true);
     const [report, status] = await Promise.all([
@@ -1364,6 +1551,19 @@ function Diagnostics() {
     ]);
     setDiagnostics(report);
     setRuntimeStatus(status);
+  }
+  async function testGsrSaveReplay() {
+    setGsrTestRunning(true);
+    try {
+      const path = await invoke<string>("test_gsr_save_replay");
+      showToast(`Test GSR sauvegardé: ${path}`);
+      const status = await invoke<RuntimeStatus>("get_runtime_status");
+      setRuntimeStatus(status);
+    } catch (error) {
+      showToast(`Test GSR: ${String(error)}`);
+    } finally {
+      setGsrTestRunning(false);
+    }
   }
   const counts = diagnostics?.checks.reduce(
     (acc, check) => ({ ...acc, [check.status]: acc[check.status] + 1 }),
@@ -1376,32 +1576,109 @@ function Diagnostics() {
           <h1 className="text-2xl font-black text-white">Diagnostics</h1>
           <p className="text-sm text-zinc-500">{diagnostics?.summary ?? "Analyse des dépendances locales"}</p>
         </div>
-        <button className="ghost-button" onClick={() => void run()}>
-          <RefreshCcw className={`h-4 w-4 ${diagnosticsRunning ? "animate-spin" : ""}`} />
-          Relancer
-        </button>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <button className="ghost-button" onClick={() => void run()}>
+            <RefreshCcw className={`h-4 w-4 ${diagnosticsRunning ? "animate-spin" : ""}`} />
+            Relancer
+          </button>
+          <button className="ghost-button" onClick={() => void invoke("restart_replay_buffer")}>
+            <RefreshCcw className="h-4 w-4" />
+            {runtimeStatus?.activeCaptureBackend === "gpu_screen_recorder"
+              ? "Redémarrer GPU Screen Recorder"
+              : "Redémarrer le buffer"}
+          </button>
+          <button
+            className="ghost-button"
+            disabled={gsrTestRunning}
+            onClick={() => void testGsrSaveReplay()}
+          >
+            <Play className={`h-4 w-4 ${gsrTestRunning ? "animate-pulse" : ""}`} />
+            Tester sauvegarde replay GSR
+          </button>
+        </div>
       </div>
       <div className="grid grid-cols-3 gap-4">
         <Metric icon={CheckCircle2} label="OK" value={counts?.ok ?? 0} />
         <Metric icon={AlertTriangle} label="Warn" value={counts?.warn ?? 0} />
         <Metric icon={XCircle} label="Error" value={counts?.error ?? 0} />
       </div>
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-4 gap-4">
         <Metric
           icon={Cpu}
-          label="Backend auto"
-          value={runtimeStatus?.autoClipRunning ? "Oui" : "Non"}
+          label="Backend actif"
+          value={captureBackendLabel(runtimeStatus?.activeCaptureBackend)}
         />
         <Metric
           icon={Download}
-          label="Mode export actif"
-          value={formatExportMode(runtimeStatus?.activeExportMode ?? "deferred")}
+          label="GPU Replay"
+          value={gsrHealthLabel(runtimeStatus?.gsrHealth)}
         />
         <Metric
           icon={Clock3}
-          label="Queue pending"
-          value={runtimeStatus?.pendingExportCount ?? 0}
+          label="PID GSR"
+          value={runtimeStatus?.gsrPid ?? "-"}
         />
+        <Metric
+          icon={Gauge}
+          label="Buffer health"
+          value={
+            runtimeStatus?.activeCaptureBackend === "gpu_screen_recorder"
+              ? gsrHealthLabel(runtimeStatus?.gsrHealth)
+              : bufferHealthLabel(runtimeStatus?.bufferHealth ?? "starting")
+          }
+        />
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <div className="diagnostic-row">
+          <Cpu className="h-5 w-5 text-amberline" />
+          <div className="min-w-0">
+            <div className="font-semibold text-white">GPU Screen Recorder</div>
+            <div className="break-words text-sm text-zinc-400">
+              target {runtimeStatus?.gsrTarget ?? "-"} · {runtimeStatus?.gsrFps ?? "-"} FPS · replay{" "}
+              {runtimeStatus?.gsrReplaySeconds ?? "-"}s · quality {runtimeStatus?.gsrQuality ?? "-"}
+            </div>
+            <div className="mt-1 text-xs text-zinc-500">
+              mode {runtimeStatus?.gsrMode ?? "-"} · disponible {runtimeStatus?.gsrAvailable ? "oui" : "non"}
+            </div>
+          </div>
+        </div>
+        <div className="diagnostic-row">
+          <FolderOpen className="h-5 w-5 text-amberline" />
+          <div className="min-w-0">
+            <div className="font-semibold text-white">Output GSR</div>
+            <div className="break-words text-sm text-zinc-400">{runtimeStatus?.gsrOutputDir ?? "-"}</div>
+            <div className="mt-1 break-words text-xs text-zinc-500">
+              prefix {runtimeStatus?.gsrOutputPrefix ?? "-"}
+            </div>
+          </div>
+        </div>
+        <div className="diagnostic-row">
+          <Video className="h-5 w-5 text-amberline" />
+          <div className="min-w-0">
+            <div className="font-semibold text-white">Dernier fichier GSR</div>
+            <div className="break-words text-sm text-zinc-400">{runtimeStatus?.gsrLastOutput ?? "-"}</div>
+            <div className="mt-1 text-xs text-zinc-500">redémarrages {runtimeStatus?.gsrRestartCount ?? 0}</div>
+          </div>
+        </div>
+        <div className="diagnostic-row">
+          <AlertTriangle className="h-5 w-5 text-amberline" />
+          <div className="min-w-0">
+            <div className="font-semibold text-white">Erreur GSR</div>
+            <div className="break-words text-sm text-zinc-400">{runtimeStatus?.gsrLastError ?? "Aucune erreur GSR"}</div>
+            <div className="mt-1 text-xs text-zinc-500">
+              monitors {(runtimeStatus?.gsrMonitors ?? []).join(", ") || "-"}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="diagnostic-row">
+        <Activity className="h-5 w-5 text-amberline" />
+        <div className="min-w-0">
+          <div className="font-semibold text-white">Commande lancée</div>
+          <div className="break-words font-mono text-xs text-zinc-400">
+            {runtimeStatus?.gsrCommandLine ?? "-"}
+          </div>
+        </div>
       </div>
       <div className="diagnostic-row">
         <FolderOpen className="h-5 w-5 text-amberline" />
@@ -1410,6 +1687,32 @@ function Diagnostics() {
           <div className="break-words text-sm text-zinc-400">{runtimeStatus?.pendingExportDir ?? "-"}</div>
           <div className="mt-1 text-xs text-zinc-500">
             {formatBytes(runtimeStatus?.pendingExportBytes ?? 0)}
+          </div>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <div className="diagnostic-row">
+          <Gauge className="h-5 w-5 text-amberline" />
+          <div className="min-w-0">
+            <div className="font-semibold text-white">Dernier segment</div>
+            <div className="break-words text-sm text-zinc-400">
+              {runtimeStatus?.bufferLastSegmentPath ?? "-"}
+            </div>
+            <div className="mt-1 text-xs text-zinc-500">
+              {runtimeStatus?.bufferLastSegmentAgeSecs != null
+                ? `il y a ${runtimeStatus.bufferLastSegmentAgeSecs}s`
+                : "-"}
+            </div>
+          </div>
+        </div>
+        <div className="diagnostic-row">
+          <RefreshCcw className="h-5 w-5 text-amberline" />
+          <div className="min-w-0">
+            <div className="font-semibold text-white">Redémarrages</div>
+            <div className="text-sm text-zinc-400">{runtimeStatus?.bufferRestartCount ?? 0}</div>
+            <div className="mt-1 text-xs text-zinc-500">
+              {runtimeStatus?.lastGstreamerError ?? "Aucune erreur GStreamer"}
+            </div>
           </div>
         </div>
       </div>

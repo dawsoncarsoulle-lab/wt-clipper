@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { mergePendingExportClips } from "./pendingQueueState";
 import type {
   AppConfig,
+  BufferHealth,
   ClipInfo,
   ClipStatus,
   ClipStatusChangedPayload,
@@ -10,6 +11,7 @@ import type {
   ExportProgressPayload,
   GalleryClipItem,
   PendingClipExportDto,
+  BufferStatus,
   RuntimeStatus,
 } from "./types";
 
@@ -18,6 +20,12 @@ type AppState = {
   wtConnected: boolean;
   bufferFilledSecs: number;
   bufferTotalSecs: number;
+  bufferHealth: BufferHealth;
+  bufferLastSegmentPath: string | null;
+  bufferLastSegmentModifiedAt: string | null;
+  bufferLastSegmentAgeSecs: number | null;
+  bufferRestartCount: number;
+  lastGstreamerError: string | null;
   diskUsedBytes: number;
   sessionKills: number;
   sessionMultiKills: number;
@@ -43,7 +51,7 @@ type AppState = {
   setRuntimeStatus: (status: RuntimeStatus) => void;
   setDiagnosticsRunning: (running: boolean) => void;
   setWtConnected: (connected: boolean) => void;
-  setBuffer: (filled: number, total: number) => void;
+  setBuffer: (status: BufferStatus) => void;
   setDiskUsedBytes: (bytes: number) => void;
   addClip: (clip: ClipInfo) => void;
   addEvent: (event: Omit<EventEntry, "id" | "at">) => void;
@@ -56,6 +64,12 @@ export const useAppStore = create<AppState>((set) => ({
   wtConnected: false,
   bufferFilledSecs: 0,
   bufferTotalSecs: 20,
+  bufferHealth: "starting",
+  bufferLastSegmentPath: null,
+  bufferLastSegmentModifiedAt: null,
+  bufferLastSegmentAgeSecs: null,
+  bufferRestartCount: 0,
+  lastGstreamerError: null,
   diskUsedBytes: 0,
   sessionKills: 0,
   sessionMultiKills: 0,
@@ -71,7 +85,14 @@ export const useAppStore = create<AppState>((set) => ({
   events: [],
   toast: null,
   setActiveView: (activeView) => set({ activeView }),
-  setConfig: (config) => set({ config, bufferTotalSecs: config.clip.seconds }),
+  setConfig: (config) =>
+    set({
+      config,
+      bufferTotalSecs:
+        config.capture.backend === "gpu_screen_recorder"
+          ? config.capture.replay_seconds
+          : config.clip.seconds,
+    }),
   setClips: (clips) =>
     set({
       clips,
@@ -84,12 +105,27 @@ export const useAppStore = create<AppState>((set) => ({
       runtimeStatus,
       bufferFilledSecs: runtimeStatus.bufferFilledSecs,
       bufferTotalSecs: Math.max(1, runtimeStatus.bufferTotalSecs),
+      bufferHealth: runtimeStatus.bufferHealth,
+      bufferLastSegmentPath: runtimeStatus.bufferLastSegmentPath ?? null,
+      bufferLastSegmentModifiedAt: runtimeStatus.bufferLastSegmentModifiedAt ?? null,
+      bufferLastSegmentAgeSecs: runtimeStatus.bufferLastSegmentAgeSecs ?? null,
+      bufferRestartCount: runtimeStatus.bufferRestartCount,
+      lastGstreamerError: runtimeStatus.lastGstreamerError ?? null,
       wtConnected: runtimeStatus.wtConnected,
     }),
   setDiagnosticsRunning: (diagnosticsRunning) => set({ diagnosticsRunning }),
   setWtConnected: (wtConnected) => set({ wtConnected }),
-  setBuffer: (bufferFilledSecs, bufferTotalSecs) =>
-    set({ bufferFilledSecs, bufferTotalSecs: Math.max(1, bufferTotalSecs) }),
+  setBuffer: (bufferStatus) =>
+    set({
+      bufferFilledSecs: bufferStatus.filledSecs,
+      bufferTotalSecs: Math.max(1, bufferStatus.totalSecs),
+      bufferHealth: bufferStatus.health,
+      bufferLastSegmentPath: bufferStatus.lastSegmentPath ?? null,
+      bufferLastSegmentModifiedAt: bufferStatus.lastSegmentModifiedAt ?? null,
+      bufferLastSegmentAgeSecs: bufferStatus.lastSegmentAgeSecs ?? null,
+      bufferRestartCount: bufferStatus.restartCount,
+      lastGstreamerError: bufferStatus.lastGstreamerError ?? null,
+    }),
   setDiskUsedBytes: (diskUsedBytes) => set({ diskUsedBytes }),
   addClip: (clip) =>
     set((state) => {

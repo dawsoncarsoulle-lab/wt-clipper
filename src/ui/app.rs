@@ -4,7 +4,7 @@ use chrono::Local;
 use eframe::egui::{self, Align, Align2, Color32, CornerRadius, FontId, Layout, RichText, Stroke};
 
 use crate::{
-    capture::buffer::ClipReason,
+    capture::buffer::{BufferHealth, ClipReason},
     capture::quality::QualityPreset,
     config::AppConfig,
     doctor::{DoctorReport, DoctorStatus},
@@ -53,6 +53,12 @@ pub struct WtClipperApp {
     player_name: Option<String>,
     buffer_filled_secs: f32,
     buffer_total_secs: f32,
+    buffer_health: BufferHealth,
+    buffer_last_segment_path: Option<String>,
+    buffer_last_segment_modified_at: Option<String>,
+    buffer_last_segment_age_secs: Option<u64>,
+    buffer_restart_count: u64,
+    last_gstreamer_error: Option<String>,
     disk_used_bytes: u64,
     session_kills: u32,
     session_multi_kills: u32,
@@ -79,6 +85,12 @@ impl WtClipperApp {
             player_name: config.war_thunder.player_name.clone(),
             buffer_filled_secs: 0.0,
             buffer_total_secs: config.clip.seconds as f32,
+            buffer_health: BufferHealth::Starting,
+            buffer_last_segment_path: None,
+            buffer_last_segment_modified_at: None,
+            buffer_last_segment_age_secs: None,
+            buffer_restart_count: 0,
+            last_gstreamer_error: None,
             disk_used_bytes: 0,
             session_kills: 0,
             session_multi_kills: 0,
@@ -185,12 +197,19 @@ impl WtClipperApp {
             }),
             AppEvent::ClipStatusChanged { .. } => {}
             AppEvent::ExportProgressChanged { .. } => {}
-            AppEvent::BufferProgress {
-                filled_secs,
-                total_secs,
-            } => {
-                self.buffer_filled_secs = filled_secs;
-                self.buffer_total_secs = total_secs.max(1.0);
+            AppEvent::GsrStatusChanged { .. } => {}
+            AppEvent::BufferProgress { status } => {
+                self.buffer_filled_secs = status.filled_secs;
+                self.buffer_total_secs = status.total_secs.max(1.0);
+                self.buffer_health = status.health;
+                self.buffer_last_segment_path = status
+                    .last_segment_path
+                    .as_ref()
+                    .map(|path| path.display().to_string());
+                self.buffer_last_segment_modified_at = status.last_segment_modified_at.clone();
+                self.buffer_last_segment_age_secs = status.last_segment_age_secs;
+                self.buffer_restart_count = status.restart_count;
+                self.last_gstreamer_error = status.last_gstreamer_error.clone();
             }
             AppEvent::DiskUsage { used_bytes } => self.disk_used_bytes = used_bytes,
             AppEvent::ClipsLoaded { clips, total_bytes } => {
@@ -267,7 +286,7 @@ impl WtClipperApp {
         self.nav_button(ui, Screen::Diagnostics, "🩺 Diagnostics");
         ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
             status_row(ui, "WT", self.wt_connected, ctx_seconds(ui));
-            status_row(ui, "Buffer", self.buffer_filled_secs > 0.0, ctx_seconds(ui));
+            status_row(ui, "Buffer", self.buffer_is_healthy(), ctx_seconds(ui));
         });
     }
 
@@ -328,14 +347,16 @@ impl WtClipperApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Replay buffer").strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(format!(
-                        "{:.0}/{:.0}s",
-                        self.buffer_filled_secs, self.buffer_total_secs
-                    ));
+                    ui.label(self.buffer_status_summary());
                 });
             });
             ui.add_space(10.0);
-            buffer_bar(ui, self.buffer_filled_secs, self.buffer_total_secs);
+            buffer_bar(
+                ui,
+                self.buffer_filled_secs,
+                self.buffer_total_secs,
+                self.buffer_health,
+            );
         });
         ui.add_space(14.0);
         card(ui, |ui| {
@@ -518,7 +539,7 @@ impl WtClipperApp {
                     });
                 }
                 if ui.button("🔄 Redémarrer le buffer").clicked() {
-                    let _ = self.bridge.cmd_tx.send(UiCommand::RestartBuffer);
+                    let _ = self.bridge.cmd_tx.send(UiCommand::RestartReplayBuffer);
                     self.toasts.push(Toast {
                         message: "Buffer redémarré".to_owned(),
                         ttl: 3.0,
@@ -533,11 +554,43 @@ impl WtClipperApp {
         ui.horizontal(|ui| {
             ui.heading("Diagnostics");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("🔄 Redémarrer le buffer").clicked() {
+                    let _ = self.bridge.cmd_tx.send(UiCommand::RestartReplayBuffer);
+                }
                 if ui.button("🔄 Relancer les checks").clicked() {
                     self.diagnostics_running = true;
                     let _ = self.bridge.cmd_tx.send(UiCommand::RunDiagnostics);
                 }
             });
+        });
+        ui.add_space(12.0);
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Replay buffer").strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(self.buffer_status_summary());
+                });
+            });
+            ui.add_space(8.0);
+            buffer_bar(
+                ui,
+                self.buffer_filled_secs,
+                self.buffer_total_secs,
+                self.buffer_health,
+            );
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Health: {}", self.buffer_health_label()));
+                ui.label(format!(
+                    "Dernier segment: {}",
+                    self.buffer_last_segment_label()
+                ));
+                ui.label(format!("Il y a: {}", self.buffer_last_segment_age_label()));
+                ui.label(format!("Redémarrages: {}", self.buffer_restart_count));
+            });
+            if let Some(error) = &self.last_gstreamer_error {
+                ui.label(RichText::new(format!("GStreamer: {error}")).color(Theme::DEATH_RED));
+            }
         });
         ui.add_space(12.0);
         if self.diagnostics_running {
@@ -567,6 +620,43 @@ impl WtClipperApp {
         } else {
             ui.label(RichText::new("Checks non lancés").color(Theme::TEXT_MUTED));
         }
+    }
+
+    fn buffer_is_healthy(&self) -> bool {
+        matches!(self.buffer_health, BufferHealth::Healthy)
+    }
+
+    fn buffer_health_label(&self) -> &'static str {
+        match self.buffer_health {
+            BufferHealth::Starting => "Starting",
+            BufferHealth::Healthy => "Healthy",
+            BufferHealth::Stalled => "Buffer bloqué",
+            BufferHealth::Error => "Erreur buffer",
+            BufferHealth::Restarting => "Redémarrage buffer...",
+        }
+    }
+
+    fn buffer_status_summary(&self) -> String {
+        match self.buffer_health {
+            BufferHealth::Healthy => format!(
+                "Buffer {:.0}%",
+                (self.buffer_filled_secs / self.buffer_total_secs.max(1.0) * 100.0)
+                    .clamp(0.0, 100.0)
+            ),
+            _ => self.buffer_health_label().to_owned(),
+        }
+    }
+
+    fn buffer_last_segment_label(&self) -> String {
+        self.buffer_last_segment_path
+            .clone()
+            .unwrap_or_else(|| "-".to_owned())
+    }
+
+    fn buffer_last_segment_age_label(&self) -> String {
+        self.buffer_last_segment_age_secs
+            .map(|age| format!("{age}s"))
+            .unwrap_or_else(|| "-".to_owned())
     }
 
     fn draw_toasts(&mut self, ctx: &egui::Context) {
@@ -657,17 +747,31 @@ fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> 
         .inner
 }
 
-fn buffer_bar(ui: &mut egui::Ui, filled: f32, total: f32) {
+fn buffer_bar(ui: &mut egui::Ui, filled: f32, total: f32, health: BufferHealth) {
     let desired = egui::vec2(ui.available_width(), 24.0);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    let percent = (filled / total.max(1.0)).clamp(0.0, 1.0);
+    let percent = if matches!(health, BufferHealth::Healthy) {
+        (filled / total.max(1.0)).clamp(0.0, 1.0)
+    } else {
+        (filled / total.max(1.0)).clamp(0.0, 0.99)
+    };
     let segment_count = (rect.width() / 4.0).floor().max(1.0) as usize;
-    let active_count = ((segment_count as f32) * percent).round() as usize;
+    let active_count = if matches!(health, BufferHealth::Healthy) {
+        ((segment_count as f32) * percent).round() as usize
+    } else {
+        ((segment_count as f32) * percent).floor() as usize
+    };
+    let active_color = match health {
+        BufferHealth::Healthy => Theme::ACCENT,
+        BufferHealth::Starting | BufferHealth::Restarting => Color32::from_rgb(220, 170, 70),
+        BufferHealth::Stalled => Color32::from_rgb(220, 170, 70),
+        BufferHealth::Error => Theme::DEATH_RED,
+    };
     for index in 0..segment_count {
         let x = rect.left() + index as f32 * 4.0;
         let color = if index <= active_count {
-            Theme::ACCENT
+            active_color
         } else {
             Theme::BG_SECONDARY
         };

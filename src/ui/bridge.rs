@@ -3,7 +3,14 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::{capture::buffer::ClipReason, config::AppConfig, doctor::DoctorReport};
+use crate::{
+    capture::{
+        buffer::{BufferStatus, ClipReason},
+        gpu_screen_recorder::GsrStatus,
+    },
+    config::AppConfig,
+    doctor::DoctorReport,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -101,8 +108,10 @@ pub enum AppEvent {
         message: String,
     },
     BufferProgress {
-        filled_secs: f32,
-        total_secs: f32,
+        status: BufferStatus,
+    },
+    GsrStatusChanged {
+        status: GsrStatus,
     },
     DiskUsage {
         used_bytes: u64,
@@ -120,6 +129,7 @@ pub enum UiCommand {
     DeleteClip(PathBuf),
     OpenOutputFolder,
     UpdateConfig(AppConfig),
+    RestartReplayBuffer,
     RestartBuffer,
     LoadClips,
     RunDiagnostics,
