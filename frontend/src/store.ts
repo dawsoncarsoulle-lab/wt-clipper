@@ -32,6 +32,11 @@ type AppState = {
   clipsSaved: number;
   clips: ClipInfo[];
   processingClips: GalleryClipItem[];
+  galleryRefreshCount: number;
+  galleryLastRefreshMs: number | null;
+  galleryRenderedClipCount: number;
+  galleryMountedVideoCount: number;
+  frontendListenerCount: number;
   config: AppConfig | null;
   diagnostics: DoctorReport | null;
   runtimeStatus: RuntimeStatus | null;
@@ -43,6 +48,10 @@ type AppState = {
   setActiveView: (view: AppState["activeView"]) => void;
   setConfig: (config: AppConfig) => void;
   setClips: (clips: ClipInfo[]) => void;
+  recordGalleryRefresh: (durationMs: number) => void;
+  setGalleryRenderedClipCount: (count: number) => void;
+  setGalleryMountedVideoCount: (count: number) => void;
+  setFrontendListenerCount: (count: number) => void;
   updateClipStatus: (payload: ClipStatusChangedPayload) => void;
   setPendingExportClips: (clips: PendingClipExportDto[]) => void;
   setExportProgress: (payload: ExportProgressPayload | null) => void;
@@ -58,6 +67,8 @@ type AppState = {
   addEventEntry: (event: EventEntry) => void;
   showToast: (message: string) => void;
 };
+
+let toastTimeout: number | null = null;
 
 export const useAppStore = create<AppState>((set) => ({
   activeView: "dashboard",
@@ -76,6 +87,11 @@ export const useAppStore = create<AppState>((set) => ({
   clipsSaved: 0,
   clips: [],
   processingClips: [],
+  galleryRefreshCount: 0,
+  galleryLastRefreshMs: null,
+  galleryRenderedClipCount: 0,
+  galleryMountedVideoCount: 0,
+  frontendListenerCount: 0,
   config: null,
   diagnostics: null,
   runtimeStatus: null,
@@ -99,6 +115,14 @@ export const useAppStore = create<AppState>((set) => ({
       clipsSaved: clips.length,
       diskUsedBytes: clips.reduce((sum, clip) => sum + clip.sizeBytes, 0),
     }),
+  recordGalleryRefresh: (galleryLastRefreshMs) =>
+    set((state) => ({
+      galleryRefreshCount: state.galleryRefreshCount + 1,
+      galleryLastRefreshMs,
+    })),
+  setGalleryRenderedClipCount: (galleryRenderedClipCount) => set({ galleryRenderedClipCount }),
+  setGalleryMountedVideoCount: (galleryMountedVideoCount) => set({ galleryMountedVideoCount }),
+  setFrontendListenerCount: (frontendListenerCount) => set({ frontendListenerCount }),
   setDiagnostics: (diagnostics) => set({ diagnostics, diagnosticsRunning: false }),
   setRuntimeStatus: (runtimeStatus) =>
     set({
@@ -210,8 +234,14 @@ export const useAppStore = create<AppState>((set) => ({
       };
     }),
   showToast: (toast) => {
+    if (toastTimeout != null) {
+      window.clearTimeout(toastTimeout);
+    }
     set({ toast });
-    window.setTimeout(() => set({ toast: null }), 3200);
+    toastTimeout = window.setTimeout(() => {
+      toastTimeout = null;
+      set({ toast: null });
+    }, 3200);
   },
 }));
 

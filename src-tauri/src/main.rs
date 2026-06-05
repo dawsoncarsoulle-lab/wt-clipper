@@ -1,11 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -18,8 +18,8 @@ use tauri::{Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 use uuid::Uuid;
-mod export_queue;
 mod editor;
+mod export_queue;
 mod updater;
 use export_queue::{ExportSummary, PendingClipExportDto};
 use wt_clipper::{
@@ -34,6 +34,10 @@ use wt_clipper::{
     ui::bridge::{AppEvent, ClipInfo, ExportProgressPayload, UiCommand},
     warthunder::client::WarThunderClient,
 };
+
+static GALLERY_SCAN_COUNT: AtomicU64 = AtomicU64::new(0);
+static GALLERY_LAST_SCAN_MS: AtomicU64 = AtomicU64::new(0);
+static GALLERY_ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
 
 struct BackendState {
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
@@ -81,6 +85,12 @@ impl ClipPreviewServer {
             clips.insert(id.clone(), canonical);
         }
         Some(format!("{}/{}.{}", self.base_url, id, extension))
+    }
+
+    fn retain_paths(&self, known_paths: &HashSet<PathBuf>) {
+        if let Ok(mut clips) = self.clips.lock() {
+            clips.retain(|_, path| known_paths.contains(path));
+        }
     }
 }
 
@@ -192,8 +202,7 @@ fn parse_byte_range(range: &str, size: u64) -> Option<(u64, u64)> {
 
 fn write_http_status(stream: &mut TcpStream, status: &str) {
     let _ = stream.write_all(
-        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .as_bytes(),
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
     );
 }
 
@@ -253,6 +262,10 @@ struct RuntimeStatus {
     pending_export_dir: PathBuf,
     pending_export_bytes: u64,
     clips_saved: usize,
+    backend_fd_count: Option<usize>,
+    gallery_scan_count: u64,
+    gallery_last_scan_ms: u64,
+    gallery_active_scans: usize,
     recent_events: Vec<RuntimeEvent>,
     export_progress: Option<ExportProgressPayload>,
     last_error: Option<String>,
@@ -303,7 +316,11 @@ impl RuntimeStatus {
             gsr_total_saves_completed: 0,
             gsr_total_saves_failed: 0,
             gsr_output_dir: config.capture.output_dir_path().ok(),
-            gsr_output_prefix: config.capture.output_dir_path().ok().map(|path| path.join("wtclip")),
+            gsr_output_prefix: config
+                .capture
+                .output_dir_path()
+                .ok()
+                .map(|path| path.join("wtclip")),
             gsr_last_output: None,
             gsr_last_error: None,
             gsr_restart_count: 0,
@@ -320,6 +337,10 @@ impl RuntimeStatus {
                 .unwrap_or_else(|_| PathBuf::from("")),
             pending_export_bytes: 0,
             clips_saved: 0,
+            backend_fd_count: current_process_fd_count(),
+            gallery_scan_count: 0,
+            gallery_last_scan_ms: 0,
+            gallery_active_scans: 0,
             recent_events: Vec::new(),
             export_progress: None,
             last_error: None,
@@ -354,7 +375,10 @@ async fn save_config(
         status.gsr_fps = status_config.capture.fps;
         status.gsr_quality = status_config.capture.quality.as_arg().to_owned();
         status.gsr_output_dir = status_config.capture.output_dir_path().ok();
-        status.gsr_output_prefix = status.gsr_output_dir.as_ref().map(|path| path.join("wtclip"));
+        status.gsr_output_prefix = status
+            .gsr_output_dir
+            .as_ref()
+            .map(|path| path.join("wtclip"));
         status.pending_export_dir = status_config
             .pending_exports
             .pending_export_dir_path()
@@ -449,7 +473,10 @@ async fn get_pending_export_clips(
 }
 
 #[tauri::command]
-async fn delete_pending_export_clip(id: String, state: State<'_, BackendState>) -> Result<(), String> {
+async fn delete_pending_export_clip(
+    id: String,
+    state: State<'_, BackendState>,
+) -> Result<(), String> {
     let (respond_to, response) = oneshot::channel();
     state
         .auto_cmd_tx
@@ -476,7 +503,11 @@ fn get_runtime_status(state: State<'_, BackendState>) -> Result<RuntimeStatus, S
     state
         .runtime_status
         .lock()
-        .map(|status| status.clone())
+        .map(|status| {
+            let mut status = status.clone();
+            refresh_resource_diagnostics(&mut status);
+            status
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -652,7 +683,9 @@ fn spawn_backend(
             if let Ok(mut status) = runtime_status.lock() {
                 status.auto_clip_running = true;
             }
-            if let Err(error) = run_auto_backend(config, output_dir, event_tx.clone(), auto_cmd_rx).await {
+            if let Err(error) =
+                run_auto_backend(config, output_dir, event_tx.clone(), auto_cmd_rx).await
+            {
                 if let Ok(mut status) = runtime_status.lock() {
                     status.auto_clip_running = false;
                     status.last_error = Some(error.to_string());
@@ -794,12 +827,10 @@ fn emit_app_event(
         AppEvent::DiskUsage { used_bytes } => {
             app.emit("disk-usage", json!({ "usedBytes": used_bytes }))
         }
-        AppEvent::ClipsLoaded { clips, total_bytes } => {
-            app.emit(
-                "clips-loaded",
-                json!({ "clips": clips, "totalBytes": total_bytes }),
-            )
-        }
+        AppEvent::ClipsLoaded { clips, total_bytes } => app.emit(
+            "clips-loaded",
+            json!({ "clips": clips, "totalBytes": total_bytes }),
+        ),
         AppEvent::DiagnosticsReady(report) => app.emit("diagnostics-ready", report),
     };
 
@@ -854,7 +885,10 @@ fn log_bridge_event_received(event: &AppEvent) {
             reason,
             description,
             ..
-        } => debug!(?reason, description, "AppEvent::KillDetected received from backend"),
+        } => debug!(
+            ?reason,
+            description, "AppEvent::KillDetected received from backend"
+        ),
         AppEvent::ClipSaved { path, reason, .. } => {
             debug!(?reason, path = %path.display(), "AppEvent::ClipSaved received from backend")
         }
@@ -885,7 +919,10 @@ fn log_bridge_event_received(event: &AppEvent) {
             debug!(used_bytes, "AppEvent::DiskUsage received from backend")
         }
         AppEvent::ClipsLoaded { clips, total_bytes } => {
-            debug!(clips = clips.len(), total_bytes, "AppEvent::ClipsLoaded received from backend")
+            debug!(
+                clips = clips.len(),
+                total_bytes, "AppEvent::ClipsLoaded received from backend"
+            )
         }
         AppEvent::DiagnosticsReady(_) => {
             debug!("AppEvent::DiagnosticsReady received from backend")
@@ -900,7 +937,9 @@ fn update_runtime_status(runtime_status: &Arc<Mutex<RuntimeStatus>>, event: &App
     match event {
         AppEvent::WtConnected => status.wt_connected = true,
         AppEvent::WtDisconnected => status.wt_connected = false,
-        AppEvent::BufferProgress { status: buffer_status } => {
+        AppEvent::BufferProgress {
+            status: buffer_status,
+        } => {
             status.buffer_filled_secs = buffer_status.filled_secs;
             status.buffer_total_secs = buffer_status.total_secs;
             status.buffer_health = buffer_status.health;
@@ -949,7 +988,9 @@ fn apply_gsr_runtime_status(status: &mut RuntimeStatus, gsr: &GsrStatus) {
     status.gsr_wrapper_pid = gsr.wrapper_pid;
     status.gsr_recorder_pid = gsr.recorder_pid;
     status.gsr_signal_pid = gsr.signal_pid;
-    status.gsr_mode = gsr.mode.map(|mode| format!("{mode:?}").to_ascii_lowercase());
+    status.gsr_mode = gsr
+        .mode
+        .map(|mode| format!("{mode:?}").to_ascii_lowercase());
     status.gsr_target = gsr.target.clone();
     status.gsr_monitors = gsr.monitors.clone();
     status.gsr_command_line = gsr.command_line.clone();
@@ -1003,6 +1044,19 @@ fn directory_size(path: &Path) -> u64 {
         .sum()
 }
 
+fn refresh_resource_diagnostics(status: &mut RuntimeStatus) {
+    status.backend_fd_count = current_process_fd_count();
+    status.gallery_scan_count = GALLERY_SCAN_COUNT.load(Ordering::Relaxed);
+    status.gallery_last_scan_ms = GALLERY_LAST_SCAN_MS.load(Ordering::Relaxed);
+    status.gallery_active_scans = GALLERY_ACTIVE_SCANS.load(Ordering::Relaxed);
+}
+
+fn current_process_fd_count() -> Option<usize> {
+    std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .map(|entries| entries.filter_map(Result::ok).count())
+}
+
 async fn command_loop(
     mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -1054,9 +1108,15 @@ async fn command_loop(
                     message: "Clip supprimé".to_owned(),
                 });
                 tokio::spawn(async move {
-                    match scan_clips(gallery_scan_roots_for_base_dirs(vec![reload_dir]), preview_server).await {
+                    match scan_clips(
+                        gallery_scan_roots_for_base_dirs(vec![reload_dir]),
+                        preview_server,
+                    )
+                    .await
+                    {
                         Ok((clips, total_bytes)) => {
-                            let _ = reload_events.send(AppEvent::ClipsLoaded { clips, total_bytes });
+                            let _ =
+                                reload_events.send(AppEvent::ClipsLoaded { clips, total_bytes });
                         }
                         Err(error) => {
                             let _ = reload_events.send(AppEvent::ClipFailed {
@@ -1083,24 +1143,22 @@ async fn command_loop(
                     .await
                     .ok()
                     .and_then(Result::ok);
-                let message = if result.is_some() {
-                    let (respond_to, response) = oneshot::channel();
-                    match auto_cmd_tx.send(AutoClipCommand::UpdateConfig {
-                        config: runtime_config,
-                        respond_to,
-                    }) {
-                        Ok(()) => response
-                            .await
-                            .map(|result| result.message)
-                            .unwrap_or_else(|error| format!("Configuration sauvegardée; backend: {error}")),
-                        Err(error) => format!("Configuration sauvegardée; backend: {error}"),
-                    }
-                } else {
-                    "La configuration n'a pas pu être sauvegardée".to_owned()
-                };
-                let _ = event_tx.send(AppEvent::ClipFailed {
-                    message,
-                });
+                let message =
+                    if result.is_some() {
+                        let (respond_to, response) = oneshot::channel();
+                        match auto_cmd_tx.send(AutoClipCommand::UpdateConfig {
+                            config: runtime_config,
+                            respond_to,
+                        }) {
+                            Ok(()) => response.await.map(|result| result.message).unwrap_or_else(
+                                |error| format!("Configuration sauvegardée; backend: {error}"),
+                            ),
+                            Err(error) => format!("Configuration sauvegardée; backend: {error}"),
+                        }
+                    } else {
+                        "La configuration n'a pas pu être sauvegardée".to_owned()
+                    };
+                let _ = event_tx.send(AppEvent::ClipFailed { message });
             }
             UiCommand::SaveManualClip => {
                 if let Err(error) = auto_cmd_tx.send(AutoClipCommand::SaveManualClip) {
@@ -1124,10 +1182,12 @@ async fn scan_clips(
     roots: Vec<PathBuf>,
     preview_server: Arc<ClipPreviewServer>,
 ) -> anyhow::Result<(Vec<ClipInfo>, u64)> {
-    tokio::task::spawn_blocking(move || {
+    GALLERY_ACTIVE_SCANS.fetch_add(1, Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
         let mut clips = Vec::new();
         let mut total_bytes = 0_u64;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let now = std::time::SystemTime::now();
         for root in roots {
             for entry in walkdir::WalkDir::new(&root)
@@ -1169,7 +1229,10 @@ async fn scan_clips(
                         .and_then(|metadata| metadata.reason)
                         .unwrap_or_else(|| clip_reason_from_name(&file_name)),
                     path: path.to_path_buf(),
-                    thumbnail_path: path.with_extension("jpg").exists().then(|| path.with_extension("jpg")),
+                    thumbnail_path: path
+                        .with_extension("jpg")
+                        .exists()
+                        .then(|| path.with_extension("jpg")),
                     preview_url: preview_server.url_for_path(path),
                     file_name,
                     size_bytes,
@@ -1181,10 +1244,21 @@ async fn scan_clips(
                 });
             }
         }
+        preview_server.retain_paths(&seen);
         clips.sort_by_key(|clip| clip.modified_secs_ago);
         Ok((clips, total_bytes))
     })
-    .await?
+    .await;
+    GALLERY_ACTIVE_SCANS.fetch_sub(1, Ordering::Relaxed);
+    let result = result?;
+    if result.is_ok() {
+        GALLERY_SCAN_COUNT.fetch_add(1, Ordering::Relaxed);
+        GALLERY_LAST_SCAN_MS.store(
+            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+    result
 }
 
 fn gallery_scan_roots_for_config(config: &AppConfig) -> anyhow::Result<Vec<PathBuf>> {

@@ -309,6 +309,10 @@ export type RuntimeStatus = {
   pendingExportDir: string;
   pendingExportBytes: number;
   clipsSaved: number;
+  backendFdCount?: number | null;
+  galleryScanCount?: number;
+  galleryLastScanMs?: number;
+  galleryActiveScans?: number;
   exportProgress?: ExportProgressPayload | null;
   recentEvents: Array<{
     id: string;

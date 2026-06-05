@@ -6,6 +6,12 @@ import {
   mapExportProgressPayload,
   shouldShowExportButton,
 } from "../src/exportLogic.js";
+import {
+  debouncedRefreshCount,
+  mountedGalleryVideoCount,
+  shouldApplyGalleryLoadResult,
+  shouldUseGalleryCache,
+} from "../src/galleryResourcePolicy.js";
 import { mergePendingExportClips } from "../src/pendingQueueState.js";
 import type { ExportProgressPayload, GalleryClipItem, PendingClipExportDto } from "../src/types.js";
 
@@ -312,6 +318,43 @@ test("generic app-event export-progress-changed est mappe", () => {
 
   assertEqual(mapped?.currentClipNumber, 2);
   assertEqual(mapped?.currentStep, "encoding");
+});
+
+test("repeated_gallery_tab_switch_does_not_increase_video_count", () => {
+  for (let index = 0; index < 10; index += 1) {
+    assertEqual(mountedGalleryVideoCount(null), 0);
+    assertEqual(mountedGalleryVideoCount("clip-a.mp4"), 1);
+  }
+});
+
+test("gallery_refresh_is_debounced", () => {
+  assertEqual(debouncedRefreshCount([0, 100, 250, 600], 800), 1);
+  assertEqual(debouncedRefreshCount([0, 900, 1900], 800), 3);
+});
+
+test("clip_saved_events_are_batched", () => {
+  assertEqual(debouncedRefreshCount([10, 30, 120, 300, 700], 800), 1);
+});
+
+test("load_clips_result_ignored_after_unmount", () => {
+  assertEqual(shouldApplyGalleryLoadResult(2, 2, false), false);
+});
+
+test("load_clips_result_ignored_when_stale", () => {
+  assertEqual(shouldApplyGalleryLoadResult(1, 2, true), false);
+  assertEqual(shouldApplyGalleryLoadResult(2, 2, true), true);
+});
+
+test("gallery_open_close_10_times_uses_recent_cache", () => {
+  let loads = 0;
+  const ttlMs = 10_000;
+  const lastLoadMs = 1_000;
+  for (let index = 0; index < 10; index += 1) {
+    if (!shouldUseGalleryCache(1_500 + index * 200, lastLoadMs, ttlMs, false)) {
+      loads += 1;
+    }
+  }
+  assertEqual(loads, 0);
 });
 
 test("modal passe de Clip 1/6 a Clip 2/6 apres event", () => {

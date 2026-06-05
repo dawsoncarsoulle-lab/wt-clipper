@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -41,6 +41,11 @@ import {
   mapExportProgressPayload,
   shouldShowExportButton,
 } from "./exportLogic";
+import {
+  mountedGalleryVideoCount,
+  shouldApplyGalleryLoadResult,
+  shouldUseGalleryCache,
+} from "./galleryResourcePolicy";
 import type {
   AppConfig,
   BufferHealth,
@@ -69,6 +74,9 @@ const nav = [
   { id: "config", label: "Configuration", icon: Settings },
   { id: "diagnostics", label: "Diagnostics", icon: Wrench },
 ] as const;
+
+const GALLERY_REFRESH_DEBOUNCE_MS = 800;
+const GALLERY_CACHE_TTL_MS = 10_000;
 
 const reasonLabel: Record<ClipReason, string> = {
   "target-destroyed": "KILL",
@@ -146,6 +154,9 @@ function replayStatusLabel(config?: AppConfig | null, runtimeStatus?: RuntimeSta
 export function App() {
   const store = useAppStore();
   const seenRuntimeEvents = useRef(new Set<string>());
+  const galleryRefreshTimeout = useRef<number | null>(null);
+  const galleryLoadSeq = useRef(0);
+  const lastGalleryLoadAt = useRef(0);
 
   useEffect(() => {
     void bootstrap();
@@ -173,6 +184,7 @@ export function App() {
         store.setIsExporting(false);
       }
     };
+    const killRefreshTimeouts = new Set<number>();
     const unsubs = [
       listen("wt-connected", () => {
         console.info("[FRONTEND] received wt-connected");
@@ -191,19 +203,19 @@ export function App() {
             title: reasonLabel[event.payload.reason],
             detail: event.payload.description,
           });
-          window.setTimeout(() => {
+          const timeout = window.setTimeout(() => {
+            killRefreshTimeouts.delete(timeout);
             void refreshPendingExportClips().catch((error) =>
               console.info("[FRONTEND] pending refresh after kill failed", error),
             );
           }, 300);
+          killRefreshTimeouts.add(timeout);
         },
       ),
       listen<ClipInfo>("clip-saved", (event) => {
         console.info("[FRONTEND] received clip-saved", event.payload);
         store.addClip(event.payload);
-        void refreshClips().catch((error) => {
-          console.info("[FRONTEND] refresh after clip-saved failed", error);
-        });
+        scheduleGalleryRefresh("clip-saved");
         store.addEvent({
           kind: event.payload.reason,
           title: "Clip sauvegardé",
@@ -263,11 +275,33 @@ export function App() {
       }),
       listen<DoctorReport>("diagnostics-ready", (event) => store.setDiagnostics(event.payload)),
     ];
+    store.setFrontendListenerCount(unsubs.length);
     return () => {
       window.clearInterval(runtimePoll);
+      for (const timeout of killRefreshTimeouts) {
+        window.clearTimeout(timeout);
+      }
+      if (galleryRefreshTimeout.current != null) {
+        window.clearTimeout(galleryRefreshTimeout.current);
+        galleryRefreshTimeout.current = null;
+      }
+      store.setFrontendListenerCount(0);
       void Promise.all(unsubs).then((items) => items.forEach((unlisten) => unlisten()));
     };
   }, []);
+
+  useEffect(() => {
+    if (store.activeView !== "clips") {
+      return;
+    }
+    scheduleGalleryRefresh("tab-open", { useCache: true, delayMs: 0 });
+    return () => {
+      if (galleryRefreshTimeout.current != null) {
+        window.clearTimeout(galleryRefreshTimeout.current);
+        galleryRefreshTimeout.current = null;
+      }
+    };
+  }, [store.activeView]);
 
   async function bootstrap() {
     try {
@@ -277,7 +311,7 @@ export function App() {
       ]);
       store.setConfig(config);
       store.setDiagnostics(diagnostics);
-      await refreshClips();
+      await refreshClips({ force: true });
       await refreshPendingExportClips();
       await refreshRuntimeStatus();
     } catch (error) {
@@ -285,9 +319,36 @@ export function App() {
     }
   }
 
-  async function refreshClips() {
+  function scheduleGalleryRefresh(
+    reason: string,
+    options: { useCache?: boolean; delayMs?: number } = {},
+  ) {
+    if (galleryRefreshTimeout.current != null) {
+      window.clearTimeout(galleryRefreshTimeout.current);
+    }
+    const delayMs = options.delayMs ?? GALLERY_REFRESH_DEBOUNCE_MS;
+    galleryRefreshTimeout.current = window.setTimeout(() => {
+      galleryRefreshTimeout.current = null;
+      void refreshClips({ force: !options.useCache }).catch((error) => {
+        console.info(`[FRONTEND] gallery refresh failed after ${reason}`, error);
+      });
+    }, delayMs);
+  }
+
+  async function refreshClips(options: { force?: boolean } = {}) {
+    const now = Date.now();
+    if (shouldUseGalleryCache(now, lastGalleryLoadAt.current, GALLERY_CACHE_TTL_MS, options.force === true)) {
+      return useAppStore.getState().clips;
+    }
+    const seq = ++galleryLoadSeq.current;
+    const started = performance.now();
     const clips = await invoke<ClipInfo[]>("load_clips");
+    if (!shouldApplyGalleryLoadResult(seq, galleryLoadSeq.current, true)) {
+      return clips;
+    }
+    lastGalleryLoadAt.current = Date.now();
     store.setClips(clips);
+    store.recordGalleryRefresh(Math.round(performance.now() - started));
     return clips;
   }
 
@@ -760,6 +821,8 @@ function Clips() {
     isExporting,
     setClips,
     setExportProgress,
+    setGalleryMountedVideoCount,
+    setGalleryRenderedClipCount,
     setIsExporting,
     setPendingExportClips,
     showToast,
@@ -768,6 +831,15 @@ function Clips() {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | ClipReason>("all");
   const [editingClip, setEditingClip] = useState<ClipInfo | null>(null);
+  const [activePreviewPath, setActivePreviewPath] = useState<string | null>(null);
+  const refreshSeq = useRef(0);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   useEffect(() => {
     let cancelled = false;
     async function refreshPending() {
@@ -801,6 +873,13 @@ function Clips() {
       return matchesQuery && matchesFilter;
     });
   }, [clips, processingClips, query, filter]);
+  useEffect(() => {
+    setGalleryRenderedClipCount(galleryItems.length);
+  }, [galleryItems.length, setGalleryRenderedClipCount]);
+  useEffect(() => {
+    setGalleryMountedVideoCount(mountedGalleryVideoCount(activePreviewPath));
+    return () => setGalleryMountedVideoCount(0);
+  }, [activePreviewPath, setGalleryMountedVideoCount]);
   const activeProcessingCount = processingClips.filter((clip) =>
     ["detected", "recording", "encoding", "saving", "exporting"].includes(clip.status),
   ).length;
@@ -811,10 +890,14 @@ function Clips() {
   const showExportButton = backend !== "gpu_screen_recorder" && shouldShowExportButton(processingClips, isExporting);
 
   async function refresh() {
+    const seq = ++refreshSeq.current;
     const [clips, pending] = await Promise.all([
       invoke<ClipInfo[]>("load_clips"),
       invoke<PendingClipExportDto[]>("get_pending_export_clips"),
     ]);
+    if (!shouldApplyGalleryLoadResult(seq, refreshSeq.current, mounted.current)) {
+      return;
+    }
     setClips(clips);
     setPendingExportClips(pending);
   }
@@ -974,6 +1057,9 @@ function Clips() {
               <ClipCard
                 key={clip.id}
                 clip={galleryItemToClipInfo(clip)}
+                previewActive={activePreviewPath === clip.filePath}
+                onPreviewStart={() => setActivePreviewPath(clip.filePath!)}
+                onPreviewEnd={() => setActivePreviewPath((current) => (current === clip.filePath ? null : current))}
                 onEdit={() => setEditingClip(galleryItemToClipInfo(clip))}
                 onDelete={() => void remove(clip.filePath!)}
               />
@@ -1190,10 +1276,16 @@ function getClipStatusLabel(status: ClipStatus): string {
 
 function ClipCard({
   clip,
+  previewActive,
+  onPreviewStart,
+  onPreviewEnd,
   onDelete,
   onEdit,
 }: {
   clip: ClipInfo;
+  previewActive: boolean;
+  onPreviewStart: () => void;
+  onPreviewEnd: () => void;
   onDelete: () => void;
   onEdit: () => void;
 }) {
@@ -1201,55 +1293,75 @@ function ClipCard({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const videoSrc = clip.previewUrl ?? convertFileSrc(clip.path);
   const videoType = videoMimeTypeForPath(clip.path);
+  const thumbnailSrc = clip.thumbnailPath ? convertFileSrc(clip.thumbnailPath) : null;
   const editedBadge = editedBadgeForPath(clip.path);
 
   useEffect(() => {
     setVideoFailed(false);
   }, [videoSrc]);
 
-  const playPreview = () => {
+  const attachVideoRef = useCallback((node: HTMLVideoElement | null) => {
+    if (videoRef.current && videoRef.current !== node) {
+      releaseVideoElement(videoRef.current);
+    }
+    videoRef.current = node;
+  }, []);
+
+  useEffect(() => {
     const video = videoRef.current;
-    if (!video || videoFailed) return;
+    if (!previewActive || !video || videoFailed) return;
 
     video.muted = true;
     video.play().catch((error) => {
       console.info("[FRONTEND] clip preview autoplay failed", error);
     });
-  };
+  }, [previewActive, videoFailed]);
 
-  const pausePreview = () => {
+  useEffect(() => {
+    if (previewActive) {
+      return;
+    }
     const video = videoRef.current;
     if (!video) return;
+    releaseVideoElement(video);
+  }, [previewActive]);
 
-    video.pause();
-    video.currentTime = 0;
-  };
+  useEffect(() => {
+    return () => {
+      const video = videoRef.current;
+      if (video) {
+        releaseVideoElement(video);
+      }
+    };
+  }, []);
 
   return (
     <motion.article
       whileHover={{ y: -4 }}
       className="clip-card"
-      onMouseEnter={playPreview}
-      onMouseLeave={pausePreview}
-      onFocus={playPreview}
-      onBlur={pausePreview}
+      onMouseEnter={onPreviewStart}
+      onMouseLeave={onPreviewEnd}
+      onFocus={onPreviewStart}
+      onBlur={onPreviewEnd}
     >
       <div className="clip-thumb">
-        {!videoFailed ? (
+        {previewActive && !videoFailed ? (
           <video
-            ref={videoRef}
+            ref={attachVideoRef}
             muted
             playsInline
-            preload="metadata"
+            preload="none"
             loop
             onError={() => setVideoFailed(true)}
           >
             <source src={videoSrc} type={videoType} />
           </video>
+        ) : thumbnailSrc ? (
+          <img src={thumbnailSrc} alt="" loading="lazy" decoding="async" />
         ) : (
           <div className="clip-thumb-fallback">
             <Video className="h-9 w-9 text-ember" />
-            <span>Vidéo indisponible</span>
+            <span>{videoFailed ? "Vidéo indisponible" : "Preview"}</span>
           </div>
         )}
         <div className="clip-overlay" />
@@ -1549,6 +1661,11 @@ function Diagnostics() {
   const {
     diagnostics,
     diagnosticsRunning,
+    galleryLastRefreshMs,
+    galleryMountedVideoCount,
+    galleryRefreshCount,
+    galleryRenderedClipCount,
+    frontendListenerCount,
     runtimeStatus,
     setDiagnostics,
     setDiagnosticsRunning,
@@ -1614,6 +1731,24 @@ function Diagnostics() {
         <Metric icon={CheckCircle2} label="OK" value={counts?.ok ?? 0} />
         <Metric icon={AlertTriangle} label="Warn" value={counts?.warn ?? 0} />
         <Metric icon={XCircle} label="Error" value={counts?.error ?? 0} />
+      </div>
+      <div>
+        <h2 className="text-sm font-black uppercase text-zinc-500">Ressources galerie</h2>
+      </div>
+      <div className="grid grid-cols-4 gap-4">
+        <Metric icon={HardDrive} label="FD backend" value={runtimeStatus?.backendFdCount ?? "-"} />
+        <Metric icon={RefreshCcw} label="Refresh galerie" value={galleryRefreshCount} />
+        <Metric icon={Clock3} label="Dernier refresh" value={galleryLastRefreshMs == null ? "-" : `${galleryLastRefreshMs}ms`} />
+        <Metric icon={Activity} label="Listeners front" value={frontendListenerCount} />
+      </div>
+      <div className="grid grid-cols-4 gap-4">
+        <Metric icon={Video} label="Clips rendus" value={galleryRenderedClipCount} />
+        <Metric icon={Video} label="Vidéos montées" value={galleryMountedVideoCount} />
+        <Metric icon={Search} label="Scans backend" value={runtimeStatus?.galleryScanCount ?? 0} />
+        <Metric icon={Gauge} label="Scans actifs" value={runtimeStatus?.galleryActiveScans ?? 0} />
+      </div>
+      <div className="grid grid-cols-4 gap-4">
+        <Metric icon={Clock3} label="Dernier scan" value={runtimeStatus?.galleryLastScanMs == null ? "-" : `${runtimeStatus.galleryLastScanMs}ms`} />
       </div>
       <div>
         <h2 className="text-sm font-black uppercase text-zinc-500">GPU Screen Recorder</h2>
@@ -1809,6 +1944,17 @@ function Empty({ label }: { label: string }) {
 
 function videoMimeTypeForPath(path: string): string {
   return path.toLowerCase().endsWith(".mp4") ? "video/mp4" : "video/webm";
+}
+
+function releaseVideoElement(video: HTMLVideoElement) {
+  video.pause();
+  video.removeAttribute("src");
+  for (const child of Array.from(video.children)) {
+    if (child instanceof HTMLSourceElement) {
+      child.removeAttribute("src");
+    }
+  }
+  video.load();
 }
 
 function editedBadgeForPath(path: string): "Edited" | "Vertical" | null {
