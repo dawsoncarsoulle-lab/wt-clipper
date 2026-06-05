@@ -70,6 +70,10 @@ pub struct CaptureConfig {
     pub encoder: GsrEncoder,
     #[serde(default)]
     pub quality: GsrQuality,
+    #[serde(default)]
+    pub bitrate_mode: GsrBitrateMode,
+    #[serde(default)]
+    pub video_bitrate_kbps: u32,
     #[serde(default = "default_gsr_output_dir_string")]
     pub output_dir: String,
     #[serde(default = "default_capture_audio_enabled")]
@@ -159,6 +163,7 @@ pub enum GsrQuality {
     Medium,
     High,
     VeryHigh,
+    Ultra,
 }
 
 impl GsrQuality {
@@ -167,6 +172,28 @@ impl GsrQuality {
             Self::Medium => "medium",
             Self::High => "high",
             Self::VeryHigh => "very_high",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GsrBitrateMode {
+    #[default]
+    Auto,
+    Qp,
+    Cbr,
+    Vbr,
+}
+
+impl GsrBitrateMode {
+    pub fn as_arg(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Qp => Some("qp"),
+            Self::Cbr => Some("cbr"),
+            Self::Vbr => Some("vbr"),
         }
     }
 }
@@ -247,12 +274,14 @@ impl Default for CaptureConfig {
             backend: CaptureBackend::GpuScreenRecorder,
             target: default_capture_target(),
             gpu_screen_recorder_mode: GpuScreenRecorderMode::Flatpak,
-            fps: default_fps(),
+            fps: default_gsr_fps(),
             replay_seconds: default_capture_replay_seconds(),
             container: GsrContainer::Mp4,
             codec: GsrCodec::H264,
             encoder: GsrEncoder::Gpu,
-            quality: GsrQuality::Medium,
+            quality: GsrQuality::VeryHigh,
+            bitrate_mode: GsrBitrateMode::Cbr,
+            video_bitrate_kbps: 20_000,
             output_dir: default_gsr_output_dir_string(),
             audio_enabled: default_capture_audio_enabled(),
             audio_input: default_capture_audio_input(),
@@ -414,12 +443,14 @@ export_mode = "deferred"
 backend = "gpu_screen_recorder"
 target = "eDP"
 mode = "flatpak"
-fps = 30
+fps = 60
 replay_seconds = 25
 container = "mp4"
 codec = "h264"
 encoder = "gpu"
-quality = "medium"
+quality = "very_high"
+bitrate_mode = "cbr"
+video_bitrate_kbps = 20000
 output_dir = "~/Videos/WarThunder Clips/GSR"
 audio_enabled = true
 audio_input = "default_output"
@@ -495,6 +526,10 @@ fn default_capture_replay_seconds() -> u64 {
     25
 }
 
+fn default_gsr_fps() -> u32 {
+    60
+}
+
 fn default_pending_export_dir_string() -> String {
     "~/.cache/wt-clipper/pending".to_owned()
 }
@@ -568,11 +603,28 @@ mod tests {
             GpuScreenRecorderMode::Flatpak
         );
         assert_eq!(config.capture.replay_seconds, 25);
+        assert_eq!(config.capture.quality, GsrQuality::VeryHigh);
+        assert_eq!(config.capture.bitrate_mode, GsrBitrateMode::Cbr);
+        assert_eq!(config.capture.video_bitrate_kbps, 20_000);
         assert_eq!(config.war_thunder.poll_interval_ms, 300);
         assert!(config.triggers.target_destroyed);
         assert!(config.triggers.base_destroyed);
         assert!(!config.triggers.player_destroyed);
         assert_eq!(config.storage.max_clips, 100);
+    }
+
+    #[test]
+    fn gsr_quality_accepts_ultra() {
+        let config: CaptureConfig = toml::from_str(
+            r#"
+quality = "ultra"
+bitrate_mode = "qp"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.quality, GsrQuality::Ultra);
+        assert_eq!(config.bitrate_mode, GsrBitrateMode::Qp);
     }
 
     #[test]

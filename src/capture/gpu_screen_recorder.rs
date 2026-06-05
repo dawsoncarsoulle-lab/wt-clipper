@@ -18,7 +18,7 @@ use crate::{
         buffer::{ClipContext, ClipReason, SavedReplay},
         output::slugify_filename_part,
     },
-    config::{CaptureConfig, GpuScreenRecorderMode},
+    config::{CaptureConfig, GpuScreenRecorderMode, GsrBitrateMode},
     warthunder::events::WarThunderEvent,
 };
 
@@ -73,6 +73,9 @@ pub struct GsrStatus {
     pub replay_seconds: u64,
     pub fps: u32,
     pub quality: String,
+    pub bitrate_mode: String,
+    pub video_bitrate_kbps: u32,
+    pub effective_q_argument: String,
     pub codec: String,
     pub container: String,
     pub encoder: String,
@@ -530,8 +533,10 @@ pub fn build_gsr_command(config: &CaptureConfig) -> anyhow::Result<GsrCommandLin
         config.codec.as_arg().to_owned(),
         "-encoder".to_owned(),
         config.encoder.as_arg().to_owned(),
-        "-q".to_owned(),
-        config.quality.as_arg().to_owned(),
+    ]);
+    append_bitrate_mode_args(&mut args, config);
+    args.extend(["-q".to_owned(), effective_q_argument(config)]);
+    args.extend([
         "-restart-replay-on-save".to_owned(),
         "yes".to_owned(),
         "-ro".to_owned(),
@@ -562,6 +567,39 @@ pub fn build_gsr_command(config: &CaptureConfig) -> anyhow::Result<GsrCommandLin
         output_dir,
         output_prefix,
     })
+}
+
+fn append_bitrate_mode_args(args: &mut Vec<String>, config: &CaptureConfig) {
+    let Some(mode) = config.bitrate_mode.as_arg() else {
+        return;
+    };
+    args.extend(["-bm".to_owned(), mode.to_owned()]);
+}
+
+fn effective_q_argument(config: &CaptureConfig) -> String {
+    match config.bitrate_mode {
+        GsrBitrateMode::Cbr => effective_cbr_bitrate_kbps(config).to_string(),
+        GsrBitrateMode::Auto | GsrBitrateMode::Qp | GsrBitrateMode::Vbr => {
+            config.quality.as_arg().to_owned()
+        }
+    }
+}
+
+fn effective_cbr_bitrate_kbps(config: &CaptureConfig) -> u32 {
+    if config.video_bitrate_kbps == 0 {
+        20_000
+    } else {
+        config.video_bitrate_kbps
+    }
+}
+
+fn bitrate_mode_label(mode: GsrBitrateMode) -> &'static str {
+    match mode {
+        GsrBitrateMode::Auto => "auto",
+        GsrBitrateMode::Qp => "qp",
+        GsrBitrateMode::Cbr => "cbr",
+        GsrBitrateMode::Vbr => "vbr",
+    }
 }
 
 pub fn scan_replay_outputs(output_dir: &Path, extension: &str) -> anyhow::Result<Vec<PathBuf>> {
@@ -717,6 +755,9 @@ fn status_from_inner(inner: &GpuScreenRecorderInner) -> GsrStatus {
         replay_seconds: inner.config.replay_seconds,
         fps: inner.config.fps,
         quality: inner.config.quality.as_arg().to_owned(),
+        bitrate_mode: bitrate_mode_label(inner.config.bitrate_mode).to_owned(),
+        video_bitrate_kbps: inner.config.video_bitrate_kbps,
+        effective_q_argument: effective_q_argument(&inner.config),
         codec: inner.config.codec.as_arg().to_owned(),
         container: inner.config.container.as_arg().to_owned(),
         encoder: inner.config.encoder.as_arg().to_owned(),
@@ -1219,7 +1260,9 @@ pub fn suggested_clip_stem(context: &ClipContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CaptureBackend, GsrCodec, GsrContainer, GsrEncoder, GsrQuality};
+    use crate::config::{
+        CaptureBackend, GsrBitrateMode, GsrCodec, GsrContainer, GsrEncoder, GsrQuality,
+    };
 
     fn test_config(output_dir: PathBuf) -> CaptureConfig {
         CaptureConfig {
@@ -1232,6 +1275,8 @@ mod tests {
             codec: GsrCodec::H264,
             encoder: GsrEncoder::Gpu,
             quality: GsrQuality::Medium,
+            bitrate_mode: GsrBitrateMode::Auto,
+            video_bitrate_kbps: 0,
             output_dir: output_dir.display().to_string(),
             audio_enabled: true,
             audio_input: "default_output".to_owned(),
@@ -1302,6 +1347,84 @@ mod tests {
         config.quality = GsrQuality::High;
         let command = build_gsr_command(&config).unwrap();
         assert!(command.args.windows(2).any(|args| args == ["-q", "high"]));
+    }
+
+    #[test]
+    fn bitrate_mode_auto_uses_quality_q_argument() {
+        let mut config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        config.bitrate_mode = GsrBitrateMode::Auto;
+        config.quality = GsrQuality::VeryHigh;
+
+        let command = build_gsr_command(&config).unwrap();
+
+        assert!(!command.args.iter().any(|arg| arg == "-bm"));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|args| args == ["-q", "very_high"]));
+    }
+
+    #[test]
+    fn bitrate_mode_cbr_adds_bm_cbr_and_bitrate_q_argument() {
+        let mut config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        config.bitrate_mode = GsrBitrateMode::Cbr;
+        config.video_bitrate_kbps = 20_000;
+
+        let command = build_gsr_command(&config).unwrap();
+
+        assert!(command.args.windows(2).any(|args| args == ["-bm", "cbr"]));
+        assert!(command.args.windows(2).any(|args| args == ["-q", "20000"]));
+    }
+
+    #[test]
+    fn bitrate_mode_cbr_does_not_add_ffmpeg_opts() {
+        let mut config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        config.bitrate_mode = GsrBitrateMode::Cbr;
+        config.video_bitrate_kbps = 20_000;
+
+        let command = build_gsr_command(&config).unwrap();
+
+        assert!(!command.args.iter().any(|arg| arg == "-ffmpeg-opts"));
+    }
+
+    #[test]
+    fn bitrate_mode_vbr_uses_quality_q_argument() {
+        let mut config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        config.bitrate_mode = GsrBitrateMode::Vbr;
+        config.quality = GsrQuality::VeryHigh;
+
+        let command = build_gsr_command(&config).unwrap();
+
+        assert!(command.args.windows(2).any(|args| args == ["-bm", "vbr"]));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|args| args == ["-q", "very_high"]));
+        assert!(!command.args.iter().any(|arg| arg == "-ffmpeg-opts"));
+    }
+
+    #[test]
+    fn bitrate_mode_qp_accepts_ultra_quality() {
+        let mut config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        config.bitrate_mode = GsrBitrateMode::Qp;
+        config.quality = GsrQuality::Ultra;
+
+        let command = build_gsr_command(&config).unwrap();
+
+        assert!(command.args.windows(2).any(|args| args == ["-bm", "qp"]));
+        assert!(command.args.windows(2).any(|args| args == ["-q", "ultra"]));
+    }
+
+    #[test]
+    fn bitrate_mode_cbr_with_invalid_bitrate_falls_back_to_20000() {
+        let mut config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        config.bitrate_mode = GsrBitrateMode::Cbr;
+        config.video_bitrate_kbps = 0;
+
+        let command = build_gsr_command(&config).unwrap();
+
+        assert!(command.args.windows(2).any(|args| args == ["-bm", "cbr"]));
+        assert!(command.args.windows(2).any(|args| args == ["-q", "20000"]));
     }
 
     #[test]

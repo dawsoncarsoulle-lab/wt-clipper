@@ -1410,6 +1410,16 @@ function Configuration() {
   ) => setDraft({ ...draft, war_thunder: { ...draft.war_thunder, [key]: value } });
   const updateTrigger = <K extends keyof AppConfig["triggers"]>(key: K, value: boolean) =>
     setDraft({ ...draft, triggers: { ...draft.triggers, [key]: value } });
+  const bitratePreset =
+    [15_000, 20_000, 30_000].includes(draft.capture.video_bitrate_kbps)
+      ? String(draft.capture.video_bitrate_kbps)
+      : "custom";
+  const updateGsrBitratePreset = (value: string) => {
+    if (value === "custom") {
+      return;
+    }
+    updateCapture("video_bitrate_kbps", Number(value));
+  };
 
   async function save() {
     if (!draft) return;
@@ -1532,13 +1542,54 @@ function Configuration() {
         <Field label="Quality GSR">
           <select
             value={draft.capture.quality}
+            disabled={draft.capture.bitrate_mode === "cbr"}
             onChange={(e) => updateCapture("quality", e.target.value as AppConfig["capture"]["quality"])}
           >
             <option value="medium">medium</option>
             <option value="high">high</option>
             <option value="very_high">very_high</option>
+            <option value="ultra">ultra</option>
+          </select>
+          {draft.capture.bitrate_mode === "cbr" && (
+            <p className="field-help">Non utilisé en CBR; le bitrate vidéo contrôle -q.</p>
+          )}
+        </Field>
+        <div className="col-span-2">
+          <h2 className="text-sm font-black uppercase text-zinc-500">Qualité avancée GPU Screen Recorder</h2>
+        </div>
+        <Field label="Mode bitrate">
+          <select
+            value={draft.capture.bitrate_mode}
+            onChange={(e) => updateCapture("bitrate_mode", e.target.value as AppConfig["capture"]["bitrate_mode"])}
+          >
+            <option value="auto">Auto</option>
+            <option value="qp">QP qualité constante</option>
+            <option value="vbr">VBR</option>
+            <option value="cbr">CBR bitrate fixe</option>
           </select>
         </Field>
+        {draft.capture.bitrate_mode === "cbr" && (
+          <Field label="Bitrate vidéo kbps">
+            <div className="grid gap-2">
+              <select value={bitratePreset} onChange={(e) => updateGsrBitratePreset(e.target.value)}>
+                <option value="15000">15000 kbps</option>
+                <option value="20000">20000 kbps</option>
+                <option value="30000">30000 kbps</option>
+                <option value="custom">Personnalisé</option>
+              </select>
+              <input
+                type="number"
+                min={0}
+                step={1000}
+                value={draft.capture.video_bitrate_kbps}
+                onChange={(e) => updateCapture("video_bitrate_kbps", Number(e.target.value))}
+              />
+            </div>
+            <p className="field-help">
+              Pour War Thunder en 1080p60, 20000-30000 kbps donne une meilleure qualité mais augmente la taille des fichiers.
+            </p>
+          </Field>
+        )}
         <Field label="Codec GSR">
           <select
             value={draft.capture.codec}
@@ -1807,6 +1858,8 @@ function Diagnostics() {
               {runtimeStatus?.gsrReplaySeconds ?? "-"}s · quality {runtimeStatus?.gsrQuality ?? "-"}
             </div>
             <div className="mt-1 text-xs text-zinc-500">
+              bitrate {runtimeStatus?.gsrBitrateMode ?? "-"} · {runtimeStatus?.gsrVideoBitrateKbps ?? 0} kbps ·{" "}
+              q {runtimeStatus?.gsrEffectiveQArgument ?? "-"} ·{" "}
               mode {runtimeStatus?.gsrMode ?? "-"} · disponible {runtimeStatus?.gsrAvailable ? "oui" : "non"} ·
               stderr {runtimeStatus?.gsrStderrHandling ?? "-"} · requested{" "}
               {runtimeStatus?.gsrTotalSavesRequested ?? 0}

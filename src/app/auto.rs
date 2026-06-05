@@ -3794,6 +3794,7 @@ fn parse_system_time_rfc3339(value: &str) -> anyhow::Result<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GsrBitrateMode;
 
     fn kill(attacker: &str) -> WarThunderEvent {
         WarThunderEvent::TargetDestroyed {
@@ -5087,6 +5088,24 @@ mod tests {
         assert_eq!(auto_config.buffer_seconds, 40);
         assert_eq!(auto_config.quality.fps, 60);
         assert!(result.restart_required);
+    }
+
+    #[test]
+    fn gsr_bitrate_change_marks_restart_required() {
+        let mut auto_config = test_auto_config(5, 2);
+        auto_config.capture.backend = CaptureBackend::GpuScreenRecorder;
+        auto_config.capture.bitrate_mode = GsrBitrateMode::Auto;
+        auto_config.capture.video_bitrate_kbps = 0;
+        let mut app_config = AppConfig::default();
+        app_config.capture = auto_config.capture.clone();
+        app_config.capture.bitrate_mode = GsrBitrateMode::Cbr;
+        app_config.capture.video_bitrate_kbps = 20_000;
+
+        let result = apply_runtime_config(&mut auto_config, &app_config);
+
+        assert!(result.restart_required);
+        assert_eq!(auto_config.capture.bitrate_mode, GsrBitrateMode::Cbr);
+        assert_eq!(auto_config.capture.video_bitrate_kbps, 20_000);
     }
 
     #[test]

@@ -255,6 +255,9 @@ struct RuntimeStatus {
     gsr_replay_seconds: u64,
     gsr_fps: u32,
     gsr_quality: String,
+    gsr_bitrate_mode: String,
+    gsr_video_bitrate_kbps: u32,
+    gsr_effective_q_argument: String,
     auto_clip_running: bool,
     active_export_mode: ClipExportMode,
     config_restart_required: bool,
@@ -327,6 +330,17 @@ impl RuntimeStatus {
             gsr_replay_seconds: config.capture.replay_seconds,
             gsr_fps: config.capture.fps,
             gsr_quality: config.capture.quality.as_arg().to_owned(),
+            gsr_bitrate_mode: config.capture.bitrate_mode.as_arg().unwrap_or("auto").to_owned(),
+            gsr_video_bitrate_kbps: config.capture.video_bitrate_kbps,
+            gsr_effective_q_argument: if config.capture.bitrate_mode.as_arg() == Some("cbr") {
+                if config.capture.video_bitrate_kbps == 0 {
+                    "20000".to_owned()
+                } else {
+                    config.capture.video_bitrate_kbps.to_string()
+                }
+            } else {
+                config.capture.quality.as_arg().to_owned()
+            },
             auto_clip_running: false,
             active_export_mode: config.clip.export_mode,
             config_restart_required: false,
@@ -374,6 +388,22 @@ async fn save_config(
         status.gsr_replay_seconds = status_config.capture.replay_seconds;
         status.gsr_fps = status_config.capture.fps;
         status.gsr_quality = status_config.capture.quality.as_arg().to_owned();
+        status.gsr_bitrate_mode = status_config
+            .capture
+            .bitrate_mode
+            .as_arg()
+            .unwrap_or("auto")
+            .to_owned();
+        status.gsr_video_bitrate_kbps = status_config.capture.video_bitrate_kbps;
+        status.gsr_effective_q_argument = if status_config.capture.bitrate_mode.as_arg() == Some("cbr") {
+            if status_config.capture.video_bitrate_kbps == 0 {
+                "20000".to_owned()
+            } else {
+                status_config.capture.video_bitrate_kbps.to_string()
+            }
+        } else {
+            status_config.capture.quality.as_arg().to_owned()
+        };
         status.gsr_output_dir = status_config.capture.output_dir_path().ok();
         status.gsr_output_prefix = status
             .gsr_output_dir
@@ -1008,6 +1038,9 @@ fn apply_gsr_runtime_status(status: &mut RuntimeStatus, gsr: &GsrStatus) {
     status.gsr_replay_seconds = gsr.replay_seconds;
     status.gsr_fps = gsr.fps;
     status.gsr_quality = gsr.quality.clone();
+    status.gsr_bitrate_mode = gsr.bitrate_mode.clone();
+    status.gsr_video_bitrate_kbps = gsr.video_bitrate_kbps;
+    status.gsr_effective_q_argument = gsr.effective_q_argument.clone();
 }
 
 fn runtime_event_id(prefix: &str) -> String {

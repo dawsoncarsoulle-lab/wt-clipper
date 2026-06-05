@@ -227,7 +227,9 @@ export type AppConfig = {
     container: "mp4" | "mkv";
     codec: "h264" | "hevc" | "av1";
     encoder: "gpu" | "cpu";
-    quality: "medium" | "high" | "very_high";
+    quality: "medium" | "high" | "very_high" | "ultra";
+    bitrate_mode: "auto" | "qp" | "cbr" | "vbr";
+    video_bitrate_kbps: number;
     output_dir: string;
     audio_enabled: boolean;
     audio_input: string;
@@ -302,6 +304,9 @@ export type RuntimeStatus = {
   gsrReplaySeconds: number;
   gsrFps: number;
   gsrQuality: string;
+  gsrBitrateMode: string;
+  gsrVideoBitrateKbps: number;
+  gsrEffectiveQArgument: string;
   autoClipRunning: boolean;
   activeExportMode: ExportMode;
   configRestartRequired: boolean;
