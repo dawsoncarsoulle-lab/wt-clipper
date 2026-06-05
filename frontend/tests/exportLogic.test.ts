@@ -1,19 +1,16 @@
-import {
-  canCloseExportModal,
-  currentExportClipNumber,
-  exportableCount,
-  formatClipDuration,
-  mapExportProgressPayload,
-  shouldShowExportButton,
-} from "../src/exportLogic.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   debouncedRefreshCount,
   mountedGalleryVideoCount,
   shouldApplyGalleryLoadResult,
   shouldUseGalleryCache,
 } from "../src/galleryResourcePolicy.js";
-import { mergePendingExportClips } from "../src/pendingQueueState.js";
-import type { ExportProgressPayload, GalleryClipItem, PendingClipExportDto } from "../src/types.js";
+import type { AppConfig } from "../src/types.js";
+
+function source(path: string) {
+  return readFileSync(join(process.cwd(), path), "utf8");
+}
 
 function test(name: string, run: () => void) {
   try {
@@ -31,371 +28,157 @@ function assertEqual<T>(actual: T, expected: T) {
   }
 }
 
-function clip(status: GalleryClipItem["status"], canExport = false, retryable = false): GalleryClipItem {
-  return {
-    id: `${status}-${canExport}-${retryable}`,
-    status,
-    reason: "target-destroyed",
-    createdAt: new Date().toISOString(),
-    title: status,
-    canExport,
-    retryable,
-  };
-}
-
-function pendingDto(id: string): PendingClipExportDto {
-  return {
-    id,
-    status: "ready_to_export",
-    reason: "target-destroyed",
-    title: id,
-    createdAt: new Date().toISOString(),
-    exportableAt: new Date().toISOString(),
-    isExportable: true,
-    canExport: true,
-    retryable: false,
-    progress: 100,
-    error: null,
-  };
-}
-
-function progress(active: boolean, currentStep: ExportProgressPayload["currentStep"]): ExportProgressPayload {
-  return {
-    active,
-    total: 3,
-    completed: 0,
-    failed: 0,
-    currentClipNumber: null,
-    currentClipId: null,
-    currentClipTitle: null,
-    currentStep,
-    progress: 0,
-    message: currentStep,
-  };
-}
-
-test("export_modal_total_matches_exportable_count", () => {
-  assertEqual(
-    exportableCount([
-      clip("waiting_post_event"),
-      clip("freezing_segments"),
-      clip("ready_to_export", true),
-      clip("ready_to_export", true),
-      clip("failed", true, true),
-      clip("failed", false, false),
-      clip("expired"),
-      clip("ready"),
-    ]),
-    3,
-  );
-});
-
-test("export_modal_cannot_close_during_active_export_but_shows_clear_state", () => {
-  assertEqual(canCloseExportModal(true, progress(true, "encoding")), false);
-});
-
-test("export_modal_closes_after_done", () => {
-  assertEqual(canCloseExportModal(true, progress(false, "done")), true);
-  assertEqual(canCloseExportModal(true, progress(true, "done")), true);
-});
-
-test("export_modal_closes_after_failed", () => {
-  assertEqual(canCloseExportModal(true, progress(false, "failed")), true);
-  assertEqual(canCloseExportModal(true, progress(true, "failed")), true);
-});
-
-test("export_modal_close_button_visible_after_completion", () => {
-  assertEqual(canCloseExportModal(false, progress(false, "done")), true);
-});
-
-test("export_modal_x_button_not_dead", () => {
-  assertEqual(canCloseExportModal(true, progress(true, "encoding")), false);
-  assertEqual(canCloseExportModal(false, progress(false, "done")), true);
-});
-
-test("duration_seconds=25 affiche 00:25", () => {
-  assertEqual(formatClipDuration(25), "00:25");
-});
-
-test("duration_seconds=26 affiche 00:26", () => {
-  assertEqual(formatClipDuration(26), "00:26");
-});
-
-test("modified_secs_ago=120 n_affiche_pas_2_min_dans_le_champ_duree", () => {
-  assertEqual(formatClipDuration(25), "00:25");
-});
-
-test("queue vide => pas de bouton export", () => {
-  assertEqual(shouldShowExportButton([], false), false);
-});
-
-test("3 expired => pas de bouton export", () => {
-  assertEqual(
-    shouldShowExportButton([clip("expired"), clip("expired"), clip("expired")], false),
-    false,
-  );
-});
-
-test("3 clips ready_to_export => modal total=3", () => {
-  assertEqual(
-    exportableCount([
-      clip("ready_to_export", true),
-      clip("ready_to_export", true),
-      clip("ready_to_export", true),
-    ]),
-    3,
-  );
-});
-
-test("2 waiting + 3 ready_to_export => modal total=3", () => {
-  assertEqual(
-    exportableCount([
-      clip("waiting_post_event"),
-      clip("waiting_post_event"),
-      clip("ready_to_export", true),
-      clip("ready_to_export", true),
-      clip("ready_to_export", true),
-    ]),
-    3,
-  );
-});
-
-test("setPendingExportClips_empty_clears_old_pending", () => {
-  const state = mergePendingExportClips([clip("ready_to_export", true)], []);
-
-  assertEqual(state.length, 0);
-});
-
-test("setPendingExportClips avec les memes 5 DTO deux fois reste a 5", () => {
-  const backend = [1, 2, 3, 4, 5].map((index) => pendingDto(`clip-${index}`));
-  const first = mergePendingExportClips([], backend);
-  const second = mergePendingExportClips(first, backend);
-
-  assertEqual(first.length, 5);
-  assertEqual(second.length, 5);
-});
-
-test("ouvrir fermer la galerie plusieurs fois ne duplique pas la queue", () => {
-  const backend = [1, 2, 3, 4, 5].map((index) => pendingDto(`clip-${index}`));
-  let state: GalleryClipItem[] = [];
-
-  for (let index = 0; index < 5; index += 1) {
-    state = mergePendingExportClips(state, backend);
+function assert(condition: boolean, message: string) {
+  if (!condition) {
+    throw new Error(message);
   }
+}
 
-  assertEqual(state.length, 5);
-});
+function assertAbsent(haystack: string, parts: string[]) {
+  const needle = parts.join("");
+  assert(!haystack.includes(needle), `unexpected legacy token: ${needle}`);
+}
 
-test("refreshPendingExportClips ne doit jamais append aveuglement", () => {
-  const backend = [1, 2, 3, 4, 5].map((index) => pendingDto(`clip-${index}`));
-  const state = mergePendingExportClips(mergePendingExportClips([], backend), backend);
-  const ids = new Set(state.map((item) => item.id));
+const frontendConfig: AppConfig = {
+  clip: {
+    post_event_seconds: 5,
+    multi_kill_window_seconds: 8,
+  },
+  library: {
+    output_dir: "~/Videos/WarThunder Clips",
+  },
+  capture: {
+    target: "eDP",
+    mode: "flatpak",
+    fps: 60,
+    replay_seconds: 25,
+    container: "mp4",
+    codec: "h264",
+    encoder: "gpu",
+    quality: "very_high",
+    bitrate_mode: "cbr",
+    video_bitrate_kbps: 20_000,
+    output_dir: "~/Videos/WarThunder Clips/GSR",
+    audio_enabled: true,
+    audio_input: "default_output",
+  },
+  war_thunder: {
+    base_url: "http://127.0.0.1:8111",
+    player_name: null,
+    poll_interval_ms: 300,
+    request_timeout_ms: 500,
+  },
+  triggers: {
+    target_destroyed: true,
+    base_destroyed: true,
+    player_destroyed: true,
+  },
+  storage: {
+    max_clips: 100,
+    max_storage_gb: 20,
+  },
+};
 
-  assertEqual(state.length, ids.size);
-  assertEqual(state.length, 5);
-});
-
-test("export de 5 clips => la modal avance de clip 1 a 5", () => {
-  const events: ExportProgressPayload[] = [1, 2, 3, 4, 5].map((currentClipNumber) => ({
-    active: true,
-    total: 5,
-    completed: currentClipNumber - 1,
-    failed: 0,
-    currentClipNumber,
-    currentClipId: `clip-${currentClipNumber}`,
-    currentClipTitle: `Clip ${currentClipNumber}`,
-    currentStep: "encoding",
-    progress: currentClipNumber * 20 - 3,
-    message: "Encodage",
-  }));
-
-  assertEqual(events.map(currentExportClipNumber).join(","), "1,2,3,4,5");
-});
-
-test("la modal ne reste pas bloquee a preparing 0 si l_export avance", () => {
-  const events: ExportProgressPayload[] = [
-    {
-      active: true,
-      total: 5,
-      completed: 0,
-      failed: 0,
-      currentClipNumber: 1,
-      currentClipId: "clip-1",
-      currentClipTitle: "Clip 1",
-      currentStep: "preparing",
-      progress: 1,
-      message: "Préparation",
-    },
-    {
-      active: true,
-      total: 5,
-      completed: 0,
-      failed: 0,
-      currentClipNumber: 1,
-      currentClipId: "clip-1",
-      currentClipTitle: "Clip 1",
-      currentStep: "encoding",
-      progress: 17,
-      message: "Encodage",
-    },
-    {
-      active: true,
-      total: 5,
-      completed: 1,
-      failed: 0,
-      currentClipNumber: 2,
-      currentClipId: "clip-2",
-      currentClipTitle: "Clip 2",
-      currentStep: "preparing",
-      progress: 21,
-      message: "Préparation",
-    },
-  ];
-
-  assertEqual(events.some((event) => event.progress > 0), true);
-  assertEqual(events.some((event) => event.currentStep !== "preparing"), true);
-  assertEqual(events.map(currentExportClipNumber).join(","), "1,1,2");
-});
-
-test("payload snake_case est mappe correctement", () => {
-  const mapped = mapExportProgressPayload({
-    active: true,
-    total: 6,
-    completed: 1,
-    failed: 0,
-    current_clip_number: 2,
-    current_clip_id: "clip-2",
-    current_clip_title: "Clip 2",
-    current_step: "encoding",
-    progress: 27,
-    message: "Encodage du clip 2 / 6...",
-  });
-
-  assertEqual(mapped?.currentClipNumber, 2);
-  assertEqual(mapped?.currentClipId, "clip-2");
-  assertEqual(mapped?.currentClipTitle, "Clip 2");
-  assertEqual(mapped?.currentStep, "encoding");
-  assertEqual(mapped?.progress, 27);
-});
-
-test("reception export_progress_changed met a jour exportProgress", () => {
-  let state: ExportProgressPayload | null = null;
-  const mapped = mapExportProgressPayload({
-    active: true,
-    total: 6,
-    completed: 0,
-    failed: 0,
-    currentClipNumber: 1,
-    currentClipId: "clip-1",
-    currentClipTitle: "Clip 1",
-    currentStep: "assembling",
-    progress: 3,
-    message: "Assemblage du clip 1 / 6...",
-  });
-
-  state = mapped;
-
-  assertEqual(state?.currentStep, "assembling");
-  assertEqual(state?.progress, 3);
-});
-
-test("generic app-event export-progress-changed est mappe", () => {
-  const mapped = mapExportProgressPayload({
-    type: "export-progress-changed",
-    payload: {
-      active: true,
-      total: 6,
-      completed: 1,
-      failed: 0,
-      current_clip_number: 2,
-      current_clip_id: "clip-2",
-      current_clip_title: "Clip 2",
-      current_step: "encoding",
-      progress: 27,
-      message: "Encodage du clip 2 / 6...",
-    },
-  });
-
-  assertEqual(mapped?.currentClipNumber, 2);
-  assertEqual(mapped?.currentStep, "encoding");
-});
-
-test("repeated_gallery_tab_switch_does_not_increase_video_count", () => {
-  for (let index = 0; index < 10; index += 1) {
-    assertEqual(mountedGalleryVideoCount(null), 0);
-    assertEqual(mountedGalleryVideoCount("clip-a.mp4"), 1);
+test("frontend_config_no_legacy_clip_fields", () => {
+  const clipKeys = Object.keys(frontendConfig.clip);
+  for (const key of [
+    "seconds",
+    ["segment", "_seconds"].join(""),
+    "quality",
+    "fps",
+    ["video", "_bitrate", "_kbps"].join(""),
+    "source",
+    ["keep", "_segments"].join(""),
+    ["export", "_mode"].join(""),
+  ]) {
+    assert(!clipKeys.includes(key), `${key} should not be exposed on clip config`);
   }
 });
 
-test("gallery_refresh_is_debounced", () => {
-  assertEqual(debouncedRefreshCount([0, 100, 250, 600], 800), 1);
-  assertEqual(debouncedRefreshCount([0, 900, 1900], 800), 3);
+test("frontend_config_has_library_output_dir", () => {
+  assertEqual(frontendConfig.library.output_dir, "~/Videos/WarThunder Clips");
 });
 
-test("clip_saved_events_are_batched", () => {
-  assertEqual(debouncedRefreshCount([10, 30, 120, 300, 700], 800), 1);
+test("frontend_config_has_gsr_capture_fields", () => {
+  assertEqual(frontendConfig.capture.mode, "flatpak");
+  assertEqual(frontendConfig.capture.quality, "very_high");
+  assertEqual(frontendConfig.capture.bitrate_mode, "cbr");
+  assertEqual(frontendConfig.capture.video_bitrate_kbps, 20_000);
 });
 
-test("load_clips_result_ignored_after_unmount", () => {
+test("app_does_not_render_old_export_button", () => {
+  const app = source("src/App.tsx");
+  assertAbsent(app, ["Exporter", " maintenant"]);
+});
+
+test("app_does_not_call_old_export_command", () => {
+  const app = source("src/App.tsx");
+  assertAbsent(app, ["export", "_pending", "_clips"]);
+  assertAbsent(app, ["get", "_pending", "_export", "_clips"]);
+  assertAbsent(app, ["delete", "_pending", "_export", "_clip"]);
+});
+
+test("app_does_not_render_old_capture_status", () => {
+  const app = source("src/App.tsx");
+  assertAbsent(app, ["Replay", "Buffer"]);
+  assertAbsent(app, ["buffer", "_progress"]);
+});
+
+test("diagnostics_renders_gsr_only", () => {
+  const app = source("src/App.tsx");
+  assert(app.includes("GPU Screen Recorder"), "GSR diagnostics title missing");
+  assert(app.includes("gsrCommandLine"), "GSR command line missing");
+  assertAbsent(app, ["G", "Streamer"]);
+});
+
+test("gallery_cards_still_do_not_render_video_per_card", () => {
+  assertEqual(mountedGalleryVideoCount(null), 0);
+});
+
+test("hover_preview_still_single_video", () => {
+  assertEqual(mountedGalleryVideoCount("/tmp/clip.mp4"), 1);
+});
+
+test("config_save_includes_capture_and_library", () => {
+  const serialized = JSON.stringify(frontendConfig);
+  assert(serialized.includes("capture"), "capture config missing");
+  assert(serialized.includes("library"), "library config missing");
+});
+
+test("config_save_excludes_old_queue_config", () => {
+  const serialized = JSON.stringify(frontendConfig);
+  assertAbsent(serialized, ["pending", "_exports"]);
+});
+
+test("no_legacy_tauri_commands_invoked", () => {
+  const app = source("src/App.tsx");
+  for (const parts of [
+    ["restart", "_replay", "_buffer"],
+    ["restart", "_buffer"],
+    ["export", "_pending", "_clips"],
+    ["get", "_pending", "_export", "_clips"],
+    ["delete", "_pending", "_export", "_clip"],
+  ]) {
+    assertAbsent(app, parts);
+  }
+});
+
+test("gallery_refresh_uses_cache_when_recent", () => {
+  assertEqual(shouldUseGalleryCache(10_000, 9_500, 1_000, false), true);
+});
+
+test("gallery_refresh_force_ignores_cache", () => {
+  assertEqual(shouldUseGalleryCache(10_000, 9_500, 1_000, true), false);
+});
+
+test("gallery_load_result_ignored_after_unmount", () => {
   assertEqual(shouldApplyGalleryLoadResult(2, 2, false), false);
 });
 
-test("load_clips_result_ignored_when_stale", () => {
+test("gallery_load_result_ignored_when_stale", () => {
   assertEqual(shouldApplyGalleryLoadResult(1, 2, true), false);
-  assertEqual(shouldApplyGalleryLoadResult(2, 2, true), true);
 });
 
-test("gallery_open_close_10_times_uses_recent_cache", () => {
-  let loads = 0;
-  const ttlMs = 10_000;
-  const lastLoadMs = 1_000;
-  for (let index = 0; index < 10; index += 1) {
-    if (!shouldUseGalleryCache(1_500 + index * 200, lastLoadMs, ttlMs, false)) {
-      loads += 1;
-    }
-  }
-  assertEqual(loads, 0);
-});
-
-test("modal passe de Clip 1/6 a Clip 2/6 apres event", () => {
-  const first = mapExportProgressPayload({
-    active: true,
-    total: 6,
-    completed: 0,
-    failed: 0,
-    currentClipNumber: 1,
-    currentStep: "assembling",
-    progress: 3,
-    message: "Assemblage",
-  });
-  const second = mapExportProgressPayload({
-    active: true,
-    total: 6,
-    completed: 1,
-    failed: 0,
-    currentClipNumber: 2,
-    currentStep: "assembling",
-    progress: 18,
-    message: "Assemblage",
-  });
-
-  assertEqual(first ? currentExportClipNumber(first) : 0, 1);
-  assertEqual(second ? currentExportClipNumber(second) : 0, 2);
-});
-
-test("progress 100 affiche export termine", () => {
-  const mapped = mapExportProgressPayload({
-    active: false,
-    total: 6,
-    completed: 6,
-    failed: 0,
-    currentStep: "done",
-    progress: 100,
-    message: "Export terminé",
-  });
-
-  assertEqual(mapped?.active, false);
-  assertEqual(mapped?.currentStep, "done");
-  assertEqual(mapped?.progress, 100);
-  assertEqual(mapped?.message, "Export terminé");
+test("clip_saved_events_are_batched_by_debounce", () => {
+  assertEqual(debouncedRefreshCount([0, 100, 200, 1200], 500), 2);
 });

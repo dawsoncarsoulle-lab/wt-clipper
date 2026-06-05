@@ -16,7 +16,6 @@ import {
   XCircle,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { formatClipDuration } from "../exportLogic";
 import type {
   ClipEditRequest,
   ClipEditorMode,
@@ -39,7 +38,7 @@ type ClipEditorModalProps = {
   onExportComplete: () => Promise<void> | void;
 };
 
-type QualityPreset = "standard" | "high";
+type EditorQualityPreset = "standard" | "high";
 
 const modeOptions: Array<{
   mode: ClipEditorMode;
@@ -71,7 +70,7 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
   const [autoTitle, setAutoTitle] = useState(true);
   const [title, setTitle] = useState(defaultEditorTitle(clip));
   const [subtitle, setSubtitle] = useState("War Thunder");
-  const [quality, setQuality] = useState<QualityPreset>("standard");
+  const [quality, setQuality] = useState<EditorQualityPreset>("standard");
   const [saveMode, setSaveMode] = useState<SaveMode>("create_copy");
   const [confirmReplaceOpen, setConfirmReplaceOpen] = useState(false);
   const [openFolderAfterExport, setOpenFolderAfterExport] = useState(false);
@@ -641,7 +640,7 @@ function buildEditRequest({
   title: string;
   subtitle: string;
   watermark: boolean;
-  quality: QualityPreset;
+  quality: EditorQualityPreset;
   saveMode: SaveMode;
 }): ClipEditRequest {
   const social = mode === "social_vertical";
@@ -674,4 +673,11 @@ function defaultEditorTitle(clip: ClipInfo): string {
 
 function videoMimeTypeForPath(path: string): string {
   return path.toLowerCase().endsWith(".mp4") ? "video/mp4" : "video/webm";
+}
+
+function formatClipDuration(seconds: number) {
+  const safe = Math.max(0, Math.round(seconds));
+  const minutes = Math.floor(safe / 60);
+  const rest = safe % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
 }

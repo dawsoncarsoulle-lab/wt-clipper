@@ -2,291 +2,163 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { motion, AnimatePresence } from "framer-motion";
 import {
   Activity,
-  AlertTriangle,
   CheckCircle2,
-  CircleDot,
-  Clapperboard,
-  Clock3,
   Cpu,
-  Download,
   FolderOpen,
   Gauge,
   HardDrive,
-  LayoutDashboard,
+  Home,
+  Monitor,
   Play,
   RefreshCcw,
   Save,
-  Search,
   Settings,
   ShieldAlert,
-  Scissors,
-  Sparkles,
   Trash2,
   Video,
-  Wifi,
-  WifiOff,
-  Wrench,
+  Wand2,
   XCircle,
   Zap,
 } from "lucide-react";
-import { useAppStore } from "./store";
-import {
-  canCloseExportModal,
-  currentExportClipNumber,
-  exportableCount,
-  formatClipDuration,
-  mapExportProgressPayload,
-  shouldShowExportButton,
-} from "./exportLogic";
+import { ClipEditorModal } from "./components/ClipEditorModal";
+import appLogo from "./assets/brand/WT_clipper_brand.png";
 import {
   mountedGalleryVideoCount,
   shouldApplyGalleryLoadResult,
   shouldUseGalleryCache,
 } from "./galleryResourcePolicy";
+import { useAppStore } from "./store";
 import type {
   AppConfig,
-  BufferHealth,
-  BufferStatus,
-  CaptureBackend,
   ClipInfo,
   ClipReason,
+  ClipStatus,
+  ClipStatusChangedPayload,
   DoctorReport,
+  GalleryClipItem,
   GsrHealth,
   RuntimeStatus,
 } from "./types";
-import type {
-  ClipStatus,
-  ClipStatusChangedPayload,
-  ExportProgressPayload,
-  ExportSummary,
-  GalleryClipItem,
-  PendingClipExportDto,
-} from "./types";
-import brandLogo from "./assets/brand/WT_clipper_brand.png";
-import { ClipEditorModal } from "./components/ClipEditorModal";
 
 const nav = [
-  { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { id: "clips", label: "Clips", icon: Clapperboard },
+  { id: "dashboard", label: "Tableau", icon: Home },
+  { id: "clips", label: "Clips", icon: Video },
   { id: "config", label: "Configuration", icon: Settings },
-  { id: "diagnostics", label: "Diagnostics", icon: Wrench },
+  { id: "diagnostics", label: "Diagnostics", icon: Activity },
 ] as const;
 
-const GALLERY_REFRESH_DEBOUNCE_MS = 800;
 const GALLERY_CACHE_TTL_MS = 10_000;
+const GALLERY_REFRESH_DEBOUNCE_MS = 800;
+const GALLERY_AUTO_REFRESH_MS = 5000;
 
 const reasonLabel: Record<ClipReason, string> = {
-  "target-destroyed": "KILL",
-  "base-destroyed": "BASE",
-  "player-destroyed": "DEATH",
-  "multi-kill": "MULTI",
-  manual: "MANUAL",
-  unknown: "CLIP",
-};
-
-const processingReasonLabel: Record<ClipReason, string> = {
-  "target-destroyed": "Cible détruite",
-  "base-destroyed": "Base détruite",
-  "player-destroyed": "Joueur détruit",
-  "multi-kill": "Multi-kill",
-  manual: "Clip manuel",
+  target_destroyed: "Cible détruite",
+  base_destroyed: "Base détruite",
+  player_destroyed: "Joueur détruit",
+  multi_kill: "Multi-kill",
+  manual: "Manuel",
   unknown: "Clip",
 };
 
-function formatExportMode(mode: AppConfig["clip"]["export_mode"]) {
-  return mode === "deferred" ? "Différé" : "Instantané";
-}
-
-function bufferHealthLabel(health: BufferHealth) {
-  switch (health) {
-    case "healthy":
-      return "Healthy";
-    case "starting":
-      return "Démarrage buffer...";
-    case "stalled":
-      return "Buffer bloqué";
-    case "error":
-      return "Erreur buffer";
-    case "restarting":
-      return "Redémarrage buffer...";
-  }
-}
-
-function captureBackendLabel(backend?: CaptureBackend | null) {
-  return backend === "gpu_screen_recorder" ? "GPU Replay" : "GStreamer";
-}
+const statusLabel: Record<ClipStatus, string> = {
+  detected: "Détecté",
+  recording: "Capture",
+  encoding: "Encodage",
+  saving: "Sauvegarde",
+  ready: "Prêt",
+  failed: "Erreur",
+};
 
 function gsrHealthLabel(health?: GsrHealth | null) {
   switch (health) {
     case "running":
-      return "Replay GPU armé";
+      return "GPU Replay armé";
     case "saving_replay":
-      return "Sauvegarde GPU...";
+      return "Sauvegarde replay";
     case "starting":
-      return "Démarrage GPU Replay...";
-    case "stopped":
-      return "Replay GPU arrêté";
-    case "not_available":
-      return "GPU Replay indisponible";
+      return "Démarrage";
     case "error":
-      return "Erreur GPU Replay";
+      return "Erreur";
+    case "not_available":
+      return "Indisponible";
+    case "stopped":
     default:
-      return "Replay GPU arrêté";
+      return "Arrêté";
   }
-}
-
-function activeCaptureBackend(config?: AppConfig | null, runtimeStatus?: RuntimeStatus | null) {
-  return runtimeStatus?.activeCaptureBackend ?? config?.capture.backend ?? "gstreamer";
-}
-
-function replayStatusLabel(config?: AppConfig | null, runtimeStatus?: RuntimeStatus | null, buffer?: BufferStatus) {
-  if (activeCaptureBackend(config, runtimeStatus) === "gpu_screen_recorder") {
-    return gsrHealthLabel(runtimeStatus?.gsrHealth);
-  }
-  if (!buffer) return "Buffer starting";
-  const progress = Math.round((buffer.filledSecs / Math.max(1, buffer.totalSecs)) * 100);
-  return buffer.health === "healthy" ? `Buffer ${Math.min(100, progress)}%` : bufferHealthLabel(buffer.health);
 }
 
 export function App() {
   const store = useAppStore();
-  const seenRuntimeEvents = useRef(new Set<string>());
   const galleryRefreshTimeout = useRef<number | null>(null);
   const galleryLoadSeq = useRef(0);
   const lastGalleryLoadAt = useRef(0);
+  const seenRuntimeEvents = useRef(new Set<string>());
 
   useEffect(() => {
     void bootstrap();
+
     const runtimePoll = window.setInterval(() => {
-      void refreshRuntimeStatus().catch((error) =>
-        console.info("[FRONTEND] runtime status refresh failed", error),
-      );
-    }, 1000);
-    console.info("[FRONTEND] listening to wt-connected");
-    console.info("[FRONTEND] listening to wt-disconnected");
-    console.info("[FRONTEND] listening to buffer-progress");
-    console.info("[FRONTEND] listening to kill-detected");
-    console.info("[FRONTEND] listening to clip-saved");
-    console.info("[FRONTEND] listening to export_progress_changed");
-    console.info("[FRONTEND] listening to export-progress-changed");
-    const handleExportProgress = (rawPayload: unknown) => {
-      const payload = mapExportProgressPayload(rawPayload);
-      if (!payload) {
-        console.info("[FRONTEND] ignored malformed export progress", rawPayload);
-        return;
-      }
-      console.info("[FRONTEND] received export progress", payload);
-      store.setExportProgress(payload);
-      if (!payload.active || payload.currentStep === "done" || payload.currentStep === "failed") {
-        store.setIsExporting(false);
-      }
-    };
+      void refreshRuntimeStatus();
+    }, 4000);
+
     const killRefreshTimeouts = new Set<number>();
     const unsubs = [
-      listen("wt-connected", () => {
-        console.info("[FRONTEND] received wt-connected");
-        store.setWtConnected(true);
+      listen<boolean>("wt-connected", (event) => store.setWtConnected(event.payload)),
+      listen("wt-disconnected", () => store.setWtConnected(false)),
+      listen<{ kind: ClipReason; description?: string }>("kill-detected", (event) => {
+        store.addEvent({
+          kind: event.payload.kind,
+          title: reasonLabel[event.payload.kind] ?? "Événement",
+          detail: event.payload.description,
+        });
+        const timeout = window.setTimeout(() => {
+          killRefreshTimeouts.delete(timeout);
+          scheduleGalleryRefresh({ force: true });
+        }, 1200);
+        killRefreshTimeouts.add(timeout);
       }),
-      listen("wt-disconnected", () => {
-        console.info("[FRONTEND] received wt-disconnected");
-        store.setWtConnected(false);
-      }),
-      listen<{ reason: ClipReason; vehicle?: string; target?: string; description: string }>(
-        "kill-detected",
-        (event) => {
-          console.info("[FRONTEND] received kill-detected", event.payload);
-          store.addEvent({
-            kind: event.payload.reason,
-            title: reasonLabel[event.payload.reason],
-            detail: event.payload.description,
-          });
-          const timeout = window.setTimeout(() => {
-            killRefreshTimeouts.delete(timeout);
-            void refreshPendingExportClips().catch((error) =>
-              console.info("[FRONTEND] pending refresh after kill failed", error),
-            );
-          }, 300);
-          killRefreshTimeouts.add(timeout);
-        },
-      ),
       listen<ClipInfo>("clip-saved", (event) => {
-        console.info("[FRONTEND] received clip-saved", event.payload);
         store.addClip(event.payload);
-        scheduleGalleryRefresh("clip-saved");
         store.addEvent({
           kind: event.payload.reason,
           title: "Clip sauvegardé",
           detail: event.payload.fileName,
         });
-        store.showToast("Clip sauvegardé");
+        scheduleGalleryRefresh({ force: true });
       }),
       listen<ClipStatusChangedPayload>("clip-status-changed", (event) => {
-        console.info("[FRONTEND] received clip-status-changed", event.payload);
         store.updateClipStatus(event.payload);
-        if (event.payload.status === "detected") {
-          store.showToast("Clip détecté — création en cours...");
-        } else if (
-          event.payload.status === "waiting_post_event" ||
-          event.payload.status === "freezing_segments" ||
-          event.payload.status === "ready_to_export" ||
-          event.payload.status === "pending_export"
-        ) {
-          store.showToast("Clip en attente d'export");
-        } else if (event.payload.status === "ready") {
-          store.showToast("Clip prêt");
-        } else if (event.payload.status === "failed") {
-          store.showToast("Erreur pendant la création du clip");
-        }
-      }),
-      listen<unknown>("export_progress_changed", (event) => {
-        handleExportProgress(event.payload);
-      }),
-      listen<unknown>("export-progress-changed", (event) => {
-        handleExportProgress(event.payload);
-      }),
-      listen<unknown>("app-event", (event) => {
-        if (
-          event.payload &&
-          typeof event.payload === "object" &&
-          "type" in event.payload &&
-          ((event.payload as { type?: unknown }).type === "export-progress-changed" ||
-            (event.payload as { type?: unknown }).type === "export_progress_changed")
-        ) {
-          handleExportProgress(event.payload);
+        if (event.payload.status === "ready" || event.payload.status === "saving") {
+          scheduleGalleryRefresh({ force: true });
         }
       }),
       listen<{ message: string }>("clip-failed", (event) => {
-        console.info("[FRONTEND] received clip-failed", event.payload);
-        store.showToast(event.payload.message);
+        store.addEvent({ kind: "system", title: "Clip échoué", detail: event.payload.message });
+        store.showToast(`Clip échoué: ${event.payload.message}`);
       }),
-      listen<BufferStatus>("buffer-progress", (event) => {
-        console.info("[FRONTEND] received buffer-progress", event.payload);
-        store.setBuffer(event.payload);
-      }),
-      listen<{ usedBytes: number }>("disk-usage", (event) =>
-        store.setDiskUsedBytes(event.payload.usedBytes),
-      ),
-      listen<{ clips: ClipInfo[]; totalBytes: number }>("clips-loaded", (event) => {
-        store.setClips(event.payload.clips);
-        store.setDiskUsedBytes(event.payload.totalBytes);
-      }),
+      listen<number>("disk-usage", (event) => store.setDiskUsedBytes(event.payload)),
+      listen<ClipInfo[]>("clips-loaded", (event) => store.setClips(event.payload)),
       listen<DoctorReport>("diagnostics-ready", (event) => store.setDiagnostics(event.payload)),
     ];
-    store.setFrontendListenerCount(unsubs.length);
+
+    void Promise.all(unsubs).then((resolved) => {
+      store.setFrontendListenerCount(resolved.length);
+    });
+
     return () => {
       window.clearInterval(runtimePoll);
+      if (galleryRefreshTimeout.current != null) {
+        window.clearTimeout(galleryRefreshTimeout.current);
+      }
       for (const timeout of killRefreshTimeouts) {
         window.clearTimeout(timeout);
       }
-      if (galleryRefreshTimeout.current != null) {
-        window.clearTimeout(galleryRefreshTimeout.current);
-        galleryRefreshTimeout.current = null;
-      }
-      store.setFrontendListenerCount(0);
-      void Promise.all(unsubs).then((items) => items.forEach((unlisten) => unlisten()));
+      void Promise.all(unsubs).then((resolved) => {
+        resolved.forEach((unlisten) => unlisten());
+        store.setFrontendListenerCount(0);
+      });
     };
   }, []);
 
@@ -294,13 +166,11 @@ export function App() {
     if (store.activeView !== "clips") {
       return;
     }
-    scheduleGalleryRefresh("tab-open", { useCache: true, delayMs: 0 });
-    return () => {
-      if (galleryRefreshTimeout.current != null) {
-        window.clearTimeout(galleryRefreshTimeout.current);
-        galleryRefreshTimeout.current = null;
-      }
-    };
+    void refreshClips({ force: true });
+    const interval = window.setInterval(() => {
+      void refreshClips();
+    }, GALLERY_AUTO_REFRESH_MS);
+    return () => window.clearInterval(interval);
   }, [store.activeView]);
 
   async function bootstrap() {
@@ -311,135 +181,75 @@ export function App() {
       ]);
       store.setConfig(config);
       store.setDiagnostics(diagnostics);
-      await refreshClips({ force: true });
-      await refreshPendingExportClips();
-      await refreshRuntimeStatus();
+      await Promise.all([refreshClips({ force: true }), refreshRuntimeStatus()]);
     } catch (error) {
       store.showToast(String(error));
     }
   }
 
-  function scheduleGalleryRefresh(
-    reason: string,
-    options: { useCache?: boolean; delayMs?: number } = {},
-  ) {
+  function scheduleGalleryRefresh(options: { force?: boolean; delayMs?: number } = {}) {
     if (galleryRefreshTimeout.current != null) {
       window.clearTimeout(galleryRefreshTimeout.current);
     }
-    const delayMs = options.delayMs ?? GALLERY_REFRESH_DEBOUNCE_MS;
     galleryRefreshTimeout.current = window.setTimeout(() => {
       galleryRefreshTimeout.current = null;
-      void refreshClips({ force: !options.useCache }).catch((error) => {
-        console.info(`[FRONTEND] gallery refresh failed after ${reason}`, error);
-      });
-    }, delayMs);
+      void refreshClips({ force: options.force ?? false });
+    }, options.delayMs ?? GALLERY_REFRESH_DEBOUNCE_MS);
   }
 
   async function refreshClips(options: { force?: boolean } = {}) {
     const now = Date.now();
-    if (shouldUseGalleryCache(now, lastGalleryLoadAt.current, GALLERY_CACHE_TTL_MS, options.force === true)) {
-      return useAppStore.getState().clips;
+    if (shouldUseGalleryCache(now, lastGalleryLoadAt.current, GALLERY_CACHE_TTL_MS, options.force ?? false)) {
+      return;
     }
     const seq = ++galleryLoadSeq.current;
     const started = performance.now();
-    const clips = await invoke<ClipInfo[]>("load_clips");
-    if (!shouldApplyGalleryLoadResult(seq, galleryLoadSeq.current, true)) {
-      return clips;
+    try {
+      const clips = await invoke<ClipInfo[]>("load_clips");
+      if (!shouldApplyGalleryLoadResult(seq, galleryLoadSeq.current, true)) {
+        return;
+      }
+      lastGalleryLoadAt.current = Date.now();
+      store.setClips(clips);
+      store.recordGalleryRefresh(Math.round(performance.now() - started));
+    } catch (error) {
+      store.showToast(String(error));
     }
-    lastGalleryLoadAt.current = Date.now();
-    store.setClips(clips);
-    store.recordGalleryRefresh(Math.round(performance.now() - started));
-    return clips;
-  }
-
-  async function refreshPendingExportClips() {
-    const clips = await invoke<PendingClipExportDto[]>("get_pending_export_clips");
-    store.setPendingExportClips(clips);
-    return clips;
   }
 
   async function refreshRuntimeStatus() {
-    const status = await invoke<RuntimeStatus>("get_runtime_status");
-    applyRuntimeStatus(status);
-  }
-
-  function applyRuntimeStatus(status: RuntimeStatus) {
-    store.setRuntimeStatus(status);
-    store.setWtConnected(status.wtConnected);
-    store.setBuffer({
-      health: status.bufferHealth,
-      filledSecs: status.bufferFilledSecs,
-      totalSecs: status.bufferTotalSecs,
-      lastSegmentPath: status.bufferLastSegmentPath ?? null,
-      lastSegmentModifiedAt: status.bufferLastSegmentModifiedAt ?? null,
-      lastSegmentAgeSecs: status.bufferLastSegmentAgeSecs ?? null,
-      restartCount: status.bufferRestartCount,
-      lastGstreamerError: status.lastGstreamerError ?? null,
-    });
-    const progress = mapExportProgressPayload(status.exportProgress);
-    if (progress) {
-      const current = useAppStore.getState();
-      if (progress.active || current.isExporting || current.exportProgress?.active) {
-        store.setExportProgress(progress);
-        if (!progress.active || progress.currentStep === "done" || progress.currentStep === "failed") {
-          store.setIsExporting(false);
+    try {
+      const status = await invoke<RuntimeStatus>("get_runtime_status");
+      store.setRuntimeStatus(status);
+      for (const event of status.recentEvents ?? []) {
+        if (seenRuntimeEvents.current.has(event.id)) {
+          continue;
         }
+        seenRuntimeEvents.current.add(event.id);
+        store.addEventEntry({
+          id: event.id,
+          at: event.at,
+          kind: event.kind,
+          title: reasonLabel[event.kind] ?? "Événement",
+          detail: event.description,
+        });
       }
-    }
-    for (const event of [...status.recentEvents].reverse()) {
-      if (seenRuntimeEvents.current.has(event.id)) {
-        continue;
-      }
-      seenRuntimeEvents.current.add(event.id);
-      store.addEventEntry({
-        id: event.id,
-        at: event.at,
-        kind: event.kind,
-        title: reasonLabel[event.kind],
-        detail: event.description,
-      });
+    } catch (error) {
+      console.info("[FRONTEND] runtime status skipped", error);
     }
   }
 
   return (
-    <div className="min-h-screen min-w-[1000px] bg-obsidian text-zinc-100">
-      <div className="noise" />
-      <div className="flex h-screen overflow-hidden">
-        <Sidebar />
-        <main className="relative flex min-w-0 flex-1 flex-col">
-          <Topbar />
-          <div className="min-h-0 flex-1 overflow-y-auto px-7 pb-8 pt-5">
-            <AnimatePresence mode="wait">
-              <motion.div
-                key={store.activeView}
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -8 }}
-                transition={{ duration: 0.18 }}
-              >
-                {store.activeView === "dashboard" && <Dashboard />}
-                {store.activeView === "clips" && <Clips />}
-                {store.activeView === "config" && <Configuration />}
-                {store.activeView === "diagnostics" && <Diagnostics />}
-              </motion.div>
-            </AnimatePresence>
-          </div>
-        </main>
-      </div>
-      <AnimatePresence>
-        {store.toast && (
-          <motion.div
-            initial={{ opacity: 0, y: 16 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 16 }}
-            className="fixed bottom-6 right-7 rounded-lg border border-line bg-[#151b25]/95 px-4 py-3 text-sm shadow-premium"
-          >
-            {store.toast}
-          </motion.div>
-        )}
-      </AnimatePresence>
-      <ProcessingPopup />
-      <ExportProgressModal />
+    <div className="app-shell">
+      <Sidebar />
+      <main className="main">
+        <Topbar />
+        {store.activeView === "dashboard" && <Dashboard />}
+        {store.activeView === "clips" && <Clips onRefresh={() => refreshClips({ force: true })} />}
+        {store.activeView === "config" && <Configuration />}
+        {store.activeView === "diagnostics" && <Diagnostics />}
+      </main>
+      {store.toast && <div className="toast">{store.toast}</div>}
     </div>
   );
 }
@@ -447,69 +257,54 @@ export function App() {
 function Sidebar() {
   const { activeView, setActiveView, config } = useAppStore();
   return (
-    <aside className="z-10 flex w-[248px] shrink-0 flex-col border-r border-line bg-[#0b0e14]/92 px-4 py-5">
-      <div className="mb-7 flex items-center gap-3 px-2">
-        <img
-          src={brandLogo}
-          alt="WT Clipper"
-          className="h-11 w-11 rounded-lg border border-ember/35 bg-[#0b0e14] object-cover shadow-glow"
-        />
+    <aside className="sidebar">
+      <div className="brand">
+        <img className="logo brand-logo" src={appLogo} alt="WT Clipper" />
         <div>
-          <div className="text-[17px] font-black tracking-wide text-white">WT CLIPPER</div>
-          <div className="text-xs font-medium uppercase text-zinc-500">combat recorder</div>
+          <strong>WT Clip</strong>
+          <span>GPU Screen Recorder</span>
         </div>
       </div>
-      <button className="primary-action mb-6" onClick={() => void invoke("save_manual_clip")}>
-        <Play className="h-4 w-4" />
-        Clip manuel
-      </button>
-      <div className="space-y-1">
+      <nav>
         {nav.map((item) => {
           const Icon = item.icon;
           const active = activeView === item.id;
           return (
             <button
               key={item.id}
+              className={active ? "nav-item active" : "nav-item"}
               onClick={() => setActiveView(item.id)}
-              className={`nav-item ${active ? "nav-item-active" : ""}`}
+              type="button"
             >
-              <Icon className="h-4 w-4" />
+              <Icon size={18} />
               {item.label}
             </button>
           );
         })}
-      </div>
-      <div className="mt-auto rounded-lg border border-line bg-white/[0.035] p-3">
-        <div className="mb-1 text-xs uppercase text-zinc-500">Pilote</div>
-        <div className="truncate text-sm font-semibold text-zinc-200">
-          {config?.war_thunder.player_name || "Non configuré"}
-        </div>
+      </nav>
+      <div className="sidebar-footer">
+        <span>Capture GSR</span>
+        <strong>{config?.capture.target || "Target non configurée"}</strong>
       </div>
     </aside>
   );
 }
 
 function Topbar() {
-  const { wtConnected, bufferFilledSecs, bufferTotalSecs, bufferHealth, config, runtimeStatus } = useAppStore();
-  const bufferLabel = replayStatusLabel(config, runtimeStatus, {
-    health: bufferHealth,
-    filledSecs: bufferFilledSecs,
-    totalSecs: bufferTotalSecs,
-    restartCount: runtimeStatus?.bufferRestartCount ?? 0,
-  });
+  const { wtConnected, runtimeStatus } = useAppStore();
   return (
-    <header className="z-10 flex h-[66px] shrink-0 items-center justify-between border-b border-line bg-[#0b0e14]/72 px-7 backdrop-blur">
-      <div className="flex items-center gap-3">
-        <StatusPill connected={wtConnected} />
-        <div className="h-4 w-px bg-white/10" />
-        <div className="flex items-center gap-2 text-sm text-zinc-400">
-          <Gauge className="h-4 w-4 text-amberline" />
-          {bufferLabel}
-        </div>
+    <header className="topbar">
+      <div>
+        <h1>War Thunder clips</h1>
+        <p>Capture replay GPU Screen Recorder, galerie et exports sociaux.</p>
       </div>
-      <div className="flex items-center gap-2 text-sm text-zinc-500">
-        <CircleDot className="h-3.5 w-3.5 text-ember" />
-        War Thunder localhost : 127.0.0.1:8111
+      <div className="topbar-status">
+        <StatusPill connected={wtConnected} />
+        <span className={`status-chip ${runtimeStatus?.gsrHealth === "running" ? "ok" : "warn"}`}>
+          <Cpu size={15} />
+          {gsrHealthLabel(runtimeStatus?.gsrHealth)}
+        </span>
+        <img className="topbar-logo" src={appLogo} alt="WT Clip" />
       </div>
     </header>
   );
@@ -517,570 +312,696 @@ function Topbar() {
 
 function StatusPill({ connected }: { connected: boolean }) {
   return (
-    <div
-      className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-semibold ${
-        connected
-          ? "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"
-          : "border-red-400/25 bg-red-400/10 text-red-300"
-      }`}
-    >
-      {connected ? <Wifi className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
-      {connected ? "War Thunder connecté" : "War Thunder déconnecté"}
-    </div>
+    <span className={`status-chip ${connected ? "ok" : "warn"}`}>
+      <Zap size={15} />
+      {connected ? "War Thunder connecté" : "War Thunder en attente"}
+    </span>
   );
 }
 
 function Dashboard() {
   const state = useAppStore();
-  const progress = Math.min(100, (state.bufferFilledSecs / Math.max(1, state.bufferTotalSecs)) * 100);
-  const backend = activeCaptureBackend(state.config, state.runtimeStatus);
-  const bufferLabel = replayStatusLabel(state.config, state.runtimeStatus, {
-    health: state.bufferHealth,
-    filledSecs: state.bufferFilledSecs,
-    totalSecs: state.bufferTotalSecs,
-    restartCount: state.bufferRestartCount,
-  });
+  const status = state.runtimeStatus;
   return (
-    <div className="space-y-6">
-      <section className="hero-panel">
-        <div className="relative z-10 max-w-2xl">
-          <div className="mb-5 flex items-center gap-3">
-            <StatusPill connected={state.wtConnected} />
-            <span className="rounded-full border border-line bg-white/5 px-3 py-1.5 text-sm text-zinc-400">
-              {state.config?.clip.quality.toUpperCase()} · {state.config?.clip.fps} FPS
-            </span>
-            <span className="rounded-full border border-line bg-white/5 px-3 py-1.5 text-sm text-zinc-400">
-              {bufferLabel}
-            </span>
-          </div>
-          <h1 className="text-4xl font-black tracking-normal text-white">
-            {backend === "gpu_screen_recorder" ? "Replay GPU armé" : "Replay buffer armé"}
-          </h1>
-          <p className="mt-3 max-w-xl text-sm leading-6 text-zinc-400">
-            Capture automatique des kills personnels, génération de clips et suivi temps réel
-            du serveur War Thunder local.
+    <section className="view-grid">
+      <div className="hero-panel">
+        <div>
+          <span className="eyebrow">Backend actif</span>
+          <h2>GPU Screen Recorder</h2>
+          <p>
+            {gsrHealthLabel(status?.gsrHealth)} · {status?.gsrMode ?? state.config?.capture.mode ?? "auto"} ·{" "}
+            {status?.gsrTarget ?? state.config?.capture.target ?? "target non configurée"}
           </p>
-          <button className="primary-action mt-7 w-fit px-5" onClick={() => void invoke("save_manual_clip")}>
-            <Play className="h-4 w-4" />
-            Clip manuel
-          </button>
         </div>
-        <div className="buffer-orb">
-          <svg viewBox="0 0 120 120" className="h-40 w-40">
-            <circle cx="60" cy="60" r="48" stroke="rgba(255,255,255,.08)" strokeWidth="10" fill="none" />
-            <circle
-              cx="60"
-              cy="60"
-              r="48"
-              stroke="#ff5a2f"
-              strokeWidth="10"
-              fill="none"
-              strokeLinecap="round"
-              strokeDasharray={`${(backend === "gpu_screen_recorder" ? 100 : progress) * 3.015} 301.5`}
-              transform="rotate(-90 60 60)"
-            />
-          </svg>
-          <div className="absolute text-center">
-            <div className="text-3xl font-black text-white">
-              {backend === "gpu_screen_recorder" ? "GPU" : `${Math.round(progress)}%`}
-            </div>
-            <div className="text-xs uppercase text-zinc-500">
-              {backend === "gpu_screen_recorder" ? "replay" : "buffer"}
-            </div>
-          </div>
-        </div>
-      </section>
-      <div className="grid grid-cols-5 gap-4">
-        <Metric icon={Zap} label="Kills session" value={state.sessionKills} />
-        <Metric icon={Sparkles} label="Multi-kills" value={state.sessionMultiKills} />
-        <Metric icon={Video} label="Clips sauvegardés" value={state.clipsSaved} />
-        <Metric icon={HardDrive} label="Stockage" value={formatBytes(state.diskUsedBytes)} />
-        <Metric
-          icon={Download}
-          label="Mode actif"
-          value={captureBackendLabel(backend)}
-        />
+        <button type="button" className="primary" onClick={() => void invoke("save_manual_clip")}>
+          <Save size={18} />
+          Clip manuel
+        </button>
       </div>
-      <section>
-        <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-lg font-bold text-white">Événements récents</h2>
-          <Activity className="h-4 w-4 text-zinc-500" />
-        </div>
-        <div className="event-feed">
-          {state.events.length === 0 ? (
-            <Empty label="Aucun événement pour cette session" />
-          ) : (
-            state.events.map((event) => (
-              <div key={event.id} className="event-row">
-                <span className="font-mono text-xs text-zinc-500">{event.at}</span>
-                <span className="badge">{String(event.title)}</span>
-                <span className="truncate text-sm text-zinc-300">{event.detail}</span>
-              </div>
-            ))
-          )}
-        </div>
-      </section>
-    </div>
-  );
-}
 
-function ProcessingPopup() {
-  const { processingClips } = useAppStore();
-  const visibleClips = processingClips.filter(
-    (clip) =>
-      ["detected", "recording", "encoding", "saving", "exporting", "failed"].includes(
-        clip.status,
-      ) && (clip.status !== "ready" || clip.filePath == null),
-  );
+      <Metric icon={Video} label="Clips" value={state.clips.length} />
+      <Metric icon={Gauge} label="Kills session" value={state.sessionKills} />
+      <Metric icon={Wand2} label="Multi-kills" value={state.sessionMultiKills} />
+      <Metric icon={HardDrive} label="Stockage" value={formatBytes(state.diskUsedBytes)} />
 
-  if (visibleClips.length === 0) {
-    return null;
-  }
-
-  return (
-    <AnimatePresence>
-      <motion.aside
-        initial={{ opacity: 0, y: 16, scale: 0.98 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        exit={{ opacity: 0, y: 16, scale: 0.98 }}
-        transition={{ duration: 0.18 }}
-        className="fixed right-6 top-[84px] z-40 w-[360px] rounded-lg border border-line bg-[#111722]/96 p-4 shadow-premium backdrop-blur"
-      >
-        <div className="flex items-start justify-between gap-3">
+      <section className="panel wide">
+        <div className="panel-heading">
           <div>
-            <div className="text-xs uppercase tracking-wide text-zinc-500">Upload en cours</div>
-            <div className="mt-1 text-base font-bold text-white">
-              {visibleClips.length} clip{visibleClips.length > 1 ? "s" : ""} en traitement
-            </div>
+            <span className="eyebrow">Activité</span>
+            <h3>Événements récents</h3>
           </div>
-          <RefreshCcw className="mt-0.5 h-4 w-4 animate-spin text-ember" />
         </div>
-        <div className="mt-4 space-y-3">
-          {visibleClips.slice(0, 3).map((clip) => (
-            <div key={clip.id} className="rounded-md border border-white/10 bg-white/[0.035] p-3">
-              <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-bold text-white">{clip.title}</div>
-                  <div className="mt-1 text-xs text-zinc-400">{processingReasonLabel[clip.reason]}</div>
-                </div>
-                <span className={`reason reason-${clip.reason}`}>{getClipStatusLabel(clip.status)}</span>
-              </div>
-              <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
-                <div
-                  className={`processing-progress ${clip.progress == null && clip.status !== "failed" ? "indeterminate" : ""}`}
-                  style={{
-                    width: `${Math.max(
-                      6,
-                      Math.min(
-                        100,
-                        clip.progress ?? (clip.status === "failed" ? 100 : 42),
-                      ),
-                    )}%`,
-                  }}
-                />
-              </div>
-              <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
-                <span>{relativeCreatedAt(clip.createdAt)}</span>
-                <span>{clip.status === "failed" ? "Erreur" : "En cours"}</span>
-              </div>
-              {clip.status === "failed" && clip.error && (
-                <p className="mt-2 break-words text-xs text-[#ffb7aa]">{clip.error}</p>
-              )}
-            </div>
+        <div className="event-list">
+          {state.events.length === 0 && <Empty label="Aucun événement reçu." />}
+          {state.events.map((event) => (
+            <article key={event.id} className="event-row">
+              <span>{event.at}</span>
+              <strong>{event.title}</strong>
+              <p>{event.detail ?? ""}</p>
+            </article>
           ))}
         </div>
-      </motion.aside>
-    </AnimatePresence>
-  );
-}
-
-function ExportProgressModal() {
-  const { exportProgress, isExporting, setExportProgress, setActiveView, showToast } = useAppStore();
-  if (!exportProgress) return null;
-  const progressState = exportProgress;
-
-  const canClose = canCloseExportModal(isExporting, progressState);
-  const finished =
-    !progressState.active ||
-    progressState.currentStep === "done" ||
-    progressState.currentStep === "failed";
-  const hasErrors = progressState.failed > 0;
-  const currentClipNumber = currentExportClipNumber(progressState);
-
-  function close() {
-    if (!canClose) {
-      showToast("Export en cours, fermeture désactivée pour éviter de corrompre les clips.");
-      return;
-    }
-    setExportProgress(null);
-  }
-
-  return (
-    <AnimatePresence>
-      <motion.div
-        className="modal-backdrop"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-      >
-        <motion.section
-          className="export-modal"
-          initial={{ opacity: 0, y: 18, scale: 0.98 }}
-          animate={{ opacity: 1, y: 0, scale: 1 }}
-          exit={{ opacity: 0, y: 18, scale: 0.98 }}
-        >
-          <div className="flex items-start justify-between gap-5">
-            <div>
-              <div className="text-xs uppercase tracking-wide text-zinc-500">
-                {finished ? "Export terminé" : "Export des clips en cours"}
-              </div>
-              <h2 className="mt-1 text-xl font-black text-white">
-                {finished
-                  ? hasErrors
-                    ? `${progressState.completed} clips exportés, ${progressState.failed} erreur`
-                    : "Export terminé"
-                  : `Clip ${currentClipNumber} / ${progressState.total}`}
-              </h2>
-            </div>
-            <button
-              className="icon-button"
-              onClick={close}
-              disabled={!canClose}
-              title={
-                canClose
-                  ? "Fermer"
-                  : "Export en cours, fermeture désactivée pour éviter de corrompre les clips."
-              }
-            >
-              <XCircle className="h-4 w-4" />
-            </button>
-          </div>
-          <div className="mt-5 rounded-md border border-white/10 bg-white/[0.035] p-4">
-            <div className="text-sm font-bold text-white">
-              {progressState.currentClipTitle ?? progressState.message}
-            </div>
-            {progressState.currentClipTitle && (
-              <div className="mt-1 text-sm text-zinc-300">{progressState.message}</div>
-            )}
-            <div className="mt-1 text-xs uppercase text-zinc-500">{progressState.currentStep}</div>
-            <div className="mt-4 h-3 overflow-hidden rounded-full bg-white/10">
-              <div className="processing-progress" style={{ width: `${progressState.progress}%` }} />
-            </div>
-            <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
-              <span>
-                {progressState.completed} terminés · {progressState.failed} erreurs
-              </span>
-              <span>{Math.round(progressState.progress)}%</span>
-            </div>
-          </div>
-          {!finished && (
-            <p className="mt-4 text-sm text-[#ffd0c3]">
-              Export en cours, fermeture désactivée pour éviter de corrompre les clips.
-            </p>
-          )}
-          {finished && hasErrors && (
-            <p className="mt-4 text-sm text-[#ffb7aa]">
-              Libérez de l'espace disque puis réessayez si l'erreur vient du stockage.
-            </p>
-          )}
-          {finished && (
-            <div className="mt-5 flex justify-end gap-2">
-              <button className="ghost-button" onClick={() => setActiveView("clips")}>
-                <Clapperboard className="h-4 w-4" />
-                Ouvrir la galerie
-              </button>
-              <button className="primary-action w-fit px-5" onClick={close}>
-                Fermer
-              </button>
-            </div>
-          )}
-        </motion.section>
-      </motion.div>
-    </AnimatePresence>
+      </section>
+    </section>
   );
 }
 
 function Metric({ icon: Icon, label, value }: { icon: typeof Zap; label: string; value: string | number }) {
   return (
-    <div className="metric-panel">
-      <Icon className="h-5 w-5 text-ember" />
-      <div>
-        <div className="text-2xl font-black text-white">{value}</div>
-        <div className="text-xs uppercase text-zinc-500">{label}</div>
-      </div>
+    <div className="metric-card">
+      <Icon size={20} />
+      <span>{label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }
 
-function Clips() {
-  const {
-    activeView,
-    config,
-    clips,
-    processingClips,
-    isExporting,
-    setClips,
-    setExportProgress,
-    setGalleryMountedVideoCount,
-    setGalleryRenderedClipCount,
-    setIsExporting,
-    setPendingExportClips,
-    showToast,
-    runtimeStatus,
-  } = useAppStore();
+function Clips({ onRefresh }: { onRefresh: () => void }) {
+  const { clips, processingClips, setClips, showToast, setGalleryRenderedClipCount, setGalleryMountedVideoCount } =
+    useAppStore();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | ClipReason>("all");
   const [editingClip, setEditingClip] = useState<ClipInfo | null>(null);
   const [activePreviewPath, setActivePreviewPath] = useState<string | null>(null);
-  const refreshSeq = useRef(0);
-  const mounted = useRef(true);
-  useEffect(() => {
-    mounted.current = true;
-    return () => {
-      mounted.current = false;
-    };
-  }, []);
-  useEffect(() => {
-    let cancelled = false;
-    async function refreshPending() {
-      const pending = await invoke<PendingClipExportDto[]>("get_pending_export_clips");
-      if (!cancelled) {
-        setPendingExportClips(pending);
-      }
-    }
-    void refreshPending().catch((error) => console.info("[FRONTEND] pending refresh failed", error));
-    if (activeView !== "clips") {
-      return () => {
-        cancelled = true;
-      };
-    }
-    const interval = window.setInterval(() => {
-      void refreshPending().catch((error) => console.info("[FRONTEND] pending refresh failed", error));
-    }, 2000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [activeView, setPendingExportClips]);
+
   const galleryItems = useMemo(() => {
     const readyPaths = new Set(clips.map((clip) => clip.path));
-    const processing = processingClips.filter((clip) => !clip.filePath || !readyPaths.has(clip.filePath));
-    const ready = clips.map(clipToGalleryItem);
-    return [...processing, ...ready].sort(compareGalleryItems).filter((clip) => {
-      const haystack = `${clip.title} ${clip.filePath ?? ""}`.toLowerCase();
-      const matchesQuery = haystack.includes(query.toLowerCase());
-      const matchesFilter = filter === "all" || clip.reason === filter;
-      return matchesQuery && matchesFilter;
-    });
-  }, [clips, processingClips, query, filter]);
+    const transient = processingClips.filter((clip) => !clip.filePath || !readyPaths.has(clip.filePath));
+    return [...transient, ...clips.map(clipToGalleryItem)]
+      .filter((clip) => {
+        const haystack = `${clip.title} ${clip.filePath ?? ""}`.toLowerCase();
+        const matchesQuery = haystack.includes(query.toLowerCase());
+        const matchesFilter = filter === "all" || clip.reason === filter;
+        return matchesQuery && matchesFilter;
+      })
+      .sort(compareGalleryItems);
+  }, [clips, filter, processingClips, query]);
+
   useEffect(() => {
     setGalleryRenderedClipCount(galleryItems.length);
   }, [galleryItems.length, setGalleryRenderedClipCount]);
+
   useEffect(() => {
     setGalleryMountedVideoCount(mountedGalleryVideoCount(activePreviewPath));
-    return () => setGalleryMountedVideoCount(0);
   }, [activePreviewPath, setGalleryMountedVideoCount]);
-  const activeProcessingCount = processingClips.filter((clip) =>
-    ["detected", "recording", "encoding", "saving", "exporting"].includes(clip.status),
-  ).length;
-  const waitingPostEventCount = processingClips.filter((clip) => clip.status === "waiting_post_event").length;
-  const freezingSegmentsCount = processingClips.filter((clip) => clip.status === "freezing_segments").length;
-  const pendingExportReadyCount = exportableCount(processingClips);
-  const backend = activeCaptureBackend(config, runtimeStatus);
-  const showExportButton = backend !== "gpu_screen_recorder" && shouldShowExportButton(processingClips, isExporting);
-
-  async function refresh() {
-    const seq = ++refreshSeq.current;
-    const [clips, pending] = await Promise.all([
-      invoke<ClipInfo[]>("load_clips"),
-      invoke<PendingClipExportDto[]>("get_pending_export_clips"),
-    ]);
-    if (!shouldApplyGalleryLoadResult(seq, refreshSeq.current, mounted.current)) {
-      return;
-    }
-    setClips(clips);
-    setPendingExportClips(pending);
-  }
 
   async function remove(path: string) {
-    await invoke("delete_clip", { path });
-    setClips(clips.filter((clip) => clip.path !== path));
-    showToast("Clip supprimé");
-  }
-
-  async function exportNow() {
-    if (isExporting) return;
-    setIsExporting(true);
-    let activeExportableCount = 0;
     try {
-      const pending = await invoke<PendingClipExportDto[]>("get_pending_export_clips");
-      setPendingExportClips(pending);
-      activeExportableCount = exportableCount(pending);
-      if (activeExportableCount === 0) {
-        setExportProgress(null);
-        showToast("Aucun clip prêt à exporter.");
-        return;
-      }
-      setExportProgress({
-        active: true,
-        total: activeExportableCount,
-        completed: 0,
-        failed: 0,
-        currentClipNumber: null,
-        currentClipId: null,
-        currentClipTitle: null,
-        currentStep: "preparing",
-        progress: 0,
-        message: "Préparation de l'export...",
-      });
-      showToast("Export des clips en attente...");
-      const summary = await invoke<ExportSummary>("export_pending_clips");
-      setExportProgress({
-        active: false,
-        total: summary.total || activeExportableCount,
-        completed: summary.completed,
-        failed: summary.failed,
-        currentClipNumber: null,
-        currentClipId: null,
-        currentClipTitle: null,
-        currentStep: summary.failed > 0 ? "failed" : "done",
-        progress: 100,
-        message:
-          summary.failed > 0
-            ? `${summary.completed} clips exportés, ${summary.failed} erreur${summary.failed > 1 ? "s" : ""}`
-            : "Export terminé",
-      });
-      await refresh();
-      if (
-        summary.total === 0 &&
-        processingClips.some((clip) => clip.status === "waiting_post_event" || clip.status === "freezing_segments")
-      ) {
-        showToast("Certains clips ne sont pas encore prêts à exporter");
-      } else if (summary.failed > 0) {
-        showToast(`${summary.completed} clips exportés, ${summary.failed} erreur`);
-      } else {
-        showToast("Export terminé");
-      }
+      await invoke("delete_clip", { path });
+      setClips(clips.filter((clip) => clip.path !== path));
+      showToast("Clip supprimé");
     } catch (error) {
-      setExportProgress({
-        active: false,
-        total: activeExportableCount,
-        completed: 0,
-        failed: activeExportableCount,
-        currentClipNumber: null,
-        currentClipId: null,
-        currentClipTitle: null,
-        currentStep: "failed",
-        progress: 100,
-        message: String(error),
-      });
-      await refresh();
-      showToast(`Export: ${String(error)}`);
-    } finally {
-      setIsExporting(false);
+      showToast(String(error));
     }
   }
 
   return (
-    <div className="space-y-5">
-      <div className="flex items-center justify-between">
+    <section className="panel">
+      <div className="panel-heading">
         <div>
-          <h1 className="text-2xl font-black text-white">Bibliothèque</h1>
-          <p className="text-sm text-zinc-500">{galleryItems.length} clips affichés</p>
+          <span className="eyebrow">Galerie</span>
+          <h2>Clips</h2>
         </div>
-        <div className="flex gap-2">
-          {showExportButton && (
-            <button
-              className="primary-action w-fit px-5"
-              disabled={isExporting}
-              onClick={() => void exportNow()}
-            >
-              <Download className="h-4 w-4" />
-              {isExporting
-                ? "Export en cours..."
-                : "Exporter maintenant"}
-            </button>
-          )}
-          <button className="ghost-button" onClick={() => void refresh()}>
-            <RefreshCcw className="h-4 w-4" />
-            Rafraîchir
-          </button>
-          <button className="ghost-button" onClick={() => void invoke("open_output_folder")}>
-            <FolderOpen className="h-4 w-4" />
-            Dossier
-          </button>
-        </div>
+        <button type="button" className="secondary" onClick={onRefresh}>
+          <RefreshCcw size={17} />
+          Rafraîchir
+        </button>
       </div>
+
       <div className="toolbar">
-        <div className="search-box">
-          <Search className="h-4 w-4 text-zinc-500" />
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Rechercher un clip" />
-        </div>
-        <div className="segmented">
-          {(["all", "target-destroyed", "base-destroyed", "multi-kill", "player-destroyed", "manual"] as const).map((item) => (
-            <button key={item} className={filter === item ? "active" : ""} onClick={() => setFilter(item)}>
-              {item === "all" ? "Tous" : reasonLabel[item]}
-            </button>
+        <input
+          type="search"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Rechercher un clip"
+        />
+        <select value={filter} onChange={(event) => setFilter(event.target.value as "all" | ClipReason)}>
+          <option value="all">Tous</option>
+          {Object.entries(reasonLabel).map(([value, label]) => (
+            <option key={value} value={value}>
+              {label}
+            </option>
           ))}
-        </div>
+        </select>
       </div>
-      {activeProcessingCount > 0 && (
-        <div className="processing-banner">
-          {activeProcessingCount} clip{activeProcessingCount > 1 ? "s" : ""} en cours de traitement
-        </div>
-      )}
-      {waitingPostEventCount > 0 && (
-        <div className="processing-banner">
-          {waitingPostEventCount} clip{waitingPostEventCount > 1 ? "s" : ""} en cours de capture...
-        </div>
-      )}
-      {freezingSegmentsCount > 0 && (
-        <div className="processing-banner">
-          Préservation des segments pour {freezingSegmentsCount} clip{freezingSegmentsCount > 1 ? "s" : ""}...
-        </div>
-      )}
-      {backend !== "gpu_screen_recorder" && pendingExportReadyCount > 0 && (
-        <div className="processing-banner pending-export-banner">
-          {pendingExportReadyCount} clip{pendingExportReadyCount > 1 ? "s" : ""} prêt
-          {pendingExportReadyCount > 1 ? "s" : ""} à exporter
-          <button disabled={isExporting} onClick={() => void exportNow()}>
-            {isExporting ? "Export en cours..." : "Exporter maintenant"}
-          </button>
-        </div>
-      )}
-      {galleryItems.length === 0 ? (
-        <Empty label="Aucun clip trouvé" />
-      ) : (
-        <div className="clip-grid">
-          {galleryItems.map((clip) => (
-            clip.status === "ready" && clip.filePath ? (
-              <ClipCard
-                key={clip.id}
-                clip={galleryItemToClipInfo(clip)}
-                previewActive={activePreviewPath === clip.filePath}
-                onPreviewStart={() => setActivePreviewPath(clip.filePath!)}
-                onPreviewEnd={() => setActivePreviewPath((current) => (current === clip.filePath ? null : current))}
-                onEdit={() => setEditingClip(galleryItemToClipInfo(clip))}
-                onDelete={() => void remove(clip.filePath!)}
-              />
-            ) : (
-              <ClipProcessingCard
-                key={clip.id}
-                clip={clip}
-                disabledExport={isExporting}
-                onExportNow={() => void exportNow()}
-              />
-            )
-          ))}
-        </div>
-      )}
+
+      <div className="clip-grid">
+        {galleryItems.length === 0 && <Empty label="Aucun clip dans la bibliothèque." />}
+        {galleryItems.map((clip) =>
+          clip.status === "ready" && clip.filePath ? (
+            <ClipCard
+              key={clip.id}
+              clip={galleryItemToClipInfo(clip)}
+              activePreviewPath={activePreviewPath}
+              onPreviewChange={setActivePreviewPath}
+              onDelete={remove}
+              onEdit={setEditingClip}
+            />
+          ) : (
+            <ClipProcessingCard key={clip.id} clip={clip} />
+          ),
+        )}
+      </div>
+
       {editingClip && (
         <ClipEditorModal
           clip={editingClip}
           onClose={() => setEditingClip(null)}
-          onExportComplete={refresh}
+          onExportComplete={async () => {
+            setEditingClip(null);
+            onRefresh();
+          }}
         />
       )}
+    </section>
+  );
+}
+
+function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
+  const progress = clip.progress ?? (clip.status === "failed" ? 0 : 48);
+  return (
+    <article className="clip-card processing">
+      <div className="clip-thumb placeholder">
+        <Activity size={28} />
+      </div>
+      <div className="clip-meta">
+        <span className={`badge ${reasonClass(clip.reason)}`}>{reasonLabel[clip.reason]}</span>
+        <h3>{clip.title}</h3>
+        <p>{clip.error ?? statusLabel[clip.status]}</p>
+        {clip.status !== "failed" && (
+          <div className="progress">
+            <span style={{ width: `${Math.max(8, Math.min(100, progress))}%` }} />
+          </div>
+        )}
+      </div>
+    </article>
+  );
+}
+
+function ClipCard({
+  clip,
+  activePreviewPath,
+  onPreviewChange,
+  onDelete,
+  onEdit,
+}: {
+  clip: ClipInfo;
+  activePreviewPath: string | null;
+  onPreviewChange: (path: string | null) => void;
+  onDelete: (path: string) => void;
+  onEdit: (clip: ClipInfo) => void;
+}) {
+  const [videoFailed, setVideoFailed] = useState(false);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const previewActive = activePreviewPath === clip.path;
+  const videoSrc = clip.previewUrl ?? convertFileSrc(clip.path);
+  const thumbnailSrc = clip.thumbnailPath ? convertFileSrc(clip.thumbnailPath) : null;
+
+  const attachVideoRef = useCallback((node: HTMLVideoElement | null) => {
+    if (videoRef.current && videoRef.current !== node) {
+      releaseVideoElement(videoRef.current);
+    }
+    videoRef.current = node;
+  }, []);
+
+  useEffect(() => {
+    if (!previewActive && videoRef.current) {
+      releaseVideoElement(videoRef.current);
+    }
+  }, [previewActive]);
+
+  useEffect(() => () => {
+    if (videoRef.current) {
+      releaseVideoElement(videoRef.current);
+    }
+  }, []);
+
+  return (
+    <article
+      className="clip-card"
+      onMouseEnter={() => onPreviewChange(clip.path)}
+      onMouseLeave={() => onPreviewChange(null)}
+    >
+      <div className="clip-thumb">
+        {previewActive && !videoFailed ? (
+          <video
+            ref={attachVideoRef}
+            src={videoSrc}
+            muted
+            playsInline
+            loop
+            preload="metadata"
+            onCanPlay={(event) => void event.currentTarget.play().catch(() => setVideoFailed(true))}
+            onError={() => setVideoFailed(true)}
+          />
+        ) : thumbnailSrc ? (
+          <img src={thumbnailSrc} alt="" loading="lazy" />
+        ) : (
+          <FilmFallback />
+        )}
+      </div>
+      <div className="clip-meta">
+        <span className={`badge ${reasonClass(clip.reason)}`}>{reasonLabel[clip.reason]}</span>
+        <h3>{clip.fileName}</h3>
+        <p>
+          {formatClipDuration(clip.durationSeconds)} · {formatBytes(clip.sizeBytes)} ·{" "}
+          {relativeTime(clip.modifiedSecsAgo)}
+        </p>
+      </div>
+      <div className="clip-actions">
+        <button type="button" title="Éditer" onClick={() => onEdit(clip)}>
+          <Wand2 size={16} />
+        </button>
+        <button type="button" title="Ouvrir le dossier" onClick={() => void invoke("open_parent_folder", { path: clip.path })}>
+          <FolderOpen size={16} />
+        </button>
+        <button type="button" title="Supprimer" onClick={() => onDelete(clip.path)}>
+          <Trash2 size={16} />
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function Configuration() {
+  const { config, runtimeStatus, setConfig, setRuntimeStatus, showToast } = useAppStore();
+  const [draft, setDraft] = useState<AppConfig | null>(config);
+  const [saving, setSaving] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+
+  useEffect(() => {
+    setDraft(config);
+  }, [config]);
+
+  if (!draft) {
+    return <Empty label="Configuration en chargement." />;
+  }
+
+  const updateClip = <K extends keyof AppConfig["clip"]>(key: K, value: AppConfig["clip"][K]) =>
+    setDraft({ ...draft, clip: { ...draft.clip, [key]: value } });
+  const updateLibrary = <K extends keyof AppConfig["library"]>(key: K, value: AppConfig["library"][K]) =>
+    setDraft({ ...draft, library: { ...draft.library, [key]: value } });
+  const updateCapture = <K extends keyof AppConfig["capture"]>(key: K, value: AppConfig["capture"][K]) =>
+    setDraft({ ...draft, capture: { ...draft.capture, [key]: value } });
+  const updateWt = <K extends keyof AppConfig["war_thunder"]>(key: K, value: AppConfig["war_thunder"][K]) =>
+    setDraft({ ...draft, war_thunder: { ...draft.war_thunder, [key]: value } });
+  const updateTrigger = <K extends keyof AppConfig["triggers"]>(key: K, value: boolean) =>
+    setDraft({ ...draft, triggers: { ...draft.triggers, [key]: value } });
+  const updateStorage = <K extends keyof AppConfig["storage"]>(key: K, value: AppConfig["storage"][K]) =>
+    setDraft({ ...draft, storage: { ...draft.storage, [key]: value } });
+
+  async function save() {
+    const nextConfig = draft;
+    if (!nextConfig) {
+      return;
+    }
+    setSaving(true);
+    try {
+      await invoke("save_config", { config: nextConfig });
+      const status = await invoke<RuntimeStatus>("get_runtime_status");
+      setConfig(nextConfig);
+      setRuntimeStatus(status);
+      showToast("Configuration sauvegardée");
+    } catch (error) {
+      showToast(String(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function checkForUpdates() {
+    setCheckingUpdate(true);
+    try {
+      const result = await invoke<{ available: boolean }>("check_for_updates");
+      showToast(result.available ? "Mise à jour disponible" : "WT Clip est à jour");
+    } catch (error) {
+      showToast(String(error));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
+  return (
+    <section className="config-layout">
+      <ConfigSection title="Clip">
+        <Field label="Délai après événement">
+          <input
+            type="number"
+            min={0}
+            value={draft.clip.post_event_seconds}
+            onChange={(event) => updateClip("post_event_seconds", Number(event.target.value))}
+          />
+        </Field>
+        <Field label="Fenêtre multi-kill">
+          <input
+            type="number"
+            min={1}
+            value={draft.clip.multi_kill_window_seconds}
+            onChange={(event) => updateClip("multi_kill_window_seconds", Number(event.target.value))}
+          />
+        </Field>
+      </ConfigSection>
+
+      <ConfigSection title="Bibliothèque">
+        <Field label="Dossier bibliothèque">
+          <input value={draft.library.output_dir} onChange={(event) => updateLibrary("output_dir", event.target.value)} />
+        </Field>
+      </ConfigSection>
+
+      <ConfigSection title="GPU Screen Recorder">
+        <Field label="Target">
+          <input value={draft.capture.target} onChange={(event) => updateCapture("target", event.target.value)} />
+        </Field>
+        <Field label="Mode">
+          <select value={draft.capture.mode} onChange={(event) => updateCapture("mode", event.target.value as AppConfig["capture"]["mode"])}>
+            <option value="auto">Auto</option>
+            <option value="native">Native</option>
+            <option value="flatpak">Flatpak</option>
+          </select>
+        </Field>
+        <Field label="FPS">
+          <input type="number" min={1} value={draft.capture.fps} onChange={(event) => updateCapture("fps", Number(event.target.value))} />
+        </Field>
+        <Field label="Durée replay">
+          <input
+            type="number"
+            min={5}
+            value={draft.capture.replay_seconds}
+            onChange={(event) => updateCapture("replay_seconds", Number(event.target.value))}
+          />
+        </Field>
+        <Field label="Conteneur">
+          <select value={draft.capture.container} onChange={(event) => updateCapture("container", event.target.value as AppConfig["capture"]["container"])}>
+            <option value="mp4">MP4</option>
+            <option value="mkv">MKV</option>
+          </select>
+        </Field>
+        <Field label="Codec">
+          <select value={draft.capture.codec} onChange={(event) => updateCapture("codec", event.target.value as AppConfig["capture"]["codec"])}>
+            <option value="h264">H.264</option>
+            <option value="hevc">HEVC</option>
+            <option value="av1">AV1</option>
+          </select>
+        </Field>
+        <Field label="Encodeur">
+          <select value={draft.capture.encoder} onChange={(event) => updateCapture("encoder", event.target.value as AppConfig["capture"]["encoder"])}>
+            <option value="gpu">GPU</option>
+            <option value="cpu">CPU</option>
+          </select>
+        </Field>
+        <Field label="Mode bitrate">
+          <select
+            value={draft.capture.bitrate_mode}
+            onChange={(event) => updateCapture("bitrate_mode", event.target.value as AppConfig["capture"]["bitrate_mode"])}
+          >
+            <option value="auto">Auto</option>
+            <option value="qp">QP qualité constante</option>
+            <option value="vbr">VBR</option>
+            <option value="cbr">CBR bitrate fixe</option>
+          </select>
+        </Field>
+        {draft.capture.bitrate_mode === "cbr" ? (
+          <Field label="Bitrate vidéo kbps">
+            <input
+              type="number"
+              min={1000}
+              step={500}
+              value={draft.capture.video_bitrate_kbps}
+              onChange={(event) => updateCapture("video_bitrate_kbps", Number(event.target.value))}
+            />
+          </Field>
+        ) : (
+          <Field label="Qualité">
+            <select value={draft.capture.quality} onChange={(event) => updateCapture("quality", event.target.value as AppConfig["capture"]["quality"])}>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="very_high">Very high</option>
+              <option value="ultra">Ultra</option>
+            </select>
+          </Field>
+        )}
+        <p className="help-text">
+          Pour War Thunder en 1080p60, 20000-30000 kbps donne une meilleure qualité mais augmente la taille des fichiers.
+        </p>
+        <Field label="Audio" className="toggle-field">
+          <div className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={draft.capture.audio_enabled}
+              onChange={(event) => updateCapture("audio_enabled", event.target.checked)}
+            />
+            <strong>Activé</strong>
+          </div>
+        </Field>
+        <Field label="Entrée audio">
+          <input value={draft.capture.audio_input} onChange={(event) => updateCapture("audio_input", event.target.value)} />
+        </Field>
+        <Field label="Dossier capture GSR">
+          <input value={draft.capture.output_dir} onChange={(event) => updateCapture("output_dir", event.target.value)} />
+        </Field>
+      </ConfigSection>
+
+      <ConfigSection title="War Thunder">
+        <Field label="Base URL">
+          <input value={draft.war_thunder.base_url} onChange={(event) => updateWt("base_url", event.target.value)} />
+        </Field>
+        <Field label="Joueur">
+          <input
+            value={draft.war_thunder.player_name ?? ""}
+            onChange={(event) => updateWt("player_name", event.target.value || null)}
+          />
+        </Field>
+        <Field label="Poll ms">
+          <input
+            type="number"
+            min={100}
+            value={draft.war_thunder.poll_interval_ms}
+            onChange={(event) => updateWt("poll_interval_ms", Number(event.target.value))}
+          />
+        </Field>
+        <Field label="Timeout ms">
+          <input
+            type="number"
+            min={100}
+            value={draft.war_thunder.request_timeout_ms}
+            onChange={(event) => updateWt("request_timeout_ms", Number(event.target.value))}
+          />
+        </Field>
+      </ConfigSection>
+
+      <ConfigSection title="Déclencheurs">
+        {Object.entries(draft.triggers).map(([key, value]) => (
+          <label key={key} className="inline-toggle">
+            <input type="checkbox" checked={value} onChange={(event) => updateTrigger(key as keyof AppConfig["triggers"], event.target.checked)} />
+            {reasonLabel[key as ClipReason] ?? key}
+          </label>
+        ))}
+      </ConfigSection>
+
+      <ConfigSection title="Stockage">
+        <Field label="Max clips">
+          <input type="number" min={1} value={draft.storage.max_clips} onChange={(event) => updateStorage("max_clips", Number(event.target.value))} />
+        </Field>
+        <Field label="Max Go">
+          <input
+            type="number"
+            min={1}
+            value={draft.storage.max_storage_gb}
+            onChange={(event) => updateStorage("max_storage_gb", Number(event.target.value))}
+          />
+        </Field>
+      </ConfigSection>
+
+      <div className="config-actions">
+        <button type="button" className="primary" onClick={save} disabled={saving}>
+          <Save size={17} />
+          {saving ? "Sauvegarde..." : "Sauvegarder"}
+        </button>
+        <button type="button" className="secondary" onClick={checkForUpdates} disabled={checkingUpdate}>
+          <RefreshCcw size={17} />
+          {checkingUpdate ? "Vérification..." : "Vérifier les mises à jour"}
+        </button>
+        {runtimeStatus?.configRestartRequired && <span className="status-chip warn">Redémarrage GSR requis</span>}
+      </div>
+    </section>
+  );
+}
+
+function Diagnostics() {
+  const { diagnostics, runtimeStatus, setDiagnostics, setDiagnosticsRunning, setRuntimeStatus, diagnosticsRunning, showToast } =
+    useAppStore();
+  const [gsrTestRunning, setGsrTestRunning] = useState(false);
+
+  async function run() {
+    setDiagnosticsRunning(true);
+    try {
+      const [report, status] = await Promise.all([
+        invoke<DoctorReport>("run_diagnostics"),
+        invoke<RuntimeStatus>("get_runtime_status"),
+      ]);
+      setDiagnostics(report);
+      setRuntimeStatus(status);
+    } catch (error) {
+      showToast(String(error));
+      setDiagnosticsRunning(false);
+    }
+  }
+
+  async function restartGpuRecorder() {
+    try {
+      await invoke("restart_gpu_recorder");
+      const status = await invoke<RuntimeStatus>("get_runtime_status");
+      setRuntimeStatus(status);
+      showToast("GPU recorder redémarré");
+    } catch (error) {
+      showToast(String(error));
+    }
+  }
+
+  async function testGsrSaveReplay() {
+    setGsrTestRunning(true);
+    try {
+      const path = await invoke<string>("test_gsr_save_replay");
+      const status = await invoke<RuntimeStatus>("get_runtime_status");
+      setRuntimeStatus(status);
+      showToast(`Replay GSR sauvegardé: ${path}`);
+    } catch (error) {
+      showToast(String(error));
+    } finally {
+      setGsrTestRunning(false);
+    }
+  }
+
+  const checks = diagnostics?.checks ?? [];
+  const counts = checks.reduce(
+    (acc, check) => ({ ...acc, [check.status]: acc[check.status] + 1 }),
+    { ok: 0, warn: 0, error: 0 },
+  );
+
+  return (
+    <section className="diagnostics-grid">
+      <div className="panel wide">
+        <div className="panel-heading">
+          <div>
+            <span className="eyebrow">Diagnostics</span>
+            <h2>GPU Screen Recorder</h2>
+          </div>
+          <div className="button-row">
+            <button type="button" className="secondary" onClick={run} disabled={diagnosticsRunning}>
+              <RefreshCcw size={17} />
+              {diagnosticsRunning ? "Analyse..." : "Relancer"}
+            </button>
+            <button type="button" className="secondary" onClick={restartGpuRecorder}>
+              <Cpu size={17} />
+              Redémarrer GPU Recorder
+            </button>
+            <button type="button" className="primary" onClick={testGsrSaveReplay} disabled={gsrTestRunning}>
+              <Play size={17} />
+              Tester sauvegarde GSR
+            </button>
+          </div>
+        </div>
+        <div className="status-summary">
+          <span className="status-chip ok">{counts.ok} OK</span>
+          <span className="status-chip warn">{counts.warn} avertissements</span>
+          <span className="status-chip error">{counts.error} erreurs</span>
+        </div>
+        <div className="diagnostic-list">
+          {checks.map((check) => (
+            <DiagnosticRow key={check.name} check={check} />
+          ))}
+        </div>
+      </div>
+
+      <div className="panel wide">
+        <div className="panel-heading">
+          <div>
+            <span className="eyebrow">Runtime</span>
+            <h3>État GSR</h3>
+          </div>
+        </div>
+        <div className="kv-grid">
+          <KeyValue label="Disponible" value={runtimeStatus?.gsrAvailable ? "Oui" : "Non"} />
+          <KeyValue label="État" value={gsrHealthLabel(runtimeStatus?.gsrHealth)} />
+          <KeyValue label="Mode" value={runtimeStatus?.gsrMode ?? "-"} />
+          <KeyValue label="PID wrapper" value={runtimeStatus?.gsrWrapperPid ?? "-"} />
+          <KeyValue label="PID recorder" value={runtimeStatus?.gsrRecorderPid ?? "-"} />
+          <KeyValue label="PID signal" value={runtimeStatus?.gsrSignalPid ?? "-"} />
+          <KeyValue label="Target" value={runtimeStatus?.gsrTarget ?? "-"} />
+          <KeyValue label="FPS" value={runtimeStatus?.gsrFps ?? "-"} />
+          <KeyValue label="Replay seconds" value={runtimeStatus?.gsrReplaySeconds ?? "-"} />
+          <KeyValue label="Quality" value={runtimeStatus?.gsrQuality ?? "-"} />
+          <KeyValue label="Bitrate mode" value={runtimeStatus?.gsrBitrateMode ?? "-"} />
+          <KeyValue label="Video bitrate kbps" value={runtimeStatus?.gsrVideoBitrateKbps ?? "-"} />
+          <KeyValue label="Effective -q" value={runtimeStatus?.gsrEffectiveQArgument ?? "-"} />
+          <KeyValue label="Save queue" value={runtimeStatus?.gsrSaveQueueLen ?? "-"} />
+          <KeyValue label="Saves requested" value={runtimeStatus?.gsrTotalSavesRequested ?? "-"} />
+          <KeyValue label="Saves completed" value={runtimeStatus?.gsrTotalSavesCompleted ?? "-"} />
+          <KeyValue label="Saves failed" value={runtimeStatus?.gsrTotalSavesFailed ?? "-"} />
+          <KeyValue label="FD backend" value={runtimeStatus?.backendFdCount ?? "-"} />
+          <KeyValue label="Scans galerie" value={runtimeStatus?.galleryScanCount ?? "-"} />
+          <KeyValue label="Dernier scan ms" value={runtimeStatus?.galleryLastScanMs ?? "-"} />
+          <KeyValue label="Scans actifs" value={runtimeStatus?.galleryActiveScans ?? "-"} />
+          <KeyValue label="Dernière sortie" value={runtimeStatus?.gsrLastOutput ?? "-"} />
+          <KeyValue label="Erreur GSR" value={runtimeStatus?.gsrLastError ?? "-"} />
+        </div>
+        <pre className="command-line">{runtimeStatus?.gsrCommandLine ?? "Commande GSR indisponible"}</pre>
+      </div>
+    </section>
+  );
+}
+
+function ConfigSection({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="panel config-section">
+      <div className="panel-heading">
+        <h3>{title}</h3>
+      </div>
+      <div className="form-grid">{children}</div>
+    </section>
+  );
+}
+
+function DiagnosticRow({ check }: { check: DoctorReport["checks"][number] }) {
+  const Icon = check.status === "ok" ? CheckCircle2 : check.status === "warn" ? ShieldAlert : XCircle;
+  return (
+    <article className={`diagnostic-row ${check.status}`}>
+      <Icon size={18} />
+      <div>
+        <strong>{check.name}</strong>
+        <p>{check.message}</p>
+        {check.hint && <small>{check.hint}</small>}
+      </div>
+    </article>
+  );
+}
+
+function Field({ label, children, className }: { label: string; children: ReactNode; className?: string }) {
+  return (
+    <label className={className ? `field ${className}` : "field"}>
+      <span>{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function KeyValue({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div className="kv">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function Empty({ label }: { label: string }) {
+  return <div className="empty-state">{label}</div>;
+}
+
+function FilmFallback() {
+  return (
+    <div className="clip-fallback">
+      <Monitor size={30} />
     </div>
   );
 }
@@ -1097,41 +1018,14 @@ function clipToGalleryItem(clip: ClipInfo): GalleryClipItem {
     previewUrl: clip.previewUrl ?? undefined,
     durationSeconds: clip.durationSeconds,
     sizeBytes: clip.sizeBytes,
-    progress: 100,
   };
-}
-
-function compareGalleryItems(a: GalleryClipItem, b: GalleryClipItem) {
-  const rank = (status: ClipStatus) => {
-    if (status === "ready_to_export") return 0;
-    if (status === "freezing_segments") return 1;
-    if (status === "waiting_post_event") return 2;
-    if (status === "exporting") return 3;
-    if (status === "failed") return 4;
-    if (status === "expired") return 5;
-    if (status === "ready") return 7;
-    return 6;
-  };
-  return rank(a.status) - rank(b.status) || secondsAgo(a.createdAt) - secondsAgo(b.createdAt);
-}
-
-function nextPendingExportableSeconds(clips: GalleryClipItem[]) {
-  const next = clips
-    .filter((clip) => clip.status === "waiting_post_event" && clip.isExportable === false && clip.exportableAt)
-    .map((clip) => new Date(clip.exportableAt!).getTime())
-    .filter((timestamp) => Number.isFinite(timestamp))
-    .sort((a, b) => a - b)[0];
-  if (next == null) {
-    return null;
-  }
-  return Math.max(1, Math.ceil((next - Date.now()) / 1000));
 }
 
 function galleryItemToClipInfo(clip: GalleryClipItem): ClipInfo {
   return {
-    path: clip.filePath ?? "",
-    thumbnailPath: clip.thumbnailPath ?? null,
-    previewUrl: clip.previewUrl ?? null,
+    path: clip.filePath ?? clip.id,
+    thumbnailPath: clip.thumbnailPath,
+    previewUrl: clip.previewUrl,
     fileName: clip.title,
     reason: clip.reason,
     sizeBytes: clip.sizeBytes ?? 0,
@@ -1140,907 +1034,64 @@ function galleryItemToClipInfo(clip: GalleryClipItem): ClipInfo {
   };
 }
 
-function ClipProcessingCard({
-  clip,
-  disabledExport,
-  onExportNow,
-}: {
-  clip: GalleryClipItem;
-  disabledExport: boolean;
-  onExportNow: () => void;
-}) {
-  const { setPendingExportClips, showToast } = useAppStore();
-  const failed = clip.status === "failed";
-  const waiting = clip.status === "waiting_post_event";
-  const freezing = clip.status === "freezing_segments";
-  const pending = (clip.status === "ready_to_export" || clip.status === "pending_export") && clip.canExport !== false;
-  const expired = clip.status === "expired";
-  const exporting = clip.status === "exporting";
-  const progress = clip.progress ?? (failed ? 0 : 48);
-  const exportableIn = waiting && clip.isExportable === false ? nextPendingExportableSeconds([clip]) : null;
-  async function removePending() {
-    await invoke("delete_pending_export_clip", { id: clip.id });
-    const pendingClips = await invoke<PendingClipExportDto[]>("get_pending_export_clips");
-    setPendingExportClips(pendingClips);
-    showToast("Clip pending supprimé");
+function compareGalleryItems(a: GalleryClipItem, b: GalleryClipItem) {
+  const rank = (status: ClipStatus) => (status === "failed" ? 1 : status === "ready" ? 2 : 0);
+  const rankDiff = rank(a.status) - rank(b.status);
+  if (rankDiff !== 0) {
+    return rankDiff;
   }
-  return (
-    <motion.article whileHover={{ y: -4 }} className={`clip-card processing-card ${failed ? "failed" : ""}`}>
-      <div className="clip-thumb processing-thumb">
-        <div className="processing-skeleton" />
-        <div className="processing-loader">
-          {failed ? (
-            <AlertTriangle className="h-7 w-7 text-[#ff8d7a]" />
-          ) : pending || waiting || freezing ? (
-            <Clock3 className="h-7 w-7 text-amberline" />
-          ) : (
-            <RefreshCcw className={`h-7 w-7 text-ember ${exporting ? "animate-spin" : ""}`} />
-          )}
-        </div>
-        <span className={`reason reason-${clip.reason}`}>{reasonLabel[clip.reason]}</span>
-      </div>
-      <div className="p-3">
-        <div className="truncate text-sm font-bold text-white">{clip.title || processingReasonLabel[clip.reason]}</div>
-        <div className="mt-1 text-sm text-zinc-400">
-          {waiting && clip.isExportable === false
-            ? exportableIn == null
-              ? "En attente de la fin du buffer..."
-              : `En attente de la fin du buffer... ${exportableIn}s`
-            : expired
-              ? "Clip expiré — les segments ont été écrasés"
-            : getClipStatusLabel(clip.status)}
-        </div>
-        {!pending && !waiting && !freezing && !expired && (
-          <>
-            <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
-              <div
-                className={`processing-progress ${clip.progress == null && !failed ? "indeterminate" : ""}`}
-                style={{ width: `${Math.max(4, Math.min(100, progress))}%` }}
-              />
-            </div>
-            <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
-              <span>{relativeCreatedAt(clip.createdAt)}</span>
-              {!failed && <span>{Math.round(progress)}%</span>}
-            </div>
-          </>
-        )}
-        {(waiting || freezing) && (
-          <div className="mt-3 rounded-md border border-white/10 bg-white/[0.035] px-3 py-2 text-xs text-zinc-400">
-            {waiting ? "Capture de la fin du clip..." : "Préservation des segments..."}
-          </div>
-        )}
-        {pending && (
-          <button className="delete-button mt-3" disabled={disabledExport} onClick={onExportNow}>
-            <Download className="h-3.5 w-3.5" />
-            {disabledExport ? "Export en cours..." : "Exporter maintenant"}
-          </button>
-        )}
-        {expired && (
-          <div className="mt-3 rounded-md border border-[#ff8d7a]/25 bg-[#351711]/45 px-3 py-2 text-xs text-[#ffb7aa]">
-            {clip.error ?? "Clip expiré — les segments ont été écrasés"}
-            <button className="delete-button mt-3" onClick={() => void removePending()}>
-              <Trash2 className="h-3.5 w-3.5" />
-              Supprimer
-            </button>
-          </div>
-        )}
-        {failed && (
-          <div className="mt-3 rounded-md border border-[#ff8d7a]/25 bg-[#351711]/45 px-3 py-2 text-xs text-[#ffb7aa]">
-            <div className="font-bold text-[#ffd0c7]">Détails</div>
-            <p className="mt-2 break-words">{clip.error ?? "Erreur pendant la création du clip"}</p>
-            {clip.canExport !== false && (
-              <button className="delete-button mt-3" disabled={disabledExport} onClick={onExportNow}>
-                <RefreshCcw className="h-3.5 w-3.5" />
-                {disabledExport ? "Export en cours..." : "Réessayer"}
-              </button>
-            )}
-            <button className="delete-button mt-2" onClick={() => void removePending()}>
-              <Trash2 className="h-3.5 w-3.5" />
-              Supprimer
-            </button>
-          </div>
-        )}
-      </div>
-    </motion.article>
-  );
-}
-
-function getClipStatusLabel(status: ClipStatus): string {
-  switch (status) {
-    case "detected":
-      return "Clip détecté...";
-    case "recording":
-      return "Capture en cours...";
-    case "encoding":
-      return "Encodage du clip...";
-    case "saving":
-      return "Sauvegarde...";
-    case "pending_export":
-      return "En attente d'export";
-    case "waiting_post_event":
-      return "Capture de la fin du clip...";
-    case "freezing_segments":
-      return "Préservation des segments...";
-    case "ready_to_export":
-      return "Prêt à exporter";
-    case "exporting":
-      return "Export en cours...";
-    case "ready":
-      return "Prêt";
-    case "failed":
-      return "Erreur";
-    case "expired":
-      return "Clip expiré";
-  }
-}
-
-function ClipCard({
-  clip,
-  previewActive,
-  onPreviewStart,
-  onPreviewEnd,
-  onDelete,
-  onEdit,
-}: {
-  clip: ClipInfo;
-  previewActive: boolean;
-  onPreviewStart: () => void;
-  onPreviewEnd: () => void;
-  onDelete: () => void;
-  onEdit: () => void;
-}) {
-  const [videoFailed, setVideoFailed] = useState(false);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const videoSrc = clip.previewUrl ?? convertFileSrc(clip.path);
-  const videoType = videoMimeTypeForPath(clip.path);
-  const thumbnailSrc = clip.thumbnailPath ? convertFileSrc(clip.thumbnailPath) : null;
-  const editedBadge = editedBadgeForPath(clip.path);
-
-  useEffect(() => {
-    setVideoFailed(false);
-  }, [videoSrc]);
-
-  const attachVideoRef = useCallback((node: HTMLVideoElement | null) => {
-    if (videoRef.current && videoRef.current !== node) {
-      releaseVideoElement(videoRef.current);
-    }
-    videoRef.current = node;
-  }, []);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!previewActive || !video || videoFailed) return;
-
-    video.muted = true;
-    video.play().catch((error) => {
-      console.info("[FRONTEND] clip preview autoplay failed", error);
-    });
-  }, [previewActive, videoFailed]);
-
-  useEffect(() => {
-    if (previewActive) {
-      return;
-    }
-    const video = videoRef.current;
-    if (!video) return;
-    releaseVideoElement(video);
-  }, [previewActive]);
-
-  useEffect(() => {
-    return () => {
-      const video = videoRef.current;
-      if (video) {
-        releaseVideoElement(video);
-      }
-    };
-  }, []);
-
-  return (
-    <motion.article
-      whileHover={{ y: -4 }}
-      className="clip-card"
-      onMouseEnter={onPreviewStart}
-      onMouseLeave={onPreviewEnd}
-      onFocus={onPreviewStart}
-      onBlur={onPreviewEnd}
-    >
-      <div className="clip-thumb">
-        {previewActive && !videoFailed ? (
-          <video
-            ref={attachVideoRef}
-            muted
-            playsInline
-            preload="none"
-            loop
-            onError={() => setVideoFailed(true)}
-          >
-            <source src={videoSrc} type={videoType} />
-          </video>
-        ) : thumbnailSrc ? (
-          <img src={thumbnailSrc} alt="" loading="lazy" decoding="async" />
-        ) : (
-          <div className="clip-thumb-fallback">
-            <Video className="h-9 w-9 text-ember" />
-            <span>{videoFailed ? "Vidéo indisponible" : "Preview"}</span>
-          </div>
-        )}
-        <div className="clip-overlay" />
-        <span className={`reason reason-${clip.reason}`}>{reasonLabel[clip.reason]}</span>
-        {editedBadge && <span className="edited-badge">{editedBadge}</span>}
-        <button className="icon-button absolute bottom-3 right-3">
-          <Play className="h-4 w-4" />
-        </button>
-      </div>
-      <div className="p-3">
-        <div className="truncate text-sm font-bold text-white">{clip.fileName}</div>
-        <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
-          <span>{formatBytes(clip.sizeBytes)}</span>
-          <span>{formatClipDuration(clip.durationSeconds)}</span>
-        </div>
-        <div className="mt-1 text-xs text-zinc-600">Ajouté {relativeTime(clip.modifiedSecsAgo)}</div>
-        <div className="clip-card-actions">
-          <button className="ghost-button" onClick={onEdit}>
-            <Scissors className="h-3.5 w-3.5" />
-            Éditer
-          </button>
-          <button className="delete-button" onClick={onDelete}>
-            <Trash2 className="h-3.5 w-3.5" />
-            Supprimer
-          </button>
-        </div>
-      </div>
-    </motion.article>
-  );
-}
-
-function Configuration() {
-  const { config, runtimeStatus, setConfig, setPendingExportClips, setRuntimeStatus, showToast } = useAppStore();
-  const [draft, setDraft] = useState<AppConfig | null>(config);
-  const [checkingUpdate, setCheckingUpdate] = useState(false);
-  useEffect(() => setDraft(config), [config]);
-  if (!draft) return <Empty label="Configuration en chargement" />;
-
-  const updateClip = <K extends keyof AppConfig["clip"]>(key: K, value: AppConfig["clip"][K]) =>
-    setDraft({ ...draft, clip: { ...draft.clip, [key]: value } });
-  const updateCapture = <K extends keyof AppConfig["capture"]>(key: K, value: AppConfig["capture"][K]) =>
-    setDraft({ ...draft, capture: { ...draft.capture, [key]: value } });
-  const updateWt = <K extends keyof AppConfig["war_thunder"]>(
-    key: K,
-    value: AppConfig["war_thunder"][K],
-  ) => setDraft({ ...draft, war_thunder: { ...draft.war_thunder, [key]: value } });
-  const updateTrigger = <K extends keyof AppConfig["triggers"]>(key: K, value: boolean) =>
-    setDraft({ ...draft, triggers: { ...draft.triggers, [key]: value } });
-  const bitratePreset =
-    [15_000, 20_000, 30_000].includes(draft.capture.video_bitrate_kbps)
-      ? String(draft.capture.video_bitrate_kbps)
-      : "custom";
-  const updateGsrBitratePreset = (value: string) => {
-    if (value === "custom") {
-      return;
-    }
-    updateCapture("video_bitrate_kbps", Number(value));
-  };
-
-  async function save() {
-    if (!draft) return;
-    const nextConfig = draft;
-    await invoke("save_config", { config: nextConfig });
-    setConfig(nextConfig);
-    const [status, pending] = await Promise.all([
-      invoke<RuntimeStatus>("get_runtime_status"),
-      invoke<PendingClipExportDto[]>("get_pending_export_clips"),
-    ]);
-    setRuntimeStatus(status);
-    setPendingExportClips(pending);
-    showToast("Configuration sauvegardée");
-  }
-
-  async function checkForUpdates() {
-    if (checkingUpdate) return;
-    setCheckingUpdate(true);
-    showToast("Recherche de mise à jour...");
-    try {
-      const result = await invoke<{ available: boolean }>("check_for_updates");
-      if (!result.available) {
-        showToast("Aucune mise à jour disponible");
-      }
-    } catch (error) {
-      showToast(`Mise à jour: ${String(error)}`);
-    } finally {
-      setCheckingUpdate(false);
-    }
-  }
-
-  return (
-    <div className="space-y-5">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-black text-white">Configuration</h1>
-          <p className="text-sm text-zinc-500">Capture, qualité, triggers et profil joueur</p>
-        </div>
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          <button className="ghost-button w-fit px-5" onClick={() => void checkForUpdates()} disabled={checkingUpdate}>
-            <RefreshCcw className={`h-4 w-4 ${checkingUpdate ? "animate-spin" : ""}`} />
-            Vérifier les mises à jour
-          </button>
-          <button className="primary-action w-fit px-5" onClick={() => void save()}>
-            <Save className="h-4 w-4" />
-            Sauvegarder
-          </button>
-        </div>
-      </div>
-      <div className="grid grid-cols-2 gap-4">
-        <div className="metric-panel">
-          <Settings className="h-5 w-5 text-ember" />
-          <div>
-            <div className="text-lg font-black text-white">{formatExportMode(draft.clip.export_mode)}</div>
-            <div className="text-xs uppercase text-zinc-500">Mode fichier config</div>
-          </div>
-        </div>
-        <div className="metric-panel">
-          <Cpu className="h-5 w-5 text-amberline" />
-          <div>
-            <div className="text-lg font-black text-white">
-              {captureBackendLabel(runtimeStatus?.activeCaptureBackend ?? draft.capture.backend)}
-            </div>
-            <div className="text-xs uppercase text-zinc-500">Mode actif backend</div>
-          </div>
-        </div>
-      </div>
-      {runtimeStatus && draft.clip.export_mode !== runtimeStatus.activeExportMode && (
-        <div className="processing-banner border-[#ffb454]/35 bg-[#2a1b08]/60 text-[#ffd6a3]">
-          La configuration affichée n'est pas encore appliquée au backend.
-        </div>
-      )}
-      {runtimeStatus?.configRestartRequired && (
-        <div className="processing-banner border-[#ffb454]/35 bg-[#2a1b08]/60 text-[#ffd6a3]">
-          Certains paramètres vidéo nécessitent un redémarrage du buffer.
-        </div>
-      )}
-      <div className="settings-grid">
-        <Field label="Capture backend">
-          <select
-            value={draft.capture.backend}
-            onChange={(e) => updateCapture("backend", e.target.value as AppConfig["capture"]["backend"])}
-          >
-            <option value="gpu_screen_recorder">GPU Screen Recorder expérimental</option>
-            <option value="gstreamer">GStreamer legacy/fallback</option>
-          </select>
-        </Field>
-        <Field label="Target capture">
-          <select value={draft.capture.target} onChange={(e) => updateCapture("target", e.target.value)}>
-            <option value="eDP">eDP</option>
-            <option value="HDMI-A-1-0">HDMI-A-1-0</option>
-            <option value="portal">portal</option>
-            <option value="focused">focused</option>
-          </select>
-        </Field>
-        <Field label="Mode GSR">
-          <select
-            value={draft.capture.mode}
-            onChange={(e) => updateCapture("mode", e.target.value as AppConfig["capture"]["mode"])}
-          >
-            <option value="flatpak">flatpak</option>
-            <option value="native">native</option>
-            <option value="auto">auto</option>
-          </select>
-        </Field>
-        <Field label="Durée replay GSR">
-          <input
-            type="number"
-            value={draft.capture.replay_seconds}
-            onChange={(e) => updateCapture("replay_seconds", Number(e.target.value))}
-          />
-        </Field>
-        <Field label="FPS GSR">
-          <input
-            type="number"
-            value={draft.capture.fps}
-            onChange={(e) => updateCapture("fps", Number(e.target.value))}
-          />
-        </Field>
-        <Field label="Quality GSR">
-          <select
-            value={draft.capture.quality}
-            disabled={draft.capture.bitrate_mode === "cbr"}
-            onChange={(e) => updateCapture("quality", e.target.value as AppConfig["capture"]["quality"])}
-          >
-            <option value="medium">medium</option>
-            <option value="high">high</option>
-            <option value="very_high">very_high</option>
-            <option value="ultra">ultra</option>
-          </select>
-          {draft.capture.bitrate_mode === "cbr" && (
-            <p className="field-help">Non utilisé en CBR; le bitrate vidéo contrôle -q.</p>
-          )}
-        </Field>
-        <div className="col-span-2">
-          <h2 className="text-sm font-black uppercase text-zinc-500">Qualité avancée GPU Screen Recorder</h2>
-        </div>
-        <Field label="Mode bitrate">
-          <select
-            value={draft.capture.bitrate_mode}
-            onChange={(e) => updateCapture("bitrate_mode", e.target.value as AppConfig["capture"]["bitrate_mode"])}
-          >
-            <option value="auto">Auto</option>
-            <option value="qp">QP qualité constante</option>
-            <option value="vbr">VBR</option>
-            <option value="cbr">CBR bitrate fixe</option>
-          </select>
-        </Field>
-        {draft.capture.bitrate_mode === "cbr" && (
-          <Field label="Bitrate vidéo kbps">
-            <div className="grid gap-2">
-              <select value={bitratePreset} onChange={(e) => updateGsrBitratePreset(e.target.value)}>
-                <option value="15000">15000 kbps</option>
-                <option value="20000">20000 kbps</option>
-                <option value="30000">30000 kbps</option>
-                <option value="custom">Personnalisé</option>
-              </select>
-              <input
-                type="number"
-                min={0}
-                step={1000}
-                value={draft.capture.video_bitrate_kbps}
-                onChange={(e) => updateCapture("video_bitrate_kbps", Number(e.target.value))}
-              />
-            </div>
-            <p className="field-help">
-              Pour War Thunder en 1080p60, 20000-30000 kbps donne une meilleure qualité mais augmente la taille des fichiers.
-            </p>
-          </Field>
-        )}
-        <Field label="Codec GSR">
-          <select
-            value={draft.capture.codec}
-            onChange={(e) => updateCapture("codec", e.target.value as AppConfig["capture"]["codec"])}
-          >
-            <option value="h264">h264</option>
-            <option value="hevc">hevc</option>
-            <option value="av1">av1</option>
-          </select>
-        </Field>
-        <Field label="Container GSR">
-          <select
-            value={draft.capture.container}
-            onChange={(e) => updateCapture("container", e.target.value as AppConfig["capture"]["container"])}
-          >
-            <option value="mp4">mp4</option>
-            <option value="mkv">mkv</option>
-          </select>
-        </Field>
-        <Field label="Encoder GSR">
-          <select
-            value={draft.capture.encoder}
-            onChange={(e) => updateCapture("encoder", e.target.value as AppConfig["capture"]["encoder"])}
-          >
-            <option value="gpu">gpu</option>
-            <option value="cpu">cpu</option>
-          </select>
-        </Field>
-        <Field label="Output directory GSR">
-          <input value={draft.capture.output_dir} onChange={(e) => updateCapture("output_dir", e.target.value)} />
-        </Field>
-        <Field label="Audio GSR">
-          <label className="flex items-center gap-2 text-sm text-zinc-300">
-            <input
-              type="checkbox"
-              checked={draft.capture.audio_enabled}
-              onChange={(e) => updateCapture("audio_enabled", e.target.checked)}
-            />
-            Activer audio
-          </label>
-        </Field>
-        <Field label="Audio input GSR">
-          <input value={draft.capture.audio_input} onChange={(e) => updateCapture("audio_input", e.target.value)} />
-        </Field>
-        <Field label="player_name">
-          <input value={draft.war_thunder.player_name ?? ""} onChange={(e) => updateWt("player_name", e.target.value || null)} />
-        </Field>
-        <Field label="output_dir">
-          <input value={draft.clip.output_dir} onChange={(e) => updateClip("output_dir", e.target.value)} />
-        </Field>
-        <Field label="seconds">
-          <input type="number" value={draft.clip.seconds} onChange={(e) => updateClip("seconds", Number(e.target.value))} />
-        </Field>
-        <Field label="segment_seconds">
-          <input type="number" value={draft.clip.segment_seconds} onChange={(e) => updateClip("segment_seconds", Number(e.target.value))} />
-        </Field>
-        <Field label="post_event_seconds">
-          <input type="number" value={draft.clip.post_event_seconds} onChange={(e) => updateClip("post_event_seconds", Number(e.target.value))} />
-        </Field>
-        <Field label="quality">
-          <select value={draft.clip.quality} onChange={(e) => updateClip("quality", e.target.value as AppConfig["clip"]["quality"])}>
-            <option value="low">low</option>
-            <option value="medium">medium</option>
-            <option value="high">high</option>
-          </select>
-        </Field>
-        <Field label="Mode d'export">
-          <select
-            value={draft.clip.export_mode}
-            onChange={(e) => updateClip("export_mode", e.target.value as AppConfig["clip"]["export_mode"])}
-          >
-            <option value="deferred">Différé recommandé</option>
-            <option value="instant">Instantané</option>
-          </select>
-          <p className="field-help">
-            Le mode différé garde les clips en attente pendant la partie puis les exporte manuellement. Il réduit la charge pendant le gameplay.
-          </p>
-        </Field>
-        <Field label="fps">
-          <input type="number" value={draft.clip.fps} onChange={(e) => updateClip("fps", Number(e.target.value))} />
-        </Field>
-        <Field label="bitrate kbps">
-          <input type="number" value={draft.clip.video_bitrate_kbps} onChange={(e) => updateClip("video_bitrate_kbps", Number(e.target.value))} />
-        </Field>
-      </div>
-      <div>
-        <h2 className="mb-3 text-lg font-bold text-white">Triggers</h2>
-        <div className="trigger-grid">
-          <label className="trigger-toggle">
-            <input
-              type="checkbox"
-              checked={draft.triggers.target_destroyed}
-              onChange={(event) => updateTrigger("target_destroyed", event.target.checked)}
-            />
-            <span>Cible détruite</span>
-          </label>
-          <label className="trigger-toggle">
-            <input
-              type="checkbox"
-              checked={draft.triggers.base_destroyed}
-              onChange={(event) => updateTrigger("base_destroyed", event.target.checked)}
-            />
-            <span>Base détruite</span>
-          </label>
-          <label className="trigger-toggle">
-            <input
-              type="checkbox"
-              checked={draft.triggers.player_destroyed}
-              onChange={(event) => updateTrigger("player_destroyed", event.target.checked)}
-            />
-            <span>Joueur détruit</span>
-          </label>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function Diagnostics() {
-  const {
-    diagnostics,
-    diagnosticsRunning,
-    galleryLastRefreshMs,
-    galleryMountedVideoCount,
-    galleryRefreshCount,
-    galleryRenderedClipCount,
-    frontendListenerCount,
-    runtimeStatus,
-    setDiagnostics,
-    setDiagnosticsRunning,
-    setRuntimeStatus,
-    showToast,
-  } = useAppStore();
-  const [gsrTestRunning, setGsrTestRunning] = useState(false);
-  async function run() {
-    setDiagnosticsRunning(true);
-    const [report, status] = await Promise.all([
-      invoke<DoctorReport>("run_diagnostics"),
-      invoke<RuntimeStatus>("get_runtime_status"),
-    ]);
-    setDiagnostics(report);
-    setRuntimeStatus(status);
-  }
-  async function testGsrSaveReplay() {
-    setGsrTestRunning(true);
-    try {
-      const path = await invoke<string>("test_gsr_save_replay");
-      showToast(`Test GSR sauvegardé: ${path}`);
-      const status = await invoke<RuntimeStatus>("get_runtime_status");
-      setRuntimeStatus(status);
-    } catch (error) {
-      showToast(`Test GSR: ${String(error)}`);
-    } finally {
-      setGsrTestRunning(false);
-    }
-  }
-  const counts = diagnostics?.checks.reduce(
-    (acc, check) => ({ ...acc, [check.status]: acc[check.status] + 1 }),
-    { ok: 0, warn: 0, error: 0 },
-  );
-  return (
-    <div className="space-y-5">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-black text-white">Diagnostics</h1>
-          <p className="text-sm text-zinc-500">{diagnostics?.summary ?? "Analyse des dépendances locales"}</p>
-        </div>
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          <button className="ghost-button" onClick={() => void run()}>
-            <RefreshCcw className={`h-4 w-4 ${diagnosticsRunning ? "animate-spin" : ""}`} />
-            Relancer
-          </button>
-          <button className="ghost-button" onClick={() => void invoke("restart_replay_buffer")}>
-            <RefreshCcw className="h-4 w-4" />
-            {runtimeStatus?.activeCaptureBackend === "gpu_screen_recorder"
-              ? "Redémarrer GPU Screen Recorder"
-              : "Redémarrer le buffer"}
-          </button>
-          <button
-            className="ghost-button"
-            disabled={gsrTestRunning}
-            onClick={() => void testGsrSaveReplay()}
-          >
-            <Play className={`h-4 w-4 ${gsrTestRunning ? "animate-pulse" : ""}`} />
-            Tester sauvegarde replay GSR
-          </button>
-        </div>
-      </div>
-      <div className="grid grid-cols-3 gap-4">
-        <Metric icon={CheckCircle2} label="OK" value={counts?.ok ?? 0} />
-        <Metric icon={AlertTriangle} label="Warn" value={counts?.warn ?? 0} />
-        <Metric icon={XCircle} label="Error" value={counts?.error ?? 0} />
-      </div>
-      <div>
-        <h2 className="text-sm font-black uppercase text-zinc-500">Ressources galerie</h2>
-      </div>
-      <div className="grid grid-cols-4 gap-4">
-        <Metric icon={HardDrive} label="FD backend" value={runtimeStatus?.backendFdCount ?? "-"} />
-        <Metric icon={RefreshCcw} label="Refresh galerie" value={galleryRefreshCount} />
-        <Metric icon={Clock3} label="Dernier refresh" value={galleryLastRefreshMs == null ? "-" : `${galleryLastRefreshMs}ms`} />
-        <Metric icon={Activity} label="Listeners front" value={frontendListenerCount} />
-      </div>
-      <div className="grid grid-cols-4 gap-4">
-        <Metric icon={Video} label="Clips rendus" value={galleryRenderedClipCount} />
-        <Metric icon={Video} label="Vidéos montées" value={galleryMountedVideoCount} />
-        <Metric icon={Search} label="Scans backend" value={runtimeStatus?.galleryScanCount ?? 0} />
-        <Metric icon={Gauge} label="Scans actifs" value={runtimeStatus?.galleryActiveScans ?? 0} />
-      </div>
-      <div className="grid grid-cols-4 gap-4">
-        <Metric icon={Clock3} label="Dernier scan" value={runtimeStatus?.galleryLastScanMs == null ? "-" : `${runtimeStatus.galleryLastScanMs}ms`} />
-      </div>
-      <div>
-        <h2 className="text-sm font-black uppercase text-zinc-500">GPU Screen Recorder</h2>
-      </div>
-      <div className="grid grid-cols-4 gap-4">
-        <Metric
-          icon={Cpu}
-          label="Backend actif"
-          value={captureBackendLabel(runtimeStatus?.activeCaptureBackend)}
-        />
-        <Metric
-          icon={Download}
-          label="GPU Replay"
-          value={gsrHealthLabel(runtimeStatus?.gsrHealth)}
-        />
-        <Metric
-          icon={Clock3}
-          label="wrapper_pid"
-          value={runtimeStatus?.gsrWrapperPid ?? "-"}
-        />
-        <Metric
-          icon={Video}
-          label="recorder_pid"
-          value={runtimeStatus?.gsrRecorderPid ?? "-"}
-        />
-      </div>
-      <div className="grid grid-cols-4 gap-4">
-        <Metric
-          icon={Zap}
-          label="signal_pid"
-          value={runtimeStatus?.gsrSignalPid ?? "-"}
-        />
-        <Metric
-          icon={Activity}
-          label="Save queue"
-          value={runtimeStatus?.gsrSaveQueueLen ?? 0}
-        />
-        <Metric
-          icon={CheckCircle2}
-          label="Saves OK"
-          value={runtimeStatus?.gsrTotalSavesCompleted ?? 0}
-        />
-        <Metric
-          icon={XCircle}
-          label="Saves failed"
-          value={runtimeStatus?.gsrTotalSavesFailed ?? 0}
-        />
-      </div>
-      <div className="grid grid-cols-2 gap-4">
-        <div className="diagnostic-row">
-          <Cpu className="h-5 w-5 text-amberline" />
-          <div className="min-w-0">
-            <div className="font-semibold text-white">GPU Screen Recorder</div>
-            <div className="break-words text-sm text-zinc-400">
-              target {runtimeStatus?.gsrTarget ?? "-"} · {runtimeStatus?.gsrFps ?? "-"} FPS · replay{" "}
-              {runtimeStatus?.gsrReplaySeconds ?? "-"}s · quality {runtimeStatus?.gsrQuality ?? "-"}
-            </div>
-            <div className="mt-1 text-xs text-zinc-500">
-              bitrate {runtimeStatus?.gsrBitrateMode ?? "-"} · {runtimeStatus?.gsrVideoBitrateKbps ?? 0} kbps ·{" "}
-              q {runtimeStatus?.gsrEffectiveQArgument ?? "-"} ·{" "}
-              mode {runtimeStatus?.gsrMode ?? "-"} · disponible {runtimeStatus?.gsrAvailable ? "oui" : "non"} ·
-              stderr {runtimeStatus?.gsrStderrHandling ?? "-"} · requested{" "}
-              {runtimeStatus?.gsrTotalSavesRequested ?? 0}
-            </div>
-          </div>
-        </div>
-        <div className="diagnostic-row">
-          <FolderOpen className="h-5 w-5 text-amberline" />
-          <div className="min-w-0">
-            <div className="font-semibold text-white">Output GSR</div>
-            <div className="break-words text-sm text-zinc-400">{runtimeStatus?.gsrOutputDir ?? "-"}</div>
-            <div className="mt-1 break-words text-xs text-zinc-500">
-              prefix {runtimeStatus?.gsrOutputPrefix ?? "-"}
-            </div>
-          </div>
-        </div>
-        <div className="diagnostic-row">
-          <Video className="h-5 w-5 text-amberline" />
-          <div className="min-w-0">
-            <div className="font-semibold text-white">Dernier fichier GSR</div>
-            <div className="break-words text-sm text-zinc-400">{runtimeStatus?.gsrLastOutput ?? "-"}</div>
-            <div className="mt-1 text-xs text-zinc-500">redémarrages {runtimeStatus?.gsrRestartCount ?? 0}</div>
-          </div>
-        </div>
-        <div className="diagnostic-row">
-          <AlertTriangle className="h-5 w-5 text-amberline" />
-          <div className="min-w-0">
-            <div className="font-semibold text-white">Erreur GSR</div>
-            <div className="break-words text-sm text-zinc-400">{runtimeStatus?.gsrLastError ?? "Aucune erreur GSR"}</div>
-            <div className="mt-1 text-xs text-zinc-500">
-              monitors {(runtimeStatus?.gsrMonitors ?? []).join(", ") || "-"}
-            </div>
-          </div>
-        </div>
-      </div>
-      <div className="diagnostic-row">
-        <Activity className="h-5 w-5 text-amberline" />
-        <div className="min-w-0">
-          <div className="font-semibold text-white">Commande lancée</div>
-          <div className="break-words font-mono text-xs text-zinc-400">
-            {runtimeStatus?.gsrCommandLine ?? "-"}
-          </div>
-        </div>
-      </div>
-      <div className="diagnostic-row">
-        <Video className="h-5 w-5 text-amberline" />
-        <div className="min-w-0">
-          <div className="font-semibold text-white">Recorder command line</div>
-          <div className="break-words font-mono text-xs text-zinc-400">
-            {runtimeStatus?.gsrRecorderCommandLine ?? "-"}
-          </div>
-        </div>
-      </div>
-      <div className="diagnostic-row">
-        <FolderOpen className="h-5 w-5 text-amberline" />
-        <div className="min-w-0">
-          <div className="font-semibold text-white">Pending exports</div>
-          <div className="break-words text-sm text-zinc-400">{runtimeStatus?.pendingExportDir ?? "-"}</div>
-          <div className="mt-1 text-xs text-zinc-500">
-            {formatBytes(runtimeStatus?.pendingExportBytes ?? 0)}
-          </div>
-        </div>
-      </div>
-      <div>
-        <h2 className="text-sm font-black uppercase text-zinc-500">Legacy GStreamer</h2>
-      </div>
-      <div className="grid grid-cols-2 gap-4">
-        <div className="diagnostic-row">
-          <Gauge className="h-5 w-5 text-amberline" />
-          <div className="min-w-0">
-            <div className="font-semibold text-white">Dernier segment</div>
-            <div className="break-words text-sm text-zinc-400">
-              {runtimeStatus?.bufferLastSegmentPath ?? "-"}
-            </div>
-            <div className="mt-1 text-xs text-zinc-500">
-              {runtimeStatus?.bufferLastSegmentAgeSecs != null
-                ? `il y a ${runtimeStatus.bufferLastSegmentAgeSecs}s`
-                : "-"}
-            </div>
-          </div>
-        </div>
-        <div className="diagnostic-row">
-          <RefreshCcw className="h-5 w-5 text-amberline" />
-          <div className="min-w-0">
-            <div className="font-semibold text-white">Redémarrages</div>
-            <div className="text-sm text-zinc-400">{runtimeStatus?.bufferRestartCount ?? 0}</div>
-            <div className="mt-1 text-xs text-zinc-500">
-              {runtimeStatus?.lastGstreamerError ?? "Aucune erreur GStreamer"}
-            </div>
-          </div>
-        </div>
-      </div>
-      <div className="diagnostic-list">
-        {!diagnostics ? (
-          <Empty label="Diagnostics en chargement" />
-        ) : (
-          diagnostics.checks.map((check) => <DiagnosticRow key={check.name} check={check} />)
-        )}
-      </div>
-    </div>
-  );
-}
-
-function DiagnosticRow({ check }: { check: DoctorReport["checks"][number] }) {
-  const Icon = check.status === "ok" ? CheckCircle2 : check.status === "warn" ? ShieldAlert : XCircle;
-  return (
-    <div className="diagnostic-row">
-      <Icon className={`h-5 w-5 status-${check.status}`} />
-      <div className="min-w-0">
-        <div className="font-semibold text-white">{check.name}</div>
-        <div className="text-sm text-zinc-400">{check.message}</div>
-        {check.hint && <div className="mt-1 text-xs text-zinc-500">{check.hint}</div>}
-      </div>
-    </div>
-  );
-}
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label className="field">
-      <span>{label}</span>
-      {children}
-    </label>
-  );
-}
-
-function Empty({ label }: { label: string }) {
-  return (
-    <div className="empty-state">
-      <Cpu className="h-8 w-8 text-zinc-600" />
-      <span>{label}</span>
-    </div>
-  );
-}
-
-function videoMimeTypeForPath(path: string): string {
-  return path.toLowerCase().endsWith(".mp4") ? "video/mp4" : "video/webm";
+  return secondsAgo(a.createdAt) - secondsAgo(b.createdAt);
 }
 
 function releaseVideoElement(video: HTMLVideoElement) {
   video.pause();
   video.removeAttribute("src");
-  for (const child of Array.from(video.children)) {
-    if (child instanceof HTMLSourceElement) {
-      child.removeAttribute("src");
-    }
-  }
   video.load();
 }
 
-function editedBadgeForPath(path: string): "Edited" | "Vertical" | null {
-  const normalized = path.replace(/\\/g, "/").toLowerCase();
-  if (normalized.includes("/social/") || normalized.includes("_vertical_")) {
-    return "Vertical";
-  }
-  if (normalized.includes("/edited/") || normalized.includes("_trim_") || normalized.includes("_youtube_")) {
-    return "Edited";
-  }
-  return null;
+function reasonClass(reason: ClipReason) {
+  return `reason-${reason.replace(/_/g, "-")}`;
+}
+
+function formatClipDuration(seconds: number) {
+  const safe = Math.max(0, Math.round(seconds));
+  const minutes = Math.floor(safe / 60);
+  const rest = safe % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
 }
 
 function formatBytes(bytes: number) {
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} GB`.replace("GB", "MB");
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
 function relativeTime(seconds: number) {
-  if (seconds < 60) return "à l'instant";
-  if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
-  if (seconds < 86400) return `${Math.round(seconds / 3600)} h`;
-  return `${Math.round(seconds / 86400)} j`;
+  if (seconds < 60) {
+    return "à l'instant";
+  }
+  if (seconds < 3600) {
+    return `${Math.floor(seconds / 60)} min`;
+  }
+  if (seconds < 86_400) {
+    return `${Math.floor(seconds / 3600)} h`;
+  }
+  return `${Math.floor(seconds / 86_400)} j`;
 }
 
 function secondsAgo(value: string) {
   const numeric = Number(value);
   const timestamp = Number.isFinite(numeric) ? numeric : Date.parse(value);
-  if (!Number.isFinite(timestamp)) return 0;
-  return Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
-}
-
-function relativeCreatedAt(value: string) {
-  return secondsAgo(value) < 5 ? "Il y a quelques secondes" : relativeTime(secondsAgo(value));
+  if (!Number.isFinite(timestamp)) {
+    return 0;
+  }
+  return Math.max(0, Math.round((Date.now() - timestamp) / 1000));
 }

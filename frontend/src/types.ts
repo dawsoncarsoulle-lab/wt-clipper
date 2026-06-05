@@ -1,41 +1,14 @@
 export type ClipReason =
-  | "target-destroyed"
-  | "base-destroyed"
-  | "player-destroyed"
-  | "multi-kill"
+  | "target_destroyed"
+  | "base_destroyed"
+  | "player_destroyed"
+  | "multi_kill"
   | "manual"
   | "unknown";
 
-export type BufferHealth = "starting" | "healthy" | "stalled" | "error" | "restarting";
-export type CaptureBackend = "gstreamer" | "gpu_screen_recorder";
 export type GsrHealth = "not_available" | "stopped" | "starting" | "running" | "saving_replay" | "error";
 
-export type BufferStatus = {
-  health: BufferHealth;
-  filledSecs: number;
-  totalSecs: number;
-  lastSegmentPath?: string | null;
-  lastSegmentModifiedAt?: string | null;
-  lastSegmentAgeSecs?: number | null;
-  restartCount: number;
-  lastGstreamerError?: string | null;
-};
-
-export type ClipStatus =
-  | "detected"
-  | "recording"
-  | "encoding"
-  | "saving"
-  | "pending_export"
-  | "waiting_post_event"
-  | "freezing_segments"
-  | "ready_to_export"
-  | "exporting"
-  | "ready"
-  | "failed"
-  | "expired";
-
-export type ExportMode = "instant" | "deferred";
+export type ClipStatus = "detected" | "recording" | "encoding" | "saving" | "ready" | "failed";
 
 export type ClipEditorMode =
   | "trim_original"
@@ -128,10 +101,6 @@ export type ClipStatusChangedPayload = {
   sizeBytes?: number | null;
   progress?: number | null;
   error?: string | null;
-  exportableAt?: string | null;
-  isExportable?: boolean | null;
-  canExport?: boolean | null;
-  retryable?: boolean | null;
 };
 
 export type GalleryClipItem = {
@@ -147,79 +116,17 @@ export type GalleryClipItem = {
   sizeBytes?: number;
   progress?: number;
   error?: string;
-  exportableAt?: string;
-  isExportable?: boolean;
-  canExport?: boolean;
-  retryable?: boolean;
-};
-
-export type PendingClipExportDto = {
-  id: string;
-  status:
-    | "waiting_post_event"
-    | "freezing_segments"
-    | "ready_to_export"
-    | "exporting"
-    | "ready"
-    | "failed"
-    | "expired";
-  reason: ClipReason;
-  title: string;
-  createdAt: string;
-  progress?: number | null;
-  error?: string | null;
-  exportableAt: string;
-  isExportable: boolean;
-  canExport: boolean;
-  retryable: boolean;
-};
-
-export type ExportProgressStep =
-  | "preparing"
-  | "extracting"
-  | "assembling"
-  | "encoding"
-  | "metadata"
-  | "thumbnail"
-  | "saving"
-  | "done"
-  | "failed";
-
-export type ExportProgressPayload = {
-  active: boolean;
-  total: number;
-  completed: number;
-  failed: number;
-  currentClipNumber?: number | null;
-  currentClipId: string | null;
-  currentClipTitle: string | null;
-  currentStep: ExportProgressStep;
-  progress: number;
-  message: string;
-};
-
-export type ExportSummary = {
-  total: number;
-  completed: number;
-  failed: number;
 };
 
 export type AppConfig = {
   clip: {
-    seconds: number;
-    segment_seconds: number;
     post_event_seconds: number;
     multi_kill_window_seconds: number;
+  };
+  library: {
     output_dir: string;
-    quality: "low" | "medium" | "high";
-    fps: number;
-    video_bitrate_kbps: number;
-    source: "screen" | "window";
-    keep_segments: boolean;
-    export_mode: ExportMode;
   };
   capture: {
-    backend: CaptureBackend;
     target: string;
     mode: "auto" | "native" | "flatpak";
     fps: number;
@@ -249,12 +156,6 @@ export type AppConfig = {
     max_clips: number;
     max_storage_gb: number;
   };
-  pending_exports: {
-    pending_export_dir: string;
-    max_total_size_mb: number;
-    max_age_hours: number;
-    delete_ready_after_export: boolean;
-  };
 };
 
 export type DoctorStatus = "ok" | "warn" | "error";
@@ -271,15 +172,6 @@ export type DoctorReport = {
 
 export type RuntimeStatus = {
   wtConnected: boolean;
-  activeCaptureBackend: CaptureBackend;
-  bufferFilledSecs: number;
-  bufferTotalSecs: number;
-  bufferHealth: BufferHealth;
-  bufferLastSegmentPath?: string | null;
-  bufferLastSegmentModifiedAt?: string | null;
-  bufferLastSegmentAgeSecs?: number | null;
-  bufferRestartCount: number;
-  lastGstreamerError?: string | null;
   gsrAvailable: boolean;
   gsrHealth: GsrHealth;
   gsrPid?: number | null;
@@ -308,17 +200,12 @@ export type RuntimeStatus = {
   gsrVideoBitrateKbps: number;
   gsrEffectiveQArgument: string;
   autoClipRunning: boolean;
-  activeExportMode: ExportMode;
   configRestartRequired: boolean;
-  pendingExportCount: number;
-  pendingExportDir: string;
-  pendingExportBytes: number;
   clipsSaved: number;
   backendFdCount?: number | null;
   galleryScanCount?: number;
   galleryLastScanMs?: number;
   galleryActiveScans?: number;
-  exportProgress?: ExportProgressPayload | null;
   recentEvents: Array<{
     id: string;
     at: string;

@@ -112,7 +112,7 @@ impl Cooldown {
 }
 
 #[derive(Debug, Clone)]
-struct PendingClip {
+struct ScheduledClip {
     clip_id: String,
     created_at: String,
     reason: ClipReason,
@@ -127,7 +127,7 @@ struct PendingClip {
     retry_count: u8,
 }
 
-impl PendingClip {
+impl ScheduledClip {
     fn new(
         event: WarThunderEvent,
         event_key: String,
@@ -263,7 +263,7 @@ pub async fn run_auto_clip(
     }
 
     let mut cooldown = Cooldown::new(auto_config.cooldown);
-    let mut pending_clips = Vec::<PendingClip>::new();
+    let mut pending_clips = Vec::<ScheduledClip>::new();
     let mut wt_tick = interval(warthunder_config.poll_interval());
     wt_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut cleanup_tick = interval(Duration::from_secs(1));
@@ -482,8 +482,8 @@ fn schedule_pending_clip(
     event_game_time: Option<Duration>,
     event_wall_time: SystemTime,
     delay: Duration,
-) -> PendingClip {
-    PendingClip::new(
+) -> ScheduledClip {
+    ScheduledClip::new(
         event,
         event_key,
         reason,
@@ -496,7 +496,7 @@ fn schedule_pending_clip(
 }
 
 fn clip_context_for_pending(
-    pending: &PendingClip,
+    pending: &ScheduledClip,
     player_name: Option<&str>,
     auto_config: &AutoClipConfig,
     configured_post_event_delay: Duration,
@@ -516,7 +516,7 @@ fn clip_context_for_pending(
 }
 
 fn status_payload(
-    pending: &PendingClip,
+    pending: &ScheduledClip,
     status: ClipStatus,
     reason: ClipReason,
     title: String,
@@ -541,13 +541,13 @@ fn status_payload(
     }
 }
 
-fn pending_dedupe_key(pending: &PendingClip) -> String {
+fn pending_dedupe_key(pending: &ScheduledClip) -> String {
     let mut keys = pending.event_keys.iter().cloned().collect::<Vec<_>>();
     keys.sort();
     format!("{}|{}", pending.reason.slug(), keys.join("|"))
 }
 
-fn ready_pending_indices(pending_clips: &[PendingClip], now: Instant) -> Vec<usize> {
+fn ready_pending_indices(pending_clips: &[ScheduledClip], now: Instant) -> Vec<usize> {
     pending_clips
         .iter()
         .enumerate()
@@ -556,7 +556,7 @@ fn ready_pending_indices(pending_clips: &[PendingClip], now: Instant) -> Vec<usi
 }
 
 fn pending_index_for_multi_kill(
-    pending_clips: &[PendingClip],
+    pending_clips: &[ScheduledClip],
     reason: ClipReason,
     now: Instant,
     game_time: Option<Duration>,
@@ -592,7 +592,7 @@ async fn recv_auto_command(
 
 async fn save_ready_pending_clips_gsr(
     gsr: &GpuScreenRecorderHandle,
-    pending_clips: &mut Vec<PendingClip>,
+    pending_clips: &mut Vec<ScheduledClip>,
     cooldown: &mut Cooldown,
     now: Instant,
     player_name: Option<&str>,
@@ -674,7 +674,7 @@ async fn save_ready_pending_clips_gsr(
     }
 }
 
-fn mark_gsr_save_failure_for_retry(pending: &mut PendingClip, now: Instant) -> bool {
+fn mark_gsr_save_failure_for_retry(pending: &mut ScheduledClip, now: Instant) -> bool {
     pending.retry_count = pending.retry_count.saturating_add(1);
     let should_retry = pending.retry_count < 3;
     if should_retry {
@@ -843,7 +843,7 @@ async fn handle_test_gsr_save_replay_command(
 
 fn emit_gsr_replay_saved(
     auto_config: &AutoClipConfig,
-    pending: &PendingClip,
+    pending: &ScheduledClip,
     replay: SavedGsrReplay,
 ) {
     let mut ready = status_payload(
