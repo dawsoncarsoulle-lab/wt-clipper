@@ -442,6 +442,7 @@ struct PendingClip {
     dedupe_keys: HashSet<String>,
     events: Vec<WarThunderEvent>,
     descriptions: Vec<String>,
+    retry_count: u8,
 }
 
 impl PendingClip {
@@ -478,6 +479,7 @@ impl PendingClip {
             dedupe_keys,
             events: vec![event],
             descriptions: vec![description],
+            retry_count: 0,
         }
     }
 
@@ -2788,7 +2790,9 @@ async fn save_ready_pending_clips_gsr(
 ) {
     let ready_indices = ready_pending_indices(pending_clips, now);
     for index in ready_indices.into_iter().rev() {
-        let pending = pending_clips.remove(index);
+        let Some(pending) = pending_clips.get(index) else {
+            continue;
+        };
         println!(
             "[GSR_AUTO] post_event elapsed id={} reason={}",
             pending.clip_id,
@@ -2816,11 +2820,21 @@ async fn save_ready_pending_clips_gsr(
         println!("[GSR_AUTO] calling gsr.save_replay id={}", pending.clip_id);
         match gsr.save_replay(context).await {
             Ok(replay) => {
+                let pending = pending_clips.remove(index);
                 emit_gsr_replay_saved(auto_config, &pending, replay);
                 cooldown.record_save(now);
             }
             Err(error) => {
-                let message = format!("GPU Screen Recorder n'a pas sauvegardé le clip: {error}");
+                let pending = &mut pending_clips[index];
+                let should_retry = mark_gsr_save_failure_for_retry(pending, Instant::now());
+                let message = if should_retry {
+                    format!(
+                        "GPU Screen Recorder n'a pas sauvegardé le clip: {error}; retry {}/3",
+                        pending.retry_count
+                    )
+                } else {
+                    format!("GPU Screen Recorder n'a pas sauvegardé le clip: {error}")
+                };
                 send_ui_event(
                     auto_config,
                     AppEvent::ClipStatusChanged {
@@ -2828,7 +2842,11 @@ async fn save_ready_pending_clips_gsr(
                             &pending,
                             ClipStatus::Failed,
                             pending.reason,
-                            "Erreur GPU Replay".to_owned(),
+                            if should_retry {
+                                "Erreur GPU Replay, nouvel essai...".to_owned()
+                            } else {
+                                "Erreur GPU Replay".to_owned()
+                            },
                             None,
                             Some(message.clone()),
                         ),
@@ -2836,10 +2854,22 @@ async fn save_ready_pending_clips_gsr(
                 );
                 send_ui_event(auto_config, AppEvent::ClipFailed { message });
                 cooldown.record_save(now);
+                if !should_retry {
+                    let _ = pending_clips.remove(index);
+                }
             }
         }
         send_gsr_status(auto_config, gsr).await;
     }
+}
+
+fn mark_gsr_save_failure_for_retry(pending: &mut PendingClip, now: Instant) -> bool {
+    pending.retry_count = pending.retry_count.saturating_add(1);
+    let should_retry = pending.retry_count < 3;
+    if should_retry {
+        pending.save_at = now + Duration::from_secs(2);
+    }
+    should_retry
 }
 
 async fn handle_manual_clip_command_gsr(
@@ -4183,6 +4213,35 @@ mod tests {
             ready_pending_indices(&[pending], now + Duration::from_secs(6)),
             vec![0]
         );
+    }
+
+    #[test]
+    fn failed_save_does_not_drop_pending_without_retry() {
+        let now = Instant::now();
+        let mut pending = schedule_pending_clip(
+            kill_with_target("[ai] MiG-15bis"),
+            event_key(&kill_with_target("[ai] MiG-15bis")),
+            ClipReason::TargetDestroyed,
+            "kill".to_owned(),
+            now,
+            None,
+            SystemTime::UNIX_EPOCH,
+            Duration::from_secs(5),
+        );
+
+        assert!(mark_gsr_save_failure_for_retry(&mut pending, now));
+        assert_eq!(pending.retry_count, 1);
+        assert_eq!(pending.save_at, now + Duration::from_secs(2));
+        assert!(mark_gsr_save_failure_for_retry(
+            &mut pending,
+            now + Duration::from_secs(2)
+        ));
+        assert_eq!(pending.retry_count, 2);
+        assert!(!mark_gsr_save_failure_for_retry(
+            &mut pending,
+            now + Duration::from_secs(4)
+        ));
+        assert_eq!(pending.retry_count, 3);
     }
 
     #[test]

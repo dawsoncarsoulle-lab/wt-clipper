@@ -72,6 +72,10 @@ pub struct CaptureConfig {
     pub quality: GsrQuality,
     #[serde(default = "default_gsr_output_dir_string")]
     pub output_dir: String,
+    #[serde(default = "default_capture_audio_enabled")]
+    pub audio_enabled: bool,
+    #[serde(default = "default_capture_audio_input")]
+    pub audio_input: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -250,6 +254,8 @@ impl Default for CaptureConfig {
             encoder: GsrEncoder::Gpu,
             quality: GsrQuality::Medium,
             output_dir: default_gsr_output_dir_string(),
+            audio_enabled: default_capture_audio_enabled(),
+            audio_input: default_capture_audio_input(),
         }
     }
 }
@@ -415,6 +421,8 @@ codec = "h264"
 encoder = "gpu"
 quality = "medium"
 output_dir = "~/Videos/WarThunder Clips/GSR"
+audio_enabled = true
+audio_input = "default_output"
 
 [war_thunder]
 player_name = ""
@@ -469,6 +477,14 @@ fn default_output_dir_string() -> String {
 
 fn default_gsr_output_dir_string() -> String {
     "~/Videos/WarThunder Clips/GSR".to_owned()
+}
+
+fn default_capture_audio_enabled() -> bool {
+    true
+}
+
+fn default_capture_audio_input() -> String {
+    "default_output".to_owned()
 }
 
 fn default_capture_target() -> String {

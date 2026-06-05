@@ -1458,6 +1458,19 @@ function Configuration() {
         <Field label="Output directory GSR">
           <input value={draft.capture.output_dir} onChange={(e) => updateCapture("output_dir", e.target.value)} />
         </Field>
+        <Field label="Audio GSR">
+          <label className="flex items-center gap-2 text-sm text-zinc-300">
+            <input
+              type="checkbox"
+              checked={draft.capture.audio_enabled}
+              onChange={(e) => updateCapture("audio_enabled", e.target.checked)}
+            />
+            Activer audio
+          </label>
+        </Field>
+        <Field label="Audio input GSR">
+          <input value={draft.capture.audio_input} onChange={(e) => updateCapture("audio_input", e.target.value)} />
+        </Field>
         <Field label="player_name">
           <input value={draft.war_thunder.player_name ?? ""} onChange={(e) => updateWt("player_name", e.target.value || null)} />
         </Field>
@@ -1602,6 +1615,9 @@ function Diagnostics() {
         <Metric icon={AlertTriangle} label="Warn" value={counts?.warn ?? 0} />
         <Metric icon={XCircle} label="Error" value={counts?.error ?? 0} />
       </div>
+      <div>
+        <h2 className="text-sm font-black uppercase text-zinc-500">GPU Screen Recorder</h2>
+      </div>
       <div className="grid grid-cols-4 gap-4">
         <Metric
           icon={Cpu}
@@ -1615,17 +1631,35 @@ function Diagnostics() {
         />
         <Metric
           icon={Clock3}
-          label="PID GSR"
-          value={runtimeStatus?.gsrPid ?? "-"}
+          label="wrapper_pid"
+          value={runtimeStatus?.gsrWrapperPid ?? "-"}
         />
         <Metric
-          icon={Gauge}
-          label="Buffer health"
-          value={
-            runtimeStatus?.activeCaptureBackend === "gpu_screen_recorder"
-              ? gsrHealthLabel(runtimeStatus?.gsrHealth)
-              : bufferHealthLabel(runtimeStatus?.bufferHealth ?? "starting")
-          }
+          icon={Video}
+          label="recorder_pid"
+          value={runtimeStatus?.gsrRecorderPid ?? "-"}
+        />
+      </div>
+      <div className="grid grid-cols-4 gap-4">
+        <Metric
+          icon={Zap}
+          label="signal_pid"
+          value={runtimeStatus?.gsrSignalPid ?? "-"}
+        />
+        <Metric
+          icon={Activity}
+          label="Save queue"
+          value={runtimeStatus?.gsrSaveQueueLen ?? 0}
+        />
+        <Metric
+          icon={CheckCircle2}
+          label="Saves OK"
+          value={runtimeStatus?.gsrTotalSavesCompleted ?? 0}
+        />
+        <Metric
+          icon={XCircle}
+          label="Saves failed"
+          value={runtimeStatus?.gsrTotalSavesFailed ?? 0}
         />
       </div>
       <div className="grid grid-cols-2 gap-4">
@@ -1638,7 +1672,9 @@ function Diagnostics() {
               {runtimeStatus?.gsrReplaySeconds ?? "-"}s · quality {runtimeStatus?.gsrQuality ?? "-"}
             </div>
             <div className="mt-1 text-xs text-zinc-500">
-              mode {runtimeStatus?.gsrMode ?? "-"} · disponible {runtimeStatus?.gsrAvailable ? "oui" : "non"}
+              mode {runtimeStatus?.gsrMode ?? "-"} · disponible {runtimeStatus?.gsrAvailable ? "oui" : "non"} ·
+              stderr {runtimeStatus?.gsrStderrHandling ?? "-"} · requested{" "}
+              {runtimeStatus?.gsrTotalSavesRequested ?? 0}
             </div>
           </div>
         </div>
@@ -1681,6 +1717,15 @@ function Diagnostics() {
         </div>
       </div>
       <div className="diagnostic-row">
+        <Video className="h-5 w-5 text-amberline" />
+        <div className="min-w-0">
+          <div className="font-semibold text-white">Recorder command line</div>
+          <div className="break-words font-mono text-xs text-zinc-400">
+            {runtimeStatus?.gsrRecorderCommandLine ?? "-"}
+          </div>
+        </div>
+      </div>
+      <div className="diagnostic-row">
         <FolderOpen className="h-5 w-5 text-amberline" />
         <div className="min-w-0">
           <div className="font-semibold text-white">Pending exports</div>
@@ -1689,6 +1734,9 @@ function Diagnostics() {
             {formatBytes(runtimeStatus?.pendingExportBytes ?? 0)}
           </div>
         </div>
+      </div>
+      <div>
+        <h2 className="text-sm font-black uppercase text-zinc-500">Legacy GStreamer</h2>
       </div>
       <div className="grid grid-cols-2 gap-4">
         <div className="diagnostic-row">

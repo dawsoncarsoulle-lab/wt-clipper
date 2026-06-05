@@ -229,6 +229,8 @@ export type AppConfig = {
     encoder: "gpu" | "cpu";
     quality: "medium" | "high" | "very_high";
     output_dir: string;
+    audio_enabled: boolean;
+    audio_input: string;
   };
   war_thunder: {
     base_url: string;
@@ -279,10 +281,19 @@ export type RuntimeStatus = {
   gsrAvailable: boolean;
   gsrHealth: GsrHealth;
   gsrPid?: number | null;
+  gsrWrapperPid?: number | null;
+  gsrRecorderPid?: number | null;
+  gsrSignalPid?: number | null;
   gsrMode?: string | null;
   gsrTarget: string;
   gsrMonitors: string[];
   gsrCommandLine?: string | null;
+  gsrRecorderCommandLine?: string | null;
+  gsrStderrHandling: string;
+  gsrSaveQueueLen: number;
+  gsrTotalSavesRequested: number;
+  gsrTotalSavesCompleted: number;
+  gsrTotalSavesFailed: number;
   gsrOutputDir?: string | null;
   gsrOutputPrefix?: string | null;
   gsrLastOutput?: string | null;

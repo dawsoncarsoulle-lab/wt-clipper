@@ -53,6 +53,15 @@ pub struct GsrStatus {
     pub mode: Option<GsrMode>,
     pub health: GsrHealth,
     pub pid: Option<u32>,
+    pub wrapper_pid: Option<u32>,
+    pub recorder_pid: Option<u32>,
+    pub signal_pid: Option<u32>,
+    pub recorder_command_line: Option<String>,
+    pub stderr_handling: String,
+    pub save_queue_len: usize,
+    pub total_saves_requested: u64,
+    pub total_saves_completed: u64,
+    pub total_saves_failed: u64,
     pub target: String,
     pub monitors: Vec<String>,
     pub command_line: Option<String>,
@@ -112,7 +121,8 @@ struct GpuScreenRecorderInner {
 #[derive(Debug, Clone)]
 pub struct GpuScreenRecorderState {
     pub mode: Option<GsrMode>,
-    pub pid: Option<u32>,
+    pub wrapper_pid: Option<u32>,
+    pub recorder_pid: Option<u32>,
     pub health: GsrHealth,
     pub target: String,
     pub output_dir: PathBuf,
@@ -121,7 +131,13 @@ pub struct GpuScreenRecorderState {
     pub last_error: Option<String>,
     pub restart_count: u64,
     pub command_line: Option<String>,
+    pub recorder_command_line: Option<String>,
     pub monitors: Vec<String>,
+    pub stderr_handling: String,
+    pub save_queue_len: usize,
+    pub total_saves_requested: u64,
+    pub total_saves_completed: u64,
+    pub total_saves_failed: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,7 +169,8 @@ impl GpuScreenRecorderHandle {
         let output_prefix = output_dir.join("wtclip");
         let state = GpuScreenRecorderState {
             mode: None,
-            pid: None,
+            wrapper_pid: None,
+            recorder_pid: None,
             health: GsrHealth::Stopped,
             target: config.target.clone(),
             output_dir,
@@ -162,7 +179,13 @@ impl GpuScreenRecorderHandle {
             last_error: None,
             restart_count: 0,
             command_line: None,
+            recorder_command_line: None,
             monitors: list_monitors(&config),
+            stderr_handling: "null".to_owned(),
+            save_queue_len: 0,
+            total_saves_requested: 0,
+            total_saves_completed: 0,
+            total_saves_failed: 0,
         };
         Self {
             inner: Arc::new(Mutex::new(GpuScreenRecorderInner {
@@ -206,17 +229,52 @@ impl GpuScreenRecorderHandle {
             .args(&command_line.args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::null());
 
         info!(command = %command_line.command_line, "starting GPU Screen Recorder");
         match command.spawn() {
-            Ok(child) => {
+            Ok(mut child) => {
+                let child_pid = child.id();
+                println!("[GPU_RECORDER] wrapper_pid={child_pid}");
+                let (recorder_pid, recorder_command_line) = match command_line.mode {
+                    GsrMode::Flatpak => {
+                        match resolve_actual_gsr_pid(
+                            &inner.config,
+                            &command_line.output_dir,
+                            &command_line.output_prefix,
+                            &inner.config.target,
+                        )
+                        .await
+                        {
+                            Ok(process) => (process.pid, Some(process.command_line)),
+                            Err(error) => {
+                                let message = error.to_string();
+                                inner.state.health = GsrHealth::Error;
+                                inner.state.last_error = Some(message.clone());
+                                if let Err(stop_error) = signal_process(child_pid, libc::SIGTERM) {
+                                    debug!(
+                                        %stop_error,
+                                        child_pid,
+                                        "failed to stop GSR wrapper after PID resolution failure"
+                                    );
+                                }
+                                let _ = child.try_wait();
+                                return Err(anyhow::anyhow!(message));
+                            }
+                        }
+                    }
+                    GsrMode::Native => (child_pid, Some(command_line.command_line.clone())),
+                };
+                println!("[GPU_RECORDER] resolved recorder_pid={recorder_pid}");
                 inner.state.mode = Some(command_line.mode);
-                inner.state.pid = Some(child.id());
+                inner.state.wrapper_pid = Some(child_pid);
+                inner.state.recorder_pid = Some(recorder_pid);
                 inner.state.health = GsrHealth::Running;
                 inner.state.command_line = Some(command_line.command_line);
+                inner.state.recorder_command_line = recorder_command_line;
                 inner.state.output_dir = command_line.output_dir;
                 inner.state.output_prefix = command_line.output_prefix;
+                inner.state.stderr_handling = "null".to_owned();
                 inner.child = Some(child);
                 Ok(())
             }
@@ -231,8 +289,11 @@ impl GpuScreenRecorderHandle {
 
     pub async fn stop(&self) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().await;
+        let recorder_pid = inner.state.recorder_pid;
         stop_child(&mut inner.child).await?;
-        inner.state.pid = None;
+        stop_recorder_pid(recorder_pid).await?;
+        inner.state.wrapper_pid = None;
+        inner.state.recorder_pid = None;
         inner.state.health = GsrHealth::Stopped;
         Ok(())
     }
@@ -251,8 +312,11 @@ impl GpuScreenRecorderHandle {
             inner.state.health = GsrHealth::Starting;
             inner.state.last_error = Some(reason.clone());
             inner.state.restart_count = inner.state.restart_count.saturating_add(1);
+            let recorder_pid = inner.state.recorder_pid;
             stop_child(&mut inner.child).await?;
-            inner.state.pid = None;
+            stop_recorder_pid(recorder_pid).await?;
+            inner.state.wrapper_pid = None;
+            inner.state.recorder_pid = None;
         }
         info!(reason = %reason, "restarting GPU Screen Recorder");
         self.start().await
@@ -280,13 +344,22 @@ impl GpuScreenRecorderHandle {
                 Ok(Some(status)) => {
                     let message = format!("GPU Screen Recorder exited: {status}");
                     inner.child = None;
-                    inner.state.pid = None;
+                    inner.state.wrapper_pid = None;
+                    inner.state.recorder_pid = None;
                     inner.state.health = GsrHealth::Error;
                     inner.state.last_error = Some(message);
                 }
                 Ok(None) if inner.state.health != GsrHealth::SavingReplay => {
                     inner.state.health = GsrHealth::Running;
-                    inner.state.pid = inner.child.as_ref().map(Child::id);
+                    inner.state.wrapper_pid = inner.child.as_ref().map(Child::id);
+                    if let Some(recorder_pid) = inner.state.recorder_pid {
+                        if !process_alive(recorder_pid) {
+                            inner.state.recorder_pid = None;
+                            inner.state.health = GsrHealth::Error;
+                            inner.state.last_error =
+                                Some("GPU Screen Recorder recorder process exited".to_owned());
+                        }
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -296,7 +369,8 @@ impl GpuScreenRecorderHandle {
             }
         } else if inner.state.health != GsrHealth::Error {
             inner.state.health = GsrHealth::Stopped;
-            inner.state.pid = None;
+            inner.state.wrapper_pid = None;
+            inner.state.recorder_pid = None;
         }
         status_from_inner(&inner)
     }
@@ -316,27 +390,41 @@ impl GpuScreenRecorderHandle {
             request_id,
             context.reason.slug()
         );
+        {
+            let mut inner = self.inner.lock().await;
+            inner.state.total_saves_requested = inner.state.total_saves_requested.saturating_add(1);
+            inner.state.save_queue_len = inner.state.save_queue_len.saturating_add(1);
+        }
         let _save_guard = self.save_replay_in_progress.lock().await;
+        {
+            let mut inner = self.inner.lock().await;
+            inner.state.save_queue_len = inner.state.save_queue_len.saturating_sub(1);
+        }
         let result = self.save_replay_inner(context).await;
         if let Err(error) = &result {
             println!("[GPU_RECORDER] save failed id={request_id} error={error}");
             let mut inner = self.inner.lock().await;
             inner.state.health = GsrHealth::Error;
             inner.state.last_error = Some(error.to_string());
+            inner.state.total_saves_failed = inner.state.total_saves_failed.saturating_add(1);
+        } else {
+            let mut inner = self.inner.lock().await;
+            inner.state.total_saves_completed = inner.state.total_saves_completed.saturating_add(1);
         }
         result
     }
 
     async fn save_replay_inner(&self, context: ClipContext) -> anyhow::Result<SavedGsrReplay> {
-        let (pid, output_dir, extension, config) = {
+        let (recorder_pid, output_dir, extension, config) = {
             let mut inner = self.inner.lock().await;
             ensure_running(&mut inner)?;
-            let pid = inner.state.pid.ok_or_else(|| {
-                anyhow::anyhow!("GPU Screen Recorder n'est pas lancé: PID indisponible")
-            })?;
+            let recorder_pid = signal_pid_from_state(&inner.state)?;
+            if !process_alive(recorder_pid) {
+                anyhow::bail!("GPU Screen Recorder recorder_pid {recorder_pid} n'est plus vivant");
+            }
             inner.state.health = GsrHealth::SavingReplay;
             (
-                pid,
+                recorder_pid,
                 inner.state.output_dir.clone(),
                 inner.config.container.extension().to_owned(),
                 inner.config.clone(),
@@ -349,11 +437,13 @@ impl GpuScreenRecorderHandle {
             before.len(),
             output_dir.display()
         );
-        println!("[GPU_RECORDER] sending SIGUSR1 pid={pid}");
-        signal_process(pid, libc::SIGUSR1).with_context(|| {
-            format!("impossible de demander la sauvegarde du replay au PID GSR {pid}")
+        println!("[GPU_RECORDER] sending SIGUSR1 recorder_pid={recorder_pid}");
+        signal_process(recorder_pid, libc::SIGUSR1).with_context(|| {
+            format!(
+                "impossible de demander la sauvegarde du replay au recorder_pid GSR {recorder_pid}"
+            )
         })?;
-        println!("[GPU_RECORDER] SIGUSR1 sent successfully pid={pid}");
+        println!("[GPU_RECORDER] SIGUSR1 sent successfully recorder_pid={recorder_pid}");
         println!("[GPU_RECORDER] waiting for new {extension}...");
         let final_video_path =
             wait_for_new_replay_output(&output_dir, &extension, &before, REPLAY_SAVE_TIMEOUT)
@@ -367,8 +457,17 @@ impl GpuScreenRecorderHandle {
             anyhow::bail!("clip GSR vide: {}", final_video_path.display());
         }
 
+        let duration_seconds = probe_video_duration_seconds(&final_video_path)
+            .await
+            .unwrap_or(config.replay_seconds);
         let metadata_path = final_video_path.with_extension("json");
-        write_gsr_metadata(&metadata_path, &final_video_path, &context, &config)?;
+        write_gsr_metadata(
+            &metadata_path,
+            &final_video_path,
+            &context,
+            &config,
+            duration_seconds,
+        )?;
         let thumbnail_path = generate_thumbnail(&final_video_path).await;
 
         {
@@ -382,7 +481,7 @@ impl GpuScreenRecorderHandle {
             final_video_path,
             metadata_path,
             thumbnail_path,
-            duration_seconds: config.replay_seconds,
+            duration_seconds,
             size_bytes,
         })
     }
@@ -440,6 +539,14 @@ pub fn build_gsr_command(config: &CaptureConfig) -> anyhow::Result<GsrCommandLin
         "-o".to_owned(),
         output_prefix.display().to_string(),
     ]);
+    if config.audio_enabled {
+        let audio_input = config.audio_input.trim();
+        if audio_input.is_empty() {
+            warn!("GSR audio is enabled but audio_input is empty; starting video without audio");
+        } else {
+            args.extend(["-a".to_owned(), audio_input.to_owned()]);
+        }
+    }
 
     let command_line = std::iter::once(program.clone())
         .chain(args.iter().cloned())
@@ -589,7 +696,16 @@ fn status_from_inner(inner: &GpuScreenRecorderInner) -> GsrStatus {
             .mode
             .or_else(|| command.as_ref().map(|command| command.mode)),
         health: inner.state.health,
-        pid: inner.state.pid,
+        pid: inner.state.recorder_pid,
+        wrapper_pid: inner.state.wrapper_pid,
+        recorder_pid: inner.state.recorder_pid,
+        signal_pid: inner.state.recorder_pid,
+        recorder_command_line: inner.state.recorder_command_line.clone(),
+        stderr_handling: inner.state.stderr_handling.clone(),
+        save_queue_len: inner.state.save_queue_len,
+        total_saves_requested: inner.state.total_saves_requested,
+        total_saves_completed: inner.state.total_saves_completed,
+        total_saves_failed: inner.state.total_saves_failed,
         target: inner.config.target.clone(),
         monitors: inner.state.monitors.clone(),
         command_line,
@@ -610,14 +726,30 @@ fn status_from_inner(inner: &GpuScreenRecorderInner) -> GsrStatus {
 fn ensure_running(inner: &mut GpuScreenRecorderInner) -> anyhow::Result<()> {
     if !child_is_running(inner.child.as_mut()) {
         inner.child = None;
-        inner.state.pid = None;
+        inner.state.wrapper_pid = None;
+        inner.state.recorder_pid = None;
         inner.state.health = GsrHealth::Error;
         let message = "GPU Screen Recorder n'est pas lancé; redémarrez le backend GPU Replay";
         inner.state.last_error = Some(message.to_owned());
         anyhow::bail!(message);
     }
-    inner.state.pid = inner.child.as_ref().map(Child::id);
+    inner.state.wrapper_pid = inner.child.as_ref().map(Child::id);
+    if let Some(recorder_pid) = inner.state.recorder_pid {
+        if !process_alive(recorder_pid) {
+            inner.state.recorder_pid = None;
+            inner.state.health = GsrHealth::Error;
+            let message = "GPU Screen Recorder recorder_pid n'est plus vivant";
+            inner.state.last_error = Some(message.to_owned());
+            anyhow::bail!(message);
+        }
+    }
     Ok(())
+}
+
+fn signal_pid_from_state(state: &GpuScreenRecorderState) -> anyhow::Result<u32> {
+    state.recorder_pid.ok_or_else(|| {
+        anyhow::anyhow!("GPU Screen Recorder n'est pas lancé: recorder_pid indisponible")
+    })
 }
 
 fn child_is_running(child: Option<&mut Child>) -> bool {
@@ -660,6 +792,38 @@ async fn stop_child(child: &mut Option<Child>) -> anyhow::Result<()> {
     }
 }
 
+async fn stop_recorder_pid(recorder_pid: Option<u32>) -> anyhow::Result<()> {
+    let Some(pid) = recorder_pid else {
+        return Ok(());
+    };
+    if !process_alive(pid) {
+        return Ok(());
+    }
+    if !is_safe_recorder_process(pid) {
+        warn!(pid, "refusing to stop non-matching GPU Screen Recorder PID");
+        return Ok(());
+    }
+    info!(pid, "stopping GPU Screen Recorder recorder process");
+    if let Err(error) = signal_process(pid, libc::SIGTERM) {
+        debug!(%error, pid, "failed to send SIGTERM to GPU Screen Recorder recorder");
+    }
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < STOP_TIMEOUT {
+        if !process_alive(pid) {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    warn!(
+        pid,
+        "GPU Screen Recorder recorder did not stop; sending SIGKILL to recorder_pid only"
+    );
+    if let Err(error) = signal_process(pid, libc::SIGKILL) {
+        debug!(%error, pid, "failed to send SIGKILL to GPU Screen Recorder recorder");
+    }
+    Ok(())
+}
+
 fn signal_process(pid: u32, signal: i32) -> anyhow::Result<()> {
     let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
     if result == 0 {
@@ -668,6 +832,165 @@ fn signal_process(pid: u32, signal: i32) -> anyhow::Result<()> {
         Err(std::io::Error::last_os_error())
             .with_context(|| format!("kill({pid}, {signal}) failed"))
     }
+}
+
+fn process_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GsrProcessInfo {
+    pub pid: u32,
+    pub args: Vec<String>,
+    pub command_line: String,
+}
+
+pub async fn resolve_actual_gsr_pid(
+    config: &CaptureConfig,
+    output_dir: &Path,
+    output_prefix: &Path,
+    target: &str,
+) -> anyhow::Result<GsrProcessInfo> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let processes = list_processes_from_proc()?;
+        if let Some(process) =
+            select_actual_gsr_process(&processes, config, output_dir, output_prefix, target)
+        {
+            return Ok(process.clone());
+        }
+        if started.elapsed() >= Duration::from_secs(5) {
+            anyhow::bail!(
+                "impossible de résoudre le vrai PID gpu-screen-recorder pour target={} -ro {} -o {}",
+                target,
+                output_dir.display(),
+                output_prefix.display()
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn list_processes_from_proc() -> anyhow::Result<Vec<GsrProcessInfo>> {
+    let mut processes = Vec::new();
+    for entry in fs::read_dir("/proc").context("failed to read /proc")? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let args = bytes
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>();
+        if args.is_empty() {
+            continue;
+        }
+        let command_line = args.join(" ");
+        processes.push(GsrProcessInfo {
+            pid,
+            args,
+            command_line,
+        });
+    }
+    Ok(processes)
+}
+
+pub fn select_actual_gsr_process<'a>(
+    processes: &'a [GsrProcessInfo],
+    _config: &CaptureConfig,
+    output_dir: &Path,
+    output_prefix: &Path,
+    target: &str,
+) -> Option<&'a GsrProcessInfo> {
+    let output_dir = output_dir.display().to_string();
+    let output_prefix = output_prefix.display().to_string();
+    processes
+        .iter()
+        .filter(|process| process_matches_actual_gsr(process, target, &output_dir, &output_prefix))
+        .max_by_key(|process| process.pid)
+}
+
+fn process_matches_actual_gsr(
+    process: &GsrProcessInfo,
+    target: &str,
+    output_dir: &str,
+    output_prefix: &str,
+) -> bool {
+    if process.args.is_empty() || ignored_gsr_process(process) {
+        return false;
+    }
+    let executable = process
+        .args
+        .first()
+        .and_then(|arg| Path::new(arg).file_name())
+        .and_then(|arg| arg.to_str())
+        .unwrap_or("");
+    if executable != "gpu-screen-recorder" {
+        return false;
+    }
+    arg_pair_matches(&process.args, "-w", target)
+        && arg_pair_matches(&process.args, "-ro", output_dir)
+        && arg_pair_matches(&process.args, "-o", output_prefix)
+}
+
+fn ignored_gsr_process(process: &GsrProcessInfo) -> bool {
+    let ignored = [
+        "bwrap",
+        "flatpak",
+        "flatpak-spawn",
+        "gsr-kms-server",
+        "kms-server-proxy",
+        "gpu-screen-recorder-gtk",
+        "gsr-game-tracker",
+    ];
+    process.args.iter().any(|arg| {
+        Path::new(arg)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| ignored.contains(&name))
+    })
+}
+
+fn is_safe_recorder_process(pid: u32) -> bool {
+    let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args = bytes
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect::<Vec<_>>();
+    let process = GsrProcessInfo {
+        pid,
+        command_line: args.join(" "),
+        args,
+    };
+    !ignored_gsr_process(&process)
+        && process
+            .args
+            .first()
+            .and_then(|arg| Path::new(arg).file_name())
+            .and_then(|arg| arg.to_str())
+            == Some("gpu-screen-recorder")
+}
+
+fn arg_pair_matches(args: &[String], key: &str, expected: &str) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == key && pair[1] == expected)
 }
 
 fn scan_replay_outputs_set(output_dir: &Path, extension: &str) -> anyhow::Result<HashSet<PathBuf>> {
@@ -721,6 +1044,7 @@ fn write_gsr_metadata(
     video_path: &Path,
     context: &ClipContext,
     config: &CaptureConfig,
+    duration_seconds: u64,
 ) -> anyhow::Result<()> {
     let primary_event = context.event.as_ref().or_else(|| context.events.first());
     let raw_event = primary_event.and_then(raw_event_text);
@@ -740,7 +1064,7 @@ fn write_gsr_metadata(
         player_name: context.player_name.clone(),
         raw_event,
         video_path: video_path.display().to_string(),
-        duration_seconds: config.replay_seconds,
+        duration_seconds,
         codec: config.codec.as_arg(),
         container: config.container.as_arg(),
         fps: config.fps,
@@ -754,6 +1078,38 @@ fn write_gsr_metadata(
     let json = serde_json::to_string_pretty(&metadata)?;
     fs::write(metadata_path, json)
         .with_context(|| format!("failed to write GSR metadata {}", metadata_path.display()))
+}
+
+async fn probe_video_duration_seconds(video_path: &Path) -> Option<u64> {
+    let video_path = video_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let output = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(&video_path)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            debug!(
+                path = %video_path.display(),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "ffprobe duration failed for GSR clip"
+            );
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let seconds = text.trim().parse::<f64>().ok()?;
+        (seconds.is_finite() && seconds > 0.0).then(|| seconds.round().max(1.0) as u64)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn generate_thumbnail(video_path: &Path) -> Option<PathBuf> {
@@ -877,6 +1233,8 @@ mod tests {
             encoder: GsrEncoder::Gpu,
             quality: GsrQuality::Medium,
             output_dir: output_dir.display().to_string(),
+            audio_enabled: true,
+            audio_input: "default_output".to_owned(),
         }
     }
 
@@ -905,6 +1263,10 @@ mod tests {
         assert!(command.command_line.contains("-q medium"));
         assert!(command.command_line.contains("-ro \"/tmp/wt gsr\""));
         assert!(command.command_line.contains("-o \"/tmp/wt gsr/wtclip\""));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|args| args == ["-a", "default_output"]));
     }
 
     #[test]
@@ -1014,6 +1376,264 @@ mod tests {
             Some(command.command_line.as_str())
         );
         assert_eq!(status.output_prefix, command.output_prefix);
+        assert_eq!(status.stderr_handling, "null");
+    }
+
+    fn process(pid: u32, args: &[&str]) -> GsrProcessInfo {
+        GsrProcessInfo {
+            pid,
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            command_line: args.join(" "),
+        }
+    }
+
+    #[test]
+    fn resolve_actual_gsr_pid_ignores_bwrap() {
+        let config = test_config(PathBuf::from("/tmp/wt gsr"));
+        let output_dir = PathBuf::from("/tmp/wt gsr");
+        let output_prefix = output_dir.join("wtclip");
+        let processes = vec![
+            process(
+                10,
+                &[
+                    "bwrap",
+                    "--args",
+                    "80",
+                    "--",
+                    "gpu-screen-recorder",
+                    "-w",
+                    "eDP",
+                    "-ro",
+                    "/tmp/wt gsr",
+                    "-o",
+                    "/tmp/wt gsr/wtclip",
+                ],
+            ),
+            process(
+                11,
+                &[
+                    "gpu-screen-recorder",
+                    "-w",
+                    "eDP",
+                    "-ro",
+                    "/tmp/wt gsr",
+                    "-o",
+                    "/tmp/wt gsr/wtclip",
+                ],
+            ),
+        ];
+
+        let selected =
+            select_actual_gsr_process(&processes, &config, &output_dir, &output_prefix, "eDP")
+                .unwrap();
+
+        assert_eq!(selected.pid, 11);
+    }
+
+    #[test]
+    fn resolve_actual_gsr_pid_ignores_gsr_game_tracker() {
+        let config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        let output_dir = PathBuf::from("/tmp/wt-gsr");
+        let output_prefix = output_dir.join("wtclip");
+        let processes = vec![
+            process(20, &["gsr-game-tracker", "gpu-screen-recorder"]),
+            process(
+                21,
+                &[
+                    "gpu-screen-recorder",
+                    "-w",
+                    "eDP",
+                    "-ro",
+                    "/tmp/wt-gsr",
+                    "-o",
+                    "/tmp/wt-gsr/wtclip",
+                ],
+            ),
+        ];
+
+        let selected =
+            select_actual_gsr_process(&processes, &config, &output_dir, &output_prefix, "eDP")
+                .unwrap();
+
+        assert_eq!(selected.pid, 21);
+    }
+
+    #[test]
+    fn resolve_actual_gsr_pid_ignores_gpu_screen_recorder_gtk() {
+        let config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        let output_dir = PathBuf::from("/tmp/wt-gsr");
+        let output_prefix = output_dir.join("wtclip");
+        let processes = vec![
+            process(
+                30,
+                &[
+                    "gpu-screen-recorder-gtk",
+                    "gpu-screen-recorder",
+                    "-w",
+                    "eDP",
+                    "-ro",
+                    "/tmp/wt-gsr",
+                    "-o",
+                    "/tmp/wt-gsr/wtclip",
+                ],
+            ),
+            process(
+                31,
+                &[
+                    "gpu-screen-recorder",
+                    "-w",
+                    "eDP",
+                    "-ro",
+                    "/tmp/wt-gsr",
+                    "-o",
+                    "/tmp/wt-gsr/wtclip",
+                ],
+            ),
+        ];
+
+        let selected =
+            select_actual_gsr_process(&processes, &config, &output_dir, &output_prefix, "eDP")
+                .unwrap();
+
+        assert_eq!(selected.pid, 31);
+    }
+
+    #[test]
+    fn resolve_actual_gsr_pid_matches_output_prefix() {
+        let config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        let output_dir = PathBuf::from("/tmp/wt-gsr");
+        let output_prefix = output_dir.join("wtclip");
+        let processes = vec![
+            process(
+                40,
+                &[
+                    "gpu-screen-recorder",
+                    "-w",
+                    "eDP",
+                    "-ro",
+                    "/tmp/wt-gsr",
+                    "-o",
+                    "/tmp/wt-gsr/other",
+                ],
+            ),
+            process(
+                41,
+                &[
+                    "gpu-screen-recorder",
+                    "-w",
+                    "eDP",
+                    "-ro",
+                    "/tmp/wt-gsr",
+                    "-o",
+                    "/tmp/wt-gsr/wtclip",
+                ],
+            ),
+        ];
+
+        let selected =
+            select_actual_gsr_process(&processes, &config, &output_dir, &output_prefix, "eDP")
+                .unwrap();
+
+        assert_eq!(selected.pid, 41);
+    }
+
+    #[test]
+    fn save_replay_sends_signal_to_recorder_pid_not_wrapper_pid() {
+        let mut state = GpuScreenRecorderState {
+            mode: Some(GsrMode::Flatpak),
+            wrapper_pid: Some(100),
+            recorder_pid: Some(101),
+            health: GsrHealth::Running,
+            target: "eDP".to_owned(),
+            output_dir: PathBuf::from("/tmp/wt-gsr"),
+            output_prefix: PathBuf::from("/tmp/wt-gsr/wtclip"),
+            last_output: None,
+            last_error: None,
+            restart_count: 0,
+            command_line: None,
+            recorder_command_line: None,
+            monitors: Vec::new(),
+            stderr_handling: "null".to_owned(),
+            save_queue_len: 0,
+            total_saves_requested: 0,
+            total_saves_completed: 0,
+            total_saves_failed: 0,
+        };
+
+        assert_eq!(signal_pid_from_state(&state).unwrap(), 101);
+        state.recorder_pid = None;
+        assert!(signal_pid_from_state(&state).is_err());
+    }
+
+    #[test]
+    fn restart_leaves_only_one_recorder_process() {
+        let config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        let output_dir = PathBuf::from("/tmp/wt-gsr");
+        let output_prefix = output_dir.join("wtclip");
+        let processes = vec![
+            process(
+                50,
+                &[
+                    "gpu-screen-recorder",
+                    "-w",
+                    "eDP",
+                    "-ro",
+                    "/tmp/wt-gsr",
+                    "-o",
+                    "/tmp/wt-gsr/wtclip",
+                ],
+            ),
+            process(
+                51,
+                &[
+                    "gpu-screen-recorder",
+                    "-w",
+                    "eDP",
+                    "-ro",
+                    "/tmp/wt-gsr",
+                    "-o",
+                    "/tmp/wt-gsr/wtclip",
+                ],
+            ),
+        ];
+
+        let selected =
+            select_actual_gsr_process(&processes, &config, &output_dir, &output_prefix, "eDP")
+                .unwrap();
+
+        assert_eq!(selected.pid, 51);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_reports_wrapper_and_recorder_pid() {
+        let config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        let handle = GpuScreenRecorderHandle::new(config);
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.state.wrapper_pid = Some(200);
+            inner.state.recorder_pid = Some(201);
+            inner.state.recorder_command_line =
+                Some("gpu-screen-recorder -w eDP -ro /tmp/wt-gsr -o /tmp/wt-gsr/wtclip".to_owned());
+        }
+        let status = handle.status().await;
+
+        assert_eq!(status.wrapper_pid, Some(200));
+        assert_eq!(status.recorder_pid, Some(201));
+        assert_eq!(status.signal_pid, Some(201));
+        assert!(status
+            .recorder_command_line
+            .as_deref()
+            .unwrap()
+            .contains("gpu-screen-recorder -w eDP"));
+    }
+
+    #[tokio::test]
+    async fn stderr_is_not_left_piped_unread() {
+        let config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        let handle = GpuScreenRecorderHandle::new(config);
+        let status = handle.status().await;
+
+        assert_eq!(status.stderr_handling, "null");
     }
 
     #[test]
@@ -1039,13 +1659,45 @@ mod tests {
             last_event_time: None,
         };
 
-        write_gsr_metadata(&metadata, &video, &context, &config).unwrap();
+        write_gsr_metadata(&metadata, &video, &context, &config, 17).unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(metadata).unwrap()).unwrap();
 
         assert_eq!(json["capture_backend"], "gpu_screen_recorder");
         assert_eq!(json["reason"], "manual");
         assert_eq!(json["container"], "mp4");
+        assert_eq!(json["duration_seconds"], 17);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_uses_ffprobe_duration_when_available() {
+        let root = temp_dir("metadata-duration");
+        let video = root.join("Replay_001.mp4");
+        fs::write(&video, b"mp4").unwrap();
+        let metadata = video.with_extension("json");
+        let config = test_config(root.clone());
+        let context = ClipContext {
+            reason: ClipReason::Manual,
+            event: None,
+            events: Vec::new(),
+            player_name: None,
+            pending_clip_id: None,
+            pending_dedupe_key: None,
+            video_quality: Default::default(),
+            quality_preset: Default::default(),
+            duration_seconds: 25,
+            post_event_seconds: 0,
+            segment_seconds: 2,
+            first_event_time: None,
+            last_event_time: None,
+        };
+
+        write_gsr_metadata(&metadata, &video, &context, &config, 9).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(metadata).unwrap()).unwrap();
+
+        assert_eq!(json["duration_seconds"], 9);
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -225,10 +225,19 @@ struct RuntimeStatus {
     gsr_available: bool,
     gsr_health: GsrHealth,
     gsr_pid: Option<u32>,
+    gsr_wrapper_pid: Option<u32>,
+    gsr_recorder_pid: Option<u32>,
+    gsr_signal_pid: Option<u32>,
     gsr_mode: Option<String>,
     gsr_target: String,
     gsr_monitors: Vec<String>,
     gsr_command_line: Option<String>,
+    gsr_recorder_command_line: Option<String>,
+    gsr_stderr_handling: String,
+    gsr_save_queue_len: usize,
+    gsr_total_saves_requested: u64,
+    gsr_total_saves_completed: u64,
+    gsr_total_saves_failed: u64,
     gsr_output_dir: Option<PathBuf>,
     gsr_output_prefix: Option<PathBuf>,
     gsr_last_output: Option<PathBuf>,
@@ -280,10 +289,19 @@ impl RuntimeStatus {
             gsr_available: false,
             gsr_health: GsrHealth::Stopped,
             gsr_pid: None,
+            gsr_wrapper_pid: None,
+            gsr_recorder_pid: None,
+            gsr_signal_pid: None,
             gsr_mode: None,
             gsr_target: config.capture.target.clone(),
             gsr_monitors: Vec::new(),
             gsr_command_line: None,
+            gsr_recorder_command_line: None,
+            gsr_stderr_handling: "null".to_owned(),
+            gsr_save_queue_len: 0,
+            gsr_total_saves_requested: 0,
+            gsr_total_saves_completed: 0,
+            gsr_total_saves_failed: 0,
             gsr_output_dir: config.capture.output_dir_path().ok(),
             gsr_output_prefix: config.capture.output_dir_path().ok().map(|path| path.join("wtclip")),
             gsr_last_output: None,
@@ -928,10 +946,19 @@ fn apply_gsr_runtime_status(status: &mut RuntimeStatus, gsr: &GsrStatus) {
     status.gsr_available = gsr.available;
     status.gsr_health = gsr.health;
     status.gsr_pid = gsr.pid;
+    status.gsr_wrapper_pid = gsr.wrapper_pid;
+    status.gsr_recorder_pid = gsr.recorder_pid;
+    status.gsr_signal_pid = gsr.signal_pid;
     status.gsr_mode = gsr.mode.map(|mode| format!("{mode:?}").to_ascii_lowercase());
     status.gsr_target = gsr.target.clone();
     status.gsr_monitors = gsr.monitors.clone();
     status.gsr_command_line = gsr.command_line.clone();
+    status.gsr_recorder_command_line = gsr.recorder_command_line.clone();
+    status.gsr_stderr_handling = gsr.stderr_handling.clone();
+    status.gsr_save_queue_len = gsr.save_queue_len;
+    status.gsr_total_saves_requested = gsr.total_saves_requested;
+    status.gsr_total_saves_completed = gsr.total_saves_completed;
+    status.gsr_total_saves_failed = gsr.total_saves_failed;
     status.gsr_output_dir = Some(gsr.output_dir.clone());
     status.gsr_output_prefix = Some(gsr.output_prefix.clone());
     status.gsr_last_output = gsr.last_output.clone();
