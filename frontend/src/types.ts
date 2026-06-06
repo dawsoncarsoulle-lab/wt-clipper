@@ -6,6 +6,9 @@ export type ClipReason =
   | "manual"
   | "unknown";
 
+export type ClipType = "kill" | "multi" | "death" | "base" | "manual" | "clip";
+export type ClipExportType = "edited" | "social" | "vertical";
+
 export type GsrHealth = "not_available" | "stopped" | "starting" | "running" | "saving_replay" | "error";
 
 export type ClipStatus = "detected" | "recording" | "encoding" | "saving" | "ready" | "failed";
@@ -62,6 +65,10 @@ export type ClipMediaInfo = {
 };
 
 export type EditorExportProgressPayload = {
+  id?: string;
+  exportId?: string;
+  phase?: string;
+  stage?: string;
   active: boolean;
   step:
     | "preparing"
@@ -74,6 +81,8 @@ export type EditorExportProgressPayload = {
     | "failed";
   progress: number;
   message: string;
+  currentTime?: number | null;
+  duration?: number | null;
   outputPath?: string;
   error?: string;
 };
@@ -84,6 +93,8 @@ export type ClipInfo = {
   previewUrl?: string | null;
   fileName: string;
   reason: ClipReason;
+  clipType?: ClipType | null;
+  exportType?: ClipExportType | null;
   sizeBytes: number;
   durationSeconds: number;
   modifiedSecsAgo: number;
@@ -107,6 +118,8 @@ export type GalleryClipItem = {
   id: string;
   status: ClipStatus;
   reason: ClipReason;
+  clipType?: ClipType | null;
+  exportType?: ClipExportType | null;
   createdAt: string;
   title: string;
   filePath?: string;
@@ -136,6 +149,9 @@ export type AppConfig = {
     encoder: "gpu" | "cpu";
     quality: "medium" | "high" | "very_high" | "ultra";
     bitrate_mode: "auto" | "qp" | "cbr" | "vbr";
+    frame_rate_mode: "cfr" | "vfr" | "content";
+    keyframe_interval_seconds: number;
+    restart_replay_on_save: boolean;
     video_bitrate_kbps: number;
     output_dir: string;
     audio_enabled: boolean;
@@ -197,6 +213,9 @@ export type RuntimeStatus = {
   gsrFps: number;
   gsrQuality: string;
   gsrBitrateMode: string;
+  gsrFrameRateMode: string;
+  gsrKeyframeIntervalSeconds: number;
+  gsrRestartReplayOnSave: boolean;
   gsrVideoBitrateKbps: number;
   gsrEffectiveQArgument: string;
   autoClipRunning: boolean;

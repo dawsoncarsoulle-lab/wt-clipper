@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -25,7 +25,11 @@ import {
 import { ClipEditorModal } from "./components/ClipEditorModal";
 import appLogo from "./assets/brand/WT_clipper_brand.png";
 import {
+  galleryBadgeClass,
+  galleryBadgeLabel,
+  hoverPreviewSeekSeconds,
   mountedGalleryVideoCount,
+  shouldShowHoverVideo,
   shouldApplyGalleryLoadResult,
   shouldUseGalleryCache,
 } from "./galleryResourcePolicy";
@@ -52,6 +56,7 @@ const nav = [
 const GALLERY_CACHE_TTL_MS = 10_000;
 const GALLERY_REFRESH_DEBOUNCE_MS = 800;
 const GALLERY_AUTO_REFRESH_MS = 5000;
+const HOVER_PREVIEW_START_SECONDS = 0.75;
 
 const reasonLabel: Record<ClipReason, string> = {
   target_destroyed: "Cible détruite",
@@ -382,7 +387,7 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | ClipReason>("all");
   const [editingClip, setEditingClip] = useState<ClipInfo | null>(null);
-  const [activePreviewPath, setActivePreviewPath] = useState<string | null>(null);
+  const [activePreviewClip, setActivePreviewClip] = useState<ClipInfo | null>(null);
 
   const galleryItems = useMemo(() => {
     const readyPaths = new Set(clips.map((clip) => clip.path));
@@ -402,8 +407,8 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
   }, [galleryItems.length, setGalleryRenderedClipCount]);
 
   useEffect(() => {
-    setGalleryMountedVideoCount(mountedGalleryVideoCount(activePreviewPath));
-  }, [activePreviewPath, setGalleryMountedVideoCount]);
+    setGalleryMountedVideoCount(mountedGalleryVideoCount(activePreviewClip?.path ?? null));
+  }, [activePreviewClip, setGalleryMountedVideoCount]);
 
   async function remove(path: string) {
     try {
@@ -452,8 +457,8 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
             <ClipCard
               key={clip.id}
               clip={galleryItemToClipInfo(clip)}
-              activePreviewPath={activePreviewPath}
-              onPreviewChange={setActivePreviewPath}
+              activePreviewPath={activePreviewClip?.path ?? null}
+              onPreviewChange={setActivePreviewClip}
               onDelete={remove}
               onEdit={setEditingClip}
             />
@@ -462,6 +467,8 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
           ),
         )}
       </div>
+
+      <HoverVideoPreview clip={activePreviewClip} startSeconds={HOVER_PREVIEW_START_SECONDS} />
 
       {editingClip && (
         <ClipEditorModal
@@ -485,7 +492,9 @@ function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
         <Activity size={28} />
       </div>
       <div className="clip-meta">
-        <span className={`badge ${reasonClass(clip.reason)}`}>{reasonLabel[clip.reason]}</span>
+        <span className={`badge ${galleryBadgeClass(clip.clipType, clip.reason, clip.exportType)}`}>
+          {galleryBadgeLabel(clip.clipType, clip.reason, clip.exportType)}
+        </span>
         <h3>{clip.title}</h3>
         <p>{clip.error ?? statusLabel[clip.status]}</p>
         {clip.status !== "failed" && (
@@ -507,61 +516,31 @@ function ClipCard({
 }: {
   clip: ClipInfo;
   activePreviewPath: string | null;
-  onPreviewChange: (path: string | null) => void;
+  onPreviewChange: (clip: ClipInfo | null) => void;
   onDelete: (path: string) => void;
   onEdit: (clip: ClipInfo) => void;
 }) {
-  const [videoFailed, setVideoFailed] = useState(false);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
   const previewActive = activePreviewPath === clip.path;
-  const videoSrc = clip.previewUrl ?? convertFileSrc(clip.path);
   const thumbnailSrc = clip.thumbnailPath ? convertFileSrc(clip.thumbnailPath) : null;
-
-  const attachVideoRef = useCallback((node: HTMLVideoElement | null) => {
-    if (videoRef.current && videoRef.current !== node) {
-      releaseVideoElement(videoRef.current);
-    }
-    videoRef.current = node;
-  }, []);
-
-  useEffect(() => {
-    if (!previewActive && videoRef.current) {
-      releaseVideoElement(videoRef.current);
-    }
-  }, [previewActive]);
-
-  useEffect(() => () => {
-    if (videoRef.current) {
-      releaseVideoElement(videoRef.current);
-    }
-  }, []);
 
   return (
     <article
-      className="clip-card"
-      onMouseEnter={() => onPreviewChange(clip.path)}
+      className={previewActive ? "clip-card preview-active" : "clip-card"}
+      data-preview-path={clip.path}
+      onMouseEnter={() => onPreviewChange(clip)}
       onMouseLeave={() => onPreviewChange(null)}
     >
       <div className="clip-thumb">
-        {previewActive && !videoFailed ? (
-          <video
-            ref={attachVideoRef}
-            src={videoSrc}
-            muted
-            playsInline
-            loop
-            preload="metadata"
-            onCanPlay={(event) => void event.currentTarget.play().catch(() => setVideoFailed(true))}
-            onError={() => setVideoFailed(true)}
-          />
-        ) : thumbnailSrc ? (
+        {thumbnailSrc ? (
           <img src={thumbnailSrc} alt="" loading="lazy" />
         ) : (
           <FilmFallback />
         )}
       </div>
       <div className="clip-meta">
-        <span className={`badge ${reasonClass(clip.reason)}`}>{reasonLabel[clip.reason]}</span>
+        <span className={`badge ${galleryBadgeClass(clip.clipType, clip.reason, clip.exportType)}`}>
+          {galleryBadgeLabel(clip.clipType, clip.reason, clip.exportType)}
+        </span>
         <h3>{clip.fileName}</h3>
         <p>
           {formatClipDuration(clip.durationSeconds)} · {formatBytes(clip.sizeBytes)} ·{" "}
@@ -581,6 +560,154 @@ function ClipCard({
       </div>
     </article>
   );
+}
+
+function HoverVideoPreview({ clip, startSeconds }: { clip: ClipInfo | null; startSeconds: number }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const cleanupTimer = useRef<number | null>(null);
+  const [ready, setReady] = useState(false);
+  const [targetRect, setTargetRect] = useState<DOMRect | null>(null);
+  const [readyState, setReadyState] = useState(0);
+
+  useEffect(() => {
+    setReady(false);
+    setReadyState(0);
+    if (cleanupTimer.current != null) {
+      window.clearTimeout(cleanupTimer.current);
+      cleanupTimer.current = null;
+    }
+
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+
+    releaseVideoElement(video);
+    if (!clip) {
+      setTargetRect(null);
+      return;
+    }
+
+    const thumb = findPreviewThumb(clip.path);
+    if (!thumb) {
+      return;
+    }
+    setTargetRect(thumb.getBoundingClientRect());
+
+    let cancelled = false;
+    const src = clip.previewUrl ?? convertFileSrc(clip.path);
+
+    function markReadyAndPlay() {
+      if (cancelled || !video) {
+        return;
+      }
+      const seekTo = hoverPreviewSeekSeconds(startSeconds, video.duration);
+      try {
+        if (Number.isFinite(video.duration) && video.duration > seekTo) {
+          video.currentTime = seekTo;
+        }
+      } catch (error) {
+        console.info("[FRONTEND] hover preview seek skipped", error);
+      }
+      if (!shouldShowHoverVideo(true, video.readyState)) {
+        return;
+      }
+      setReadyState(video.readyState);
+      setReady(true);
+      void video.play().catch((error) => {
+        console.info("[FRONTEND] hover preview playback failed", error);
+      });
+    }
+
+    const onLoadedMetadata = () => {
+      if (cancelled) {
+        return;
+      }
+      try {
+        video.currentTime = hoverPreviewSeekSeconds(startSeconds, video.duration);
+      } catch (error) {
+        console.info("[FRONTEND] hover preview metadata seek skipped", error);
+      }
+    };
+    const onLoadedData = () => {
+      if (!cancelled) {
+        setReadyState(video.readyState);
+      }
+    };
+    const onCanPlay = () => markReadyAndPlay();
+
+    video.addEventListener("loadedmetadata", onLoadedMetadata);
+    video.addEventListener("loadeddata", onLoadedData);
+    video.addEventListener("canplay", onCanPlay);
+    video.src = src;
+    video.load();
+
+    cleanupTimer.current = window.setTimeout(() => {
+      if (!cancelled) {
+        setReadyState(video.readyState);
+      }
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      video.removeEventListener("loadedmetadata", onLoadedMetadata);
+      video.removeEventListener("loadeddata", onLoadedData);
+      video.removeEventListener("canplay", onCanPlay);
+      if (cleanupTimer.current != null) {
+        window.clearTimeout(cleanupTimer.current);
+        cleanupTimer.current = null;
+      }
+      releaseVideoElement(video);
+    };
+  }, [clip, startSeconds]);
+
+  useEffect(() => {
+    if (!clip) {
+      return;
+    }
+    const clipPath = clip.path;
+    function updateRect() {
+      const thumb = findPreviewThumb(clipPath);
+      setTargetRect(thumb?.getBoundingClientRect() ?? null);
+    }
+    window.addEventListener("scroll", updateRect, true);
+    window.addEventListener("resize", updateRect);
+    return () => {
+      window.removeEventListener("scroll", updateRect, true);
+      window.removeEventListener("resize", updateRect);
+    };
+  }, [clip]);
+
+  const visible = Boolean(clip && targetRect && shouldShowHoverVideo(ready, readyState));
+
+  return (
+    <video
+      ref={videoRef}
+      className="hover-video-preview"
+      style={
+        targetRect
+          ? {
+              left: `${targetRect.left}px`,
+              top: `${targetRect.top}px`,
+              width: `${targetRect.width}px`,
+              height: `${targetRect.height}px`,
+              opacity: visible ? 1 : 0,
+              pointerEvents: "none",
+            }
+          : { opacity: 0, pointerEvents: "none" }
+      }
+      muted
+      playsInline
+      loop
+      preload="metadata"
+    />
+  );
+}
+
+function findPreviewThumb(path: string) {
+  const cards = Array.from(document.querySelectorAll<HTMLElement>("[data-preview-path]"));
+  const card = cards.find((item) => item.dataset.previewPath === path);
+  return card?.querySelector<HTMLElement>(".clip-thumb") ?? null;
 }
 
 function Configuration() {
@@ -682,6 +809,32 @@ function Configuration() {
         <Field label="FPS">
           <input type="number" min={1} value={draft.capture.fps} onChange={(event) => updateCapture("fps", Number(event.target.value))} />
         </Field>
+        <Field label="Mode FPS">
+          <select
+            value={draft.capture.frame_rate_mode}
+            onChange={(event) => updateCapture("frame_rate_mode", event.target.value as AppConfig["capture"]["frame_rate_mode"])}
+          >
+            <option value="cfr">Constant (CFR)</option>
+            <option value="vfr">Variable (VFR)</option>
+            <option value="content">Content</option>
+          </select>
+        </Field>
+        <Field label="Intervalle keyframe">
+          <input
+            type="number"
+            min={0.1}
+            max={10}
+            step={0.1}
+            list="keyframe-presets"
+            value={draft.capture.keyframe_interval_seconds}
+            onChange={(event) => updateCapture("keyframe_interval_seconds", Number(event.target.value))}
+          />
+          <datalist id="keyframe-presets">
+            <option value="0.5" />
+            <option value="1.0" />
+            <option value="2.0" />
+          </datalist>
+        </Field>
         <Field label="Durée replay">
           <input
             type="number"
@@ -743,6 +896,16 @@ function Configuration() {
         <p className="help-text">
           Pour War Thunder en 1080p60, 20000-30000 kbps donne une meilleure qualité mais augmente la taille des fichiers.
         </p>
+        <Field label="Redémarrer le replay après sauvegarde" className="toggle-field">
+          <div className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={draft.capture.restart_replay_on_save}
+              onChange={(event) => updateCapture("restart_replay_on_save", event.target.checked)}
+            />
+            <strong>{draft.capture.restart_replay_on_save ? "Oui, vider le buffer" : "Non, conserver le buffer"}</strong>
+          </div>
+        </Field>
         <Field label="Audio" className="toggle-field">
           <div className="checkbox-row">
             <input
@@ -932,6 +1095,12 @@ function Diagnostics() {
           <KeyValue label="Replay seconds" value={runtimeStatus?.gsrReplaySeconds ?? "-"} />
           <KeyValue label="Quality" value={runtimeStatus?.gsrQuality ?? "-"} />
           <KeyValue label="Bitrate mode" value={runtimeStatus?.gsrBitrateMode ?? "-"} />
+          <KeyValue label="Frame rate mode" value={runtimeStatus?.gsrFrameRateMode ?? "-"} />
+          <KeyValue label="Keyframe interval seconds" value={runtimeStatus?.gsrKeyframeIntervalSeconds ?? "-"} />
+          <KeyValue
+            label="Restart replay on save"
+            value={runtimeStatus?.gsrRestartReplayOnSave ? "yes" : "no"}
+          />
           <KeyValue label="Video bitrate kbps" value={runtimeStatus?.gsrVideoBitrateKbps ?? "-"} />
           <KeyValue label="Effective -q" value={runtimeStatus?.gsrEffectiveQArgument ?? "-"} />
           <KeyValue label="Save queue" value={runtimeStatus?.gsrSaveQueueLen ?? "-"} />
@@ -1011,6 +1180,8 @@ function clipToGalleryItem(clip: ClipInfo): GalleryClipItem {
     id: clip.path,
     status: "ready",
     reason: clip.reason,
+    clipType: clip.clipType,
+    exportType: clip.exportType,
     createdAt: String(Date.now() - clip.modifiedSecsAgo * 1000),
     title: clip.fileName,
     filePath: clip.path,
@@ -1028,6 +1199,8 @@ function galleryItemToClipInfo(clip: GalleryClipItem): ClipInfo {
     previewUrl: clip.previewUrl,
     fileName: clip.title,
     reason: clip.reason,
+    clipType: clip.clipType,
+    exportType: clip.exportType,
     sizeBytes: clip.sizeBytes ?? 0,
     durationSeconds: clip.durationSeconds ?? 0,
     modifiedSecsAgo: secondsAgo(clip.createdAt),
@@ -1047,10 +1220,6 @@ function releaseVideoElement(video: HTMLVideoElement) {
   video.pause();
   video.removeAttribute("src");
   video.load();
-}
-
-function reasonClass(reason: ClipReason) {
-  return `reason-${reason.replace(/_/g, "-")}`;
 }
 
 function formatClipDuration(seconds: number) {

@@ -246,6 +246,9 @@ struct RuntimeStatus {
     gsr_fps: u32,
     gsr_quality: String,
     gsr_bitrate_mode: String,
+    gsr_frame_rate_mode: String,
+    gsr_keyframe_interval_seconds: f32,
+    gsr_restart_replay_on_save: bool,
     gsr_video_bitrate_kbps: u32,
     gsr_effective_q_argument: String,
     auto_clip_running: bool,
@@ -270,7 +273,10 @@ struct RuntimeEvent {
 
 #[derive(Debug, Deserialize)]
 struct ClipMetadataInfo {
-    reason: Option<ClipReason>,
+    reason: Option<String>,
+    clip_type: Option<String>,
+    export_type: Option<String>,
+    thumbnail_path: Option<String>,
     duration_seconds: Option<f64>,
 }
 
@@ -307,6 +313,9 @@ impl RuntimeStatus {
             gsr_fps: config.capture.fps,
             gsr_quality: config.capture.quality.as_arg().to_owned(),
             gsr_bitrate_mode: config.capture.bitrate_mode.as_arg().unwrap_or("auto").to_owned(),
+            gsr_frame_rate_mode: config.capture.frame_rate_mode.as_arg().to_owned(),
+            gsr_keyframe_interval_seconds: config.capture.keyframe_interval_seconds,
+            gsr_restart_replay_on_save: config.capture.restart_replay_on_save,
             gsr_video_bitrate_kbps: config.capture.video_bitrate_kbps,
             gsr_effective_q_argument: if config.capture.bitrate_mode.as_arg() == Some("cbr") {
                 if config.capture.video_bitrate_kbps == 0 {
@@ -360,6 +369,9 @@ async fn save_config(
             .as_arg()
             .unwrap_or("auto")
             .to_owned();
+        status.gsr_frame_rate_mode = status_config.capture.frame_rate_mode.as_arg().to_owned();
+        status.gsr_keyframe_interval_seconds = status_config.capture.keyframe_interval_seconds;
+        status.gsr_restart_replay_on_save = status_config.capture.restart_replay_on_save;
         status.gsr_video_bitrate_kbps = status_config.capture.video_bitrate_kbps;
         status.gsr_effective_q_argument = if status_config.capture.bitrate_mode.as_arg() == Some("cbr") {
             if status_config.capture.video_bitrate_kbps == 0 {
@@ -884,6 +896,9 @@ fn apply_gsr_runtime_status(status: &mut RuntimeStatus, gsr: &GsrStatus) {
     status.gsr_fps = gsr.fps;
     status.gsr_quality = gsr.quality.clone();
     status.gsr_bitrate_mode = gsr.bitrate_mode.clone();
+    status.gsr_frame_rate_mode = gsr.frame_rate_mode.clone();
+    status.gsr_keyframe_interval_seconds = gsr.keyframe_interval_seconds;
+    status.gsr_restart_replay_on_save = gsr.restart_replay_on_save;
     status.gsr_video_bitrate_kbps = gsr.video_bitrate_kbps;
     status.gsr_effective_q_argument = gsr.effective_q_argument.clone();
 }
@@ -1088,16 +1103,24 @@ async fn scan_clips(
                     .map(str::to_owned)
                     .unwrap_or_else(|| path.display().to_string());
                 let metadata_info = read_clip_metadata_info(&path.with_extension("json"));
+                let reason = metadata_info
+                    .as_ref()
+                    .and_then(|metadata| clip_reason_from_metadata(metadata))
+                    .unwrap_or_else(|| clip_reason_from_name(&file_name));
+                let thumbnail_path =
+                    gallery_thumbnail_path(path, metadata_info.as_ref().and_then(|metadata| {
+                        metadata.thumbnail_path.as_deref()
+                    }));
                 clips.push(ClipInfo {
-                    reason: metadata_info
+                    reason,
+                    clip_type: metadata_info
                         .as_ref()
-                        .and_then(|metadata| metadata.reason)
-                        .unwrap_or_else(|| clip_reason_from_name(&file_name)),
+                        .and_then(|metadata| normalize_clip_type(metadata.clip_type.as_deref())),
+                    export_type: metadata_info
+                        .as_ref()
+                        .and_then(|metadata| normalize_export_type(metadata.export_type.as_deref())),
                     path: path.to_path_buf(),
-                    thumbnail_path: path
-                        .with_extension("jpg")
-                        .exists()
-                        .then(|| path.with_extension("jpg")),
+                    thumbnail_path,
                     preview_url: preview_server.url_for_path(path),
                     file_name,
                     size_bytes,
@@ -1170,6 +1193,78 @@ fn read_clip_metadata_info(path: &Path) -> Option<ClipMetadataInfo> {
     serde_json::from_str(&content).ok()
 }
 
+fn clip_reason_from_metadata(metadata: &ClipMetadataInfo) -> Option<ClipReason> {
+    metadata
+        .reason
+        .as_deref()
+        .and_then(parse_clip_reason)
+        .or_else(|| metadata.clip_type.as_deref().and_then(parse_clip_type_reason))
+}
+
+fn parse_clip_reason(value: &str) -> Option<ClipReason> {
+    match value {
+        "target-destroyed" | "target_destroyed" | "kill" => Some(ClipReason::TargetDestroyed),
+        "base-destroyed" | "base_destroyed" | "base" => Some(ClipReason::BaseDestroyed),
+        "player-destroyed" | "player_destroyed" | "death" => Some(ClipReason::PlayerDestroyed),
+        "multi-kill" | "multi_kill" | "multi" => Some(ClipReason::MultiKill),
+        "manual" => Some(ClipReason::Manual),
+        "unknown" | "clip" => Some(ClipReason::Unknown),
+        _ => None,
+    }
+}
+
+fn parse_clip_type_reason(value: &str) -> Option<ClipReason> {
+    match value {
+        "kill" => Some(ClipReason::TargetDestroyed),
+        "base" => Some(ClipReason::BaseDestroyed),
+        "death" => Some(ClipReason::PlayerDestroyed),
+        "multi" => Some(ClipReason::MultiKill),
+        "manual" => Some(ClipReason::Manual),
+        "clip" => Some(ClipReason::Unknown),
+        _ => None,
+    }
+}
+
+fn normalize_clip_type(value: Option<&str>) -> Option<String> {
+    value
+        .and_then(|value| match value {
+            "kill" | "base" | "death" | "multi" | "manual" | "clip" => Some(value),
+            _ => None,
+        })
+        .map(str::to_owned)
+}
+
+fn normalize_export_type(value: Option<&str>) -> Option<String> {
+    value
+        .and_then(|value| match value {
+            "edited" | "social" | "vertical" => Some(value),
+            _ => None,
+        })
+        .map(str::to_owned)
+}
+
+fn gallery_thumbnail_path(video_path: &Path, metadata_thumbnail_path: Option<&str>) -> Option<PathBuf> {
+    metadata_thumbnail_path
+        .and_then(|value| resolve_metadata_path(video_path, value))
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            let sidecar = video_path.with_extension("jpg");
+            sidecar.is_file().then_some(sidecar)
+        })
+}
+
+fn resolve_metadata_path(video_path: &Path, value: &str) -> Option<PathBuf> {
+    if value.trim().is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        video_path.parent().map(|parent| parent.join(path))
+    }
+}
+
 fn clip_reason_from_name(name: &str) -> ClipReason {
     if name.starts_with("multi-kill") {
         ClipReason::MultiKill
@@ -1210,4 +1305,84 @@ fn write_config(path: &Path, config: &AppConfig) -> anyhow::Result<()> {
     }
     std::fs::write(path, toml::to_string_pretty(config)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wt-clipper-tauri-test-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn metadata_target_destroyed_parses_as_kill_reason() {
+        let metadata = ClipMetadataInfo {
+            reason: Some("target-destroyed".to_owned()),
+            clip_type: Some("kill".to_owned()),
+            export_type: None,
+            thumbnail_path: None,
+            duration_seconds: Some(25.0),
+        };
+
+        assert_eq!(
+            clip_reason_from_metadata(&metadata),
+            Some(ClipReason::TargetDestroyed)
+        );
+        assert_eq!(normalize_clip_type(metadata.clip_type.as_deref()), Some("kill".to_owned()));
+    }
+
+    #[test]
+    fn metadata_multi_kill_parses_from_hyphen_reason() {
+        let metadata = ClipMetadataInfo {
+            reason: Some("multi-kill".to_owned()),
+            clip_type: None,
+            export_type: None,
+            thumbnail_path: None,
+            duration_seconds: None,
+        };
+
+        assert_eq!(clip_reason_from_metadata(&metadata), Some(ClipReason::MultiKill));
+    }
+
+    #[test]
+    fn replay_filename_without_metadata_falls_back_to_clip() {
+        assert_eq!(clip_reason_from_name("Replay_2026-06-06_11-11-30.mp4"), ClipReason::Unknown);
+    }
+
+    #[test]
+    fn gallery_thumbnail_uses_existing_metadata_path() {
+        let dir = temp_dir("metadata-thumb");
+        let video = dir.join("Replay_001.mp4");
+        let thumbnail = dir.join("custom.jpg");
+        std::fs::write(&video, b"mp4").unwrap();
+        std::fs::write(&thumbnail, b"jpg").unwrap();
+
+        assert_eq!(
+            gallery_thumbnail_path(&video, Some(thumbnail.to_str().unwrap())),
+            Some(thumbnail.clone())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn gallery_thumbnail_falls_back_to_sidecar_when_metadata_file_missing() {
+        let dir = temp_dir("sidecar-thumb");
+        let video = dir.join("Replay_001.mp4");
+        let sidecar = video.with_extension("jpg");
+        std::fs::write(&video, b"mp4").unwrap();
+        std::fs::write(&sidecar, b"jpg").unwrap();
+
+        assert_eq!(
+            gallery_thumbnail_path(&video, Some("/tmp/does-not-exist-wtclip.jpg")),
+            Some(sidecar.clone())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

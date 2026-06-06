@@ -36,7 +36,7 @@ pub struct LibraryConfig {
     pub output_dir: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct CaptureConfig {
     #[serde(default = "default_capture_target")]
     pub target: String,
@@ -56,6 +56,12 @@ pub struct CaptureConfig {
     pub quality: GsrQuality,
     #[serde(default)]
     pub bitrate_mode: GsrBitrateMode,
+    #[serde(default)]
+    pub frame_rate_mode: GsrFrameRateMode,
+    #[serde(default = "default_keyframe_interval_seconds")]
+    pub keyframe_interval_seconds: f32,
+    #[serde(default)]
+    pub restart_replay_on_save: bool,
     #[serde(default = "default_gsr_video_bitrate_kbps")]
     pub video_bitrate_kbps: u32,
     #[serde(default = "default_gsr_output_dir_string")]
@@ -174,6 +180,25 @@ impl GsrBitrateMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GsrFrameRateMode {
+    #[default]
+    Cfr,
+    Vfr,
+    Content,
+}
+
+impl GsrFrameRateMode {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Cfr => "cfr",
+            Self::Vfr => "vfr",
+            Self::Content => "content",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct WarThunderConfig {
     #[serde(default = "default_base_url")]
@@ -233,6 +258,9 @@ impl Default for CaptureConfig {
             encoder: GsrEncoder::Gpu,
             quality: GsrQuality::VeryHigh,
             bitrate_mode: GsrBitrateMode::Cbr,
+            frame_rate_mode: GsrFrameRateMode::Cfr,
+            keyframe_interval_seconds: default_keyframe_interval_seconds(),
+            restart_replay_on_save: false,
             video_bitrate_kbps: default_gsr_video_bitrate_kbps(),
             output_dir: default_gsr_output_dir_string(),
             audio_enabled: default_capture_audio_enabled(),
@@ -422,6 +450,9 @@ codec = "h264"
 encoder = "gpu"
 quality = "very_high"
 bitrate_mode = "cbr"
+frame_rate_mode = "cfr"
+keyframe_interval_seconds = 1.0
+restart_replay_on_save = false
 video_bitrate_kbps = 20000
 output_dir = "~/Videos/WarThunder Clips/GSR"
 audio_enabled = true
@@ -492,6 +523,10 @@ fn default_gsr_fps() -> u32 {
 
 fn default_gsr_video_bitrate_kbps() -> u32 {
     20_000
+}
+
+fn default_keyframe_interval_seconds() -> f32 {
+    1.0
 }
 
 fn default_base_url() -> String {

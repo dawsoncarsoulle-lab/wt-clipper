@@ -98,6 +98,8 @@ pub struct ClipInfo {
     pub preview_url: Option<String>,
     pub file_name: String,
     pub reason: ClipReason,
+    pub clip_type: Option<String>,
+    pub export_type: Option<String>,
     pub size_bytes: u64,
     pub duration_seconds: u64,
     pub modified_secs_ago: u64,

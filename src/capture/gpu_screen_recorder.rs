@@ -44,7 +44,7 @@ pub enum GsrHealth {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GsrStatus {
     pub available: bool,
@@ -72,6 +72,9 @@ pub struct GsrStatus {
     pub fps: u32,
     pub quality: String,
     pub bitrate_mode: String,
+    pub frame_rate_mode: String,
+    pub keyframe_interval_seconds: f32,
+    pub restart_replay_on_save: bool,
     pub video_bitrate_kbps: u32,
     pub effective_q_argument: String,
     pub codec: String,
@@ -135,13 +138,20 @@ pub struct GpuScreenRecorderState {
 
 #[derive(Debug, Serialize)]
 struct GsrClipMetadata {
+    id: String,
     created_by: &'static str,
     capture_backend: &'static str,
     kind: &'static str,
     reason: &'static str,
+    clip_type: &'static str,
+    title: String,
+    game: &'static str,
     player_name: Option<String>,
     raw_event: Option<String>,
+    path: String,
+    source_path: String,
     video_path: String,
+    thumbnail_path: Option<String>,
     duration_seconds: u64,
     codec: &'static str,
     container: &'static str,
@@ -453,15 +463,16 @@ impl GpuScreenRecorderHandle {
         let duration_seconds = probe_video_duration_seconds(&final_video_path)
             .await
             .unwrap_or(config.replay_seconds);
+        let thumbnail_path = generate_thumbnail(&final_video_path).await;
         let metadata_path = final_video_path.with_extension("json");
         write_gsr_metadata(
             &metadata_path,
             &final_video_path,
+            thumbnail_path.as_deref(),
             &context,
             &config,
             duration_seconds,
         )?;
-        let thumbnail_path = generate_thumbnail(&final_video_path).await;
 
         {
             let mut inner = self.inner.lock().await;
@@ -515,6 +526,10 @@ pub fn build_gsr_command(config: &CaptureConfig) -> anyhow::Result<GsrCommandLin
         config.target.clone(),
         "-f".to_owned(),
         sanitized_fps(config.fps).to_string(),
+        "-fm".to_owned(),
+        config.frame_rate_mode.as_arg().to_owned(),
+        "-keyint".to_owned(),
+        keyframe_interval_arg(config),
         "-r".to_owned(),
         config.replay_seconds.max(1).to_string(),
         "-c".to_owned(),
@@ -528,7 +543,7 @@ pub fn build_gsr_command(config: &CaptureConfig) -> anyhow::Result<GsrCommandLin
     args.extend(["-q".to_owned(), effective_q_argument(config)]);
     args.extend([
         "-restart-replay-on-save".to_owned(),
-        "yes".to_owned(),
+        restart_replay_on_save_arg(config).to_owned(),
         "-ro".to_owned(),
         output_dir.display().to_string(),
         "-o".to_owned(),
@@ -580,6 +595,31 @@ fn effective_cbr_bitrate_kbps(config: &CaptureConfig) -> u32 {
         20_000
     } else {
         config.video_bitrate_kbps
+    }
+}
+
+fn restart_replay_on_save_arg(config: &CaptureConfig) -> &'static str {
+    if config.restart_replay_on_save {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn keyframe_interval_arg(config: &CaptureConfig) -> String {
+    let value = if config.keyframe_interval_seconds.is_finite() {
+        config.keyframe_interval_seconds.clamp(0.1, 10.0)
+    } else {
+        1.0
+    };
+    let rounded = (value * 1000.0).round() / 1000.0;
+    if (rounded.fract()).abs() < f32::EPSILON {
+        format!("{}", rounded as u32)
+    } else {
+        format!("{rounded:.3}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
     }
 }
 
@@ -746,6 +786,9 @@ fn status_from_inner(inner: &GpuScreenRecorderInner) -> GsrStatus {
         fps: inner.config.fps,
         quality: inner.config.quality.as_arg().to_owned(),
         bitrate_mode: bitrate_mode_label(inner.config.bitrate_mode).to_owned(),
+        frame_rate_mode: inner.config.frame_rate_mode.as_arg().to_owned(),
+        keyframe_interval_seconds: inner.config.keyframe_interval_seconds,
+        restart_replay_on_save: inner.config.restart_replay_on_save,
         video_bitrate_kbps: inner.config.video_bitrate_kbps,
         effective_q_argument: effective_q_argument(&inner.config),
         codec: inner.config.codec.as_arg().to_owned(),
@@ -1073,6 +1116,7 @@ fn list_monitors(config: &CaptureConfig) -> Vec<String> {
 fn write_gsr_metadata(
     metadata_path: &Path,
     video_path: &Path,
+    thumbnail_path: Option<&Path>,
     context: &ClipContext,
     config: &CaptureConfig,
     duration_seconds: u64,
@@ -1087,14 +1131,28 @@ fn write_gsr_metadata(
             .map(metadata_event_json)
             .collect::<Vec<_>>()
     });
+    let video_path_string = video_path.display().to_string();
     let metadata = GsrClipMetadata {
+        id: context.pending_clip_id.clone().unwrap_or_else(|| {
+            video_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("clip")
+                .to_owned()
+        }),
         created_by: "wt-clipper",
         capture_backend: "gpu_screen_recorder",
         kind: "clip",
         reason: context.reason.slug(),
+        clip_type: clip_type_for_reason(context.reason),
+        title: suggested_clip_stem(context),
+        game: "War Thunder",
         player_name: context.player_name.clone(),
         raw_event,
-        video_path: video_path.display().to_string(),
+        path: video_path_string.clone(),
+        source_path: video_path_string.clone(),
+        video_path: video_path_string,
+        thumbnail_path: thumbnail_path.map(|path| path.display().to_string()),
         duration_seconds,
         codec: config.codec.as_arg(),
         container: config.container.as_arg(),
@@ -1109,6 +1167,17 @@ fn write_gsr_metadata(
     let json = serde_json::to_string_pretty(&metadata)?;
     fs::write(metadata_path, json)
         .with_context(|| format!("failed to write GSR metadata {}", metadata_path.display()))
+}
+
+fn clip_type_for_reason(reason: ClipReason) -> &'static str {
+    match reason {
+        ClipReason::TargetDestroyed => "kill",
+        ClipReason::BaseDestroyed => "base",
+        ClipReason::PlayerDestroyed => "death",
+        ClipReason::MultiKill => "multi",
+        ClipReason::Manual => "manual",
+        ClipReason::Unknown => "clip",
+    }
 }
 
 async fn probe_video_duration_seconds(video_path: &Path) -> Option<u64> {
@@ -1250,7 +1319,9 @@ pub fn suggested_clip_stem(context: &ClipContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{GsrBitrateMode, GsrCodec, GsrContainer, GsrEncoder, GsrQuality};
+    use crate::config::{
+        GsrBitrateMode, GsrCodec, GsrContainer, GsrEncoder, GsrFrameRateMode, GsrQuality,
+    };
 
     fn test_config(output_dir: PathBuf) -> CaptureConfig {
         CaptureConfig {
@@ -1263,6 +1334,9 @@ mod tests {
             encoder: GsrEncoder::Gpu,
             quality: GsrQuality::Medium,
             bitrate_mode: GsrBitrateMode::Auto,
+            frame_rate_mode: GsrFrameRateMode::Cfr,
+            keyframe_interval_seconds: 1.0,
+            restart_replay_on_save: false,
             video_bitrate_kbps: 0,
             output_dir: output_dir.display().to_string(),
             audio_enabled: true,
@@ -1291,8 +1365,14 @@ mod tests {
             .contains("com.dec05eba.gpu_screen_recorder"));
         assert!(command.command_line.contains("-w eDP"));
         assert!(command.command_line.contains("-f 30"));
+        assert!(command.command_line.contains("-fm cfr"));
+        assert!(command.command_line.contains("-keyint 1"));
         assert!(command.command_line.contains("-r 25"));
         assert!(command.command_line.contains("-q medium"));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|args| args == ["-restart-replay-on-save", "no"]));
         assert!(command.command_line.contains("-ro \"/tmp/wt gsr\""));
         assert!(command.command_line.contains("-o \"/tmp/wt gsr/wtclip\""));
         assert!(command
@@ -1315,6 +1395,71 @@ mod tests {
         config.fps = 60;
         let command = build_gsr_command(&config).unwrap();
         assert!(command.args.windows(2).any(|args| args == ["-f", "60"]));
+    }
+
+    #[test]
+    fn default_config_generates_cfr_frame_rate_mode() {
+        let config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        let command = build_gsr_command(&config).unwrap();
+        assert!(command.args.windows(2).any(|args| args == ["-fm", "cfr"]));
+    }
+
+    #[test]
+    fn default_config_does_not_restart_replay_on_save() {
+        let config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        let command = build_gsr_command(&config).unwrap();
+        assert!(command
+            .args
+            .windows(2)
+            .any(|args| args == ["-restart-replay-on-save", "no"]));
+    }
+
+    #[test]
+    fn frame_rate_mode_content_generates_fm_content() {
+        let mut config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        config.frame_rate_mode = GsrFrameRateMode::Content;
+        let command = build_gsr_command(&config).unwrap();
+        assert!(command
+            .args
+            .windows(2)
+            .any(|args| args == ["-fm", "content"]));
+    }
+
+    #[test]
+    fn default_config_generates_keyint_1() {
+        let config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        let command = build_gsr_command(&config).unwrap();
+        assert!(command.args.windows(2).any(|args| args == ["-keyint", "1"]));
+    }
+
+    #[test]
+    fn keyframe_interval_half_generates_keyint_half() {
+        let mut config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        config.keyframe_interval_seconds = 0.5;
+        let command = build_gsr_command(&config).unwrap();
+        assert!(command
+            .args
+            .windows(2)
+            .any(|args| args == ["-keyint", "0.5"]));
+    }
+
+    #[test]
+    fn keyframe_interval_two_generates_keyint_2() {
+        let mut config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        config.keyframe_interval_seconds = 2.0;
+        let command = build_gsr_command(&config).unwrap();
+        assert!(command.args.windows(2).any(|args| args == ["-keyint", "2"]));
+    }
+
+    #[test]
+    fn restart_replay_on_save_true_generates_yes() {
+        let mut config = test_config(PathBuf::from("/tmp/wt-gsr"));
+        config.restart_replay_on_save = true;
+        let command = build_gsr_command(&config).unwrap();
+        assert!(command
+            .args
+            .windows(2)
+            .any(|args| args == ["-restart-replay-on-save", "yes"]));
     }
 
     #[test]
@@ -1766,12 +1911,19 @@ mod tests {
             last_event_time: None,
         };
 
-        write_gsr_metadata(&metadata, &video, &context, &config, 17).unwrap();
+        let thumbnail = video.with_extension("jpg");
+        fs::write(&thumbnail, b"jpg").unwrap();
+        write_gsr_metadata(&metadata, &video, Some(&thumbnail), &context, &config, 17).unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(metadata).unwrap()).unwrap();
 
         assert_eq!(json["capture_backend"], "gpu_screen_recorder");
         assert_eq!(json["reason"], "manual");
+        assert_eq!(json["clip_type"], "manual");
+        assert_eq!(json["game"], "War Thunder");
+        assert_eq!(json["path"], video.display().to_string());
+        assert_eq!(json["source_path"], video.display().to_string());
+        assert_eq!(json["thumbnail_path"], thumbnail.display().to_string());
         assert_eq!(json["container"], "mp4");
         assert_eq!(json["duration_seconds"], 17);
         fs::remove_dir_all(root).unwrap();
@@ -1797,7 +1949,7 @@ mod tests {
             last_event_time: None,
         };
 
-        write_gsr_metadata(&metadata, &video, &context, &config, 9).unwrap();
+        write_gsr_metadata(&metadata, &video, None, &context, &config, 9).unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(metadata).unwrap()).unwrap();
 

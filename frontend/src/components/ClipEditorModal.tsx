@@ -52,6 +52,7 @@ const modeOptions: Array<{
 
 export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorModalProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const resumeAfterScrubRef = useRef(false);
   const [mediaInfo, setMediaInfo] = useState<ClipMediaInfo | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [videoDuration, setVideoDuration] = useState(clip.durationSeconds);
@@ -177,6 +178,25 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
     setVideoCurrentTime(0);
   }
 
+  function beginTimelineScrub() {
+    const video = videoRef.current;
+    resumeAfterScrubRef.current = Boolean(video && !video.paused);
+    if (video) {
+      video.pause();
+    }
+    setPlaying(false);
+  }
+
+  function endTimelineScrub() {
+    const video = videoRef.current;
+    if (video && resumeAfterScrubRef.current) {
+      void video.play().catch((error) => {
+        console.info("[FRONTEND] editor scrub resume failed", error);
+      });
+    }
+    resumeAfterScrubRef.current = false;
+  }
+
   async function togglePlayback() {
     const video = videoRef.current;
     if (!video) {
@@ -244,7 +264,7 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
     setProgress({
       active: true,
       step: "preparing",
-      progress: 0,
+      progress: 5,
       message: "Préparation de l'export...",
     });
     const request = buildEditRequest({
@@ -343,8 +363,11 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
                 disabled={exporting}
                 durationSeconds={durationSeconds}
                 endSeconds={endSeconds}
+                onCurrentChange={setVideoCurrentTime}
                 onEndChange={updateEnd}
                 onReset={resetTrim}
+                onScrubEnd={endTimelineScrub}
+                onScrubStart={beginTimelineScrub}
                 onSetEndToCurrent={() => updateEnd(currentSeconds)}
                 onSetStartToCurrent={() => updateStart(currentSeconds)}
                 onStartChange={updateStart}

@@ -2,10 +2,22 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   debouncedRefreshCount,
+  galleryBadgeLabel,
+  hoverPreviewSeekSeconds,
   mountedGalleryVideoCount,
   shouldApplyGalleryLoadResult,
+  shouldResetHoverPreview,
+  shouldShowHoverVideo,
+  shouldUnloadHoverPreview,
   shouldUseGalleryCache,
 } from "../src/galleryResourcePolicy.js";
+import {
+  clampTrimEnd,
+  clampTrimStart,
+  nextTimelineZoom,
+  timelineContentWidthPercent,
+  timelineTimeFromClientX,
+} from "../src/editorTimelinePolicy.js";
 import type { AppConfig } from "../src/types.js";
 
 function source(path: string) {
@@ -57,6 +69,9 @@ const frontendConfig: AppConfig = {
     encoder: "gpu",
     quality: "very_high",
     bitrate_mode: "cbr",
+    frame_rate_mode: "cfr",
+    keyframe_interval_seconds: 1.0,
+    restart_replay_on_save: false,
     video_bitrate_kbps: 20_000,
     output_dir: "~/Videos/WarThunder Clips/GSR",
     audio_enabled: true,
@@ -103,6 +118,9 @@ test("frontend_config_has_gsr_capture_fields", () => {
   assertEqual(frontendConfig.capture.mode, "flatpak");
   assertEqual(frontendConfig.capture.quality, "very_high");
   assertEqual(frontendConfig.capture.bitrate_mode, "cbr");
+  assertEqual(frontendConfig.capture.frame_rate_mode, "cfr");
+  assertEqual(frontendConfig.capture.keyframe_interval_seconds, 1.0);
+  assertEqual(frontendConfig.capture.restart_replay_on_save, false);
   assertEqual(frontendConfig.capture.video_bitrate_kbps, 20_000);
 });
 
@@ -137,6 +155,30 @@ test("gallery_cards_still_do_not_render_video_per_card", () => {
 
 test("hover_preview_still_single_video", () => {
   assertEqual(mountedGalleryVideoCount("/tmp/clip.mp4"), 1);
+});
+
+test("hover_preview_keeps_thumbnail_until_video_ready", () => {
+  assertEqual(shouldShowHoverVideo(false, 4), false);
+  assertEqual(shouldShowHoverVideo(true, 1), false);
+  assertEqual(shouldShowHoverVideo(true, 2), true);
+});
+
+test("hover_preview_seeks_to_configured_start_seconds", () => {
+  assertEqual(hoverPreviewSeekSeconds(0.75, 25), 0.75);
+});
+
+test("hover_preview_seek_is_clamped_near_short_video_end", () => {
+  assertEqual(hoverPreviewSeekSeconds(0.75, 0.5), 0.4);
+});
+
+test("switching_clips_resets_previous_video", () => {
+  assertEqual(shouldResetHoverPreview("/tmp/a.mp4", "/tmp/b.mp4"), true);
+  assertEqual(shouldResetHoverPreview("/tmp/a.mp4", "/tmp/a.mp4"), false);
+});
+
+test("mouseleave_unloads_video", () => {
+  assertEqual(shouldUnloadHoverPreview(null), true);
+  assertEqual(shouldUnloadHoverPreview("/tmp/a.mp4"), false);
 });
 
 test("config_save_includes_capture_and_library", () => {
@@ -181,4 +223,92 @@ test("gallery_load_result_ignored_when_stale", () => {
 
 test("clip_saved_events_are_batched_by_debounce", () => {
   assertEqual(debouncedRefreshCount([0, 100, 200, 1200], 500), 2);
+});
+
+test("metadata_target_destroyed_badge_is_kill", () => {
+  assertEqual(galleryBadgeLabel("kill", "target_destroyed"), "KILL");
+  assertEqual(galleryBadgeLabel(null, "target-destroyed"), "KILL");
+});
+
+test("metadata_multi_kill_badge_is_multi", () => {
+  assertEqual(galleryBadgeLabel("multi", "multi_kill"), "MULTI");
+  assertEqual(galleryBadgeLabel(null, "multi-kill"), "MULTI");
+});
+
+test("metadata_player_destroyed_badge_is_death", () => {
+  assertEqual(galleryBadgeLabel("death", "player_destroyed"), "DEATH");
+});
+
+test("metadata_base_destroyed_badge_is_base", () => {
+  assertEqual(galleryBadgeLabel("base", "base_destroyed"), "BASE");
+});
+
+test("metadata_manual_badge_is_manual", () => {
+  assertEqual(galleryBadgeLabel("manual", "manual"), "MANUAL");
+});
+
+test("replay_filename_without_metadata_badge_is_clip", () => {
+  assertEqual(galleryBadgeLabel(null, "unknown"), "Clip");
+});
+
+test("edited_and_vertical_exports_prioritize_export_badge", () => {
+  assertEqual(galleryBadgeLabel("kill", "target_destroyed", "edited"), "Edited");
+  assertEqual(galleryBadgeLabel("multi", "multi_kill", "social"), "Vertical");
+});
+
+test("frontend_listens_to_backend_editor_progress_event", () => {
+  const backend = source("../src-tauri/src/editor.rs");
+  const frontend = source("src/components/ClipEditorModal.tsx");
+  assert(backend.includes('"editor_export_progress_changed"'), "backend progress event missing");
+  assert(frontend.includes('"editor_export_progress_changed"'), "frontend progress listener missing");
+});
+
+test("progress_modal_initializes_above_zero", () => {
+  const frontend = source("src/components/ClipEditorModal.tsx");
+  assert(frontend.includes("progress: 5"), "editor progress should not start at 0");
+});
+
+test("backend_progress_preparing_is_above_zero", () => {
+  const backend = source("../src-tauri/src/editor.rs");
+  assert(backend.includes("EditorExportProgressStep::Preparing,\n        5"), "backend preparing progress should be 5");
+});
+
+test("timeline_click_updates_playhead", () => {
+  assertEqual(timelineTimeFromClientX(150, 100, 200, 20), 5);
+});
+
+test("scrubbing_updates_video_current_time", () => {
+  assertEqual(timelineTimeFromClientX(300, 100, 200, 20), 20);
+  assertEqual(timelineTimeFromClientX(50, 100, 200, 20), 0);
+});
+
+test("trim_start_handle_updates_start", () => {
+  assertEqual(clampTrimStart(4, 12, 20, 0.25), 4);
+});
+
+test("trim_end_handle_updates_end", () => {
+  assertEqual(clampTrimEnd(16, 4, 20, 0.25), 16);
+});
+
+test("trim_handles_cannot_cross", () => {
+  assertEqual(clampTrimStart(19, 10, 20, 1), 9);
+  assertEqual(clampTrimEnd(2, 10, 20, 1), 11);
+});
+
+test("zoom_increases_timeline_scale", () => {
+  const zoom = nextTimelineZoom(1, "in");
+  assertEqual(zoom, 1.5);
+  assertEqual(timelineContentWidthPercent(zoom), 150);
+});
+
+test("export_uses_timeline_trim_values", () => {
+  const editor = source("src/components/ClipEditorModal.tsx");
+  assert(editor.includes("startSeconds,"), "export request should use timeline startSeconds");
+  assert(editor.includes("endSeconds,"), "export request should use timeline endSeconds");
+});
+
+test("existing_export_buttons_still_work", () => {
+  const editor = source("src/components/ClipEditorModal.tsx");
+  assert(editor.includes("Exporter"), "export button missing");
+  assert(editor.includes("Remplacer"), "replace export button missing");
 });

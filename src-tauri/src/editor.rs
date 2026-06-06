@@ -140,10 +140,16 @@ pub enum EditorExportProgressStep {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorExportProgressPayload {
+    pub id: String,
+    pub export_id: String,
+    pub phase: String,
+    pub stage: String,
     pub active: bool,
     pub step: EditorExportProgressStep,
     pub progress: u8,
     pub message: String,
+    pub current_time: Option<f64>,
+    pub duration: Option<f64>,
     pub output_path: Option<String>,
     pub error: Option<String>,
 }
@@ -152,6 +158,7 @@ pub struct EditorExportProgressPayload {
 struct EditedClipMetadata {
     created_by: &'static str,
     kind: &'static str,
+    export_type: &'static str,
     source_video_path: String,
     output_video_path: String,
     mode: ClipEditorMode,
@@ -166,6 +173,10 @@ struct EditedClipMetadata {
     bitrate_kbps: u32,
     created_at: String,
     reason: Option<String>,
+    clip_type: Option<String>,
+    source_reason: Option<String>,
+    source_clip_type: Option<String>,
+    thumbnail_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +203,13 @@ struct ReplacementPaths {
 #[derive(Debug, Deserialize)]
 struct SourceClipMetadata {
     reason: Option<String>,
+    clip_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceClipDetails {
+    reason: Option<String>,
+    clip_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,7 +274,7 @@ fn export_edited_clip_blocking(
     emit_editor_progress(
         &app,
         EditorExportProgressStep::Preparing,
-        0,
+        5,
         "Preparation de l'export...",
         true,
         None,
@@ -309,6 +327,15 @@ fn export_edited_clip_inner(
     let input_path = PathBuf::from(&request.clip_path);
     validate_input_path(&input_path)?;
 
+    emit_editor_progress(
+        app,
+        EditorExportProgressStep::Preparing,
+        10,
+        "Analyse du clip...",
+        true,
+        None,
+        None,
+    );
     let media_info = probe_media_info(&input_path)?;
     validate_trim_request(
         request.start_seconds,
@@ -358,43 +385,8 @@ fn export_edited_copy(
 
     emit_editor_progress(
         app,
-        EditorExportProgressStep::Thumbnail,
-        80,
-        "Generation de la miniature...",
-        true,
-        None,
-        None,
-    );
-    let thumbnail = match generate_thumbnail(&tmp_path, &thumbnail_path) {
-        Ok(path) => Some(path),
-        Err(error) => {
-            debug!(%error, path = %tmp_path.display(), "failed to generate edited clip thumbnail");
-            None
-        }
-    };
-
-    emit_editor_progress(
-        app,
-        EditorExportProgressStep::Metadata,
-        90,
-        "Ecriture des metadata...",
-        true,
-        None,
-        None,
-    );
-    let source_reason = read_source_reason(request, input_path);
-    write_edited_metadata(
-        &metadata_path,
-        request,
-        input_path,
-        &output_path,
-        source_reason,
-    )?;
-
-    emit_editor_progress(
-        app,
         EditorExportProgressStep::Saving,
-        95,
+        82,
         "Sauvegarde du clip exporte...",
         true,
         Some(output_path.display().to_string()),
@@ -414,6 +406,48 @@ fn export_edited_copy(
         return Err(error);
     }
 
+    emit_editor_progress(
+        app,
+        EditorExportProgressStep::Thumbnail,
+        88,
+        "Generation de la miniature...",
+        true,
+        None,
+        None,
+    );
+    let output_media_info = probe_media_info(&output_path)?;
+    let thumbnail = match generate_thumbnail(
+        &output_path,
+        &thumbnail_path,
+        output_media_info.duration_seconds,
+    ) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            debug!(%error, path = %output_path.display(), "failed to generate edited clip thumbnail");
+            None
+        }
+    };
+
+    emit_editor_progress(
+        app,
+        EditorExportProgressStep::Metadata,
+        94,
+        "Ecriture des metadata...",
+        true,
+        None,
+        None,
+    );
+    let source_details = read_source_clip_details(request, input_path);
+    write_edited_metadata(
+        &metadata_path,
+        request,
+        input_path,
+        &output_path,
+        source_details,
+        thumbnail.as_deref(),
+        output_media_info.duration_seconds,
+    )?;
+
     let size_bytes = fs::metadata(&output_path)
         .with_context(|| format!("Impossible de lire {}", output_path.display()))?
         .len();
@@ -422,7 +456,7 @@ fn export_edited_copy(
         output_path: output_path.display().to_string(),
         metadata_path: Some(metadata_path.display().to_string()),
         thumbnail_path: thumbnail.map(|path| path.display().to_string()),
-        duration_seconds: edited_duration(request),
+        duration_seconds: output_media_info.duration_seconds,
         size_bytes,
         save_mode: SaveMode::CreateCopy,
         replaced_original: false,
@@ -476,7 +510,12 @@ fn replace_original_clip_safely(
         None,
         None,
     );
-    if let Err(error) = generate_thumbnail(&paths.tmp_video_path, &paths.tmp_thumbnail_path) {
+    let replacement_media_info = probe_media_info(&paths.tmp_video_path)?;
+    if let Err(error) = generate_thumbnail(
+        &paths.tmp_video_path,
+        &paths.tmp_thumbnail_path,
+        replacement_media_info.duration_seconds,
+    ) {
         cleanup_replacement_temps(&paths);
         return Err(error);
     }
@@ -1133,17 +1172,68 @@ fn validate_replacement_temp_video(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn generate_thumbnail(video_path: &Path, thumbnail_path: &Path) -> anyhow::Result<PathBuf> {
-    let mut command = Command::new("ffmpeg");
-    command
-        .args(["-y", "-hide_banner", "-loglevel", "error"])
-        .arg("-i")
-        .arg(video_path)
-        .args(["-vframes", "1", "-s", "640x360"])
-        .arg(thumbnail_path);
-    run_command(command, "Generation miniature FFmpeg")?;
-    validate_non_empty_file(thumbnail_path, "Miniature invalide")?;
-    Ok(thumbnail_path.to_path_buf())
+fn generate_thumbnail(
+    video_path: &Path,
+    thumbnail_path: &Path,
+    duration_seconds: f64,
+) -> anyhow::Result<PathBuf> {
+    info!(
+        path = %video_path.display(),
+        thumbnail = %thumbnail_path.display(),
+        "[EDITOR_EXPORT] thumbnail started"
+    );
+    if let Some(parent) = thumbnail_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Impossible de creer {}", parent.display()))?;
+    }
+    let mut attempts = vec![thumbnail_time_seconds(duration_seconds), 0.5, 0.1];
+    attempts.dedup_by(|a, b| (*a - *b).abs() < 0.001);
+    let mut last_error = None;
+    for time in attempts {
+        let _ = remove_if_exists(thumbnail_path);
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(["-y", "-hide_banner", "-loglevel", "error"])
+            .args(["-ss", &format_seconds_arg(time)])
+            .arg("-i")
+            .arg(video_path)
+            .args(["-frames:v", "1", "-s", "640x360"])
+            .arg(thumbnail_path);
+        match run_command(command, "Generation miniature FFmpeg")
+            .and_then(|()| validate_non_empty_file(thumbnail_path, "Miniature invalide"))
+        {
+            Ok(()) => {
+                info!(
+                    path = %video_path.display(),
+                    thumbnail = %thumbnail_path.display(),
+                    thumbnail_time_seconds = time,
+                    "[EDITOR_EXPORT] thumbnail done"
+                );
+                return Ok(thumbnail_path.to_path_buf());
+            }
+            Err(error) => {
+                debug!(
+                    %error,
+                    path = %video_path.display(),
+                    thumbnail_time_seconds = time,
+                    "edited clip thumbnail attempt failed"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    let _ = remove_if_exists(thumbnail_path);
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Generation miniature FFmpeg a echoue")))
+}
+
+fn thumbnail_time_seconds(duration_seconds: f64) -> f64 {
+    if duration_seconds.is_finite() && duration_seconds > 2.0 {
+        1.0
+    } else if duration_seconds.is_finite() && duration_seconds > 0.0 {
+        (duration_seconds * 0.25).clamp(0.1, duration_seconds.max(0.1))
+    } else {
+        0.1
+    }
 }
 
 fn write_edited_metadata(
@@ -1151,25 +1241,36 @@ fn write_edited_metadata(
     request: &ClipEditRequest,
     input_path: &Path,
     output_path: &Path,
-    reason: Option<String>,
+    source_details: Option<SourceClipDetails>,
+    thumbnail_path: Option<&Path>,
+    duration_seconds: f64,
 ) -> anyhow::Result<()> {
+    let reason = source_details.as_ref().and_then(|details| details.reason.clone());
+    let clip_type = source_details
+        .as_ref()
+        .and_then(|details| details.clip_type.clone());
     let metadata = EditedClipMetadata {
         created_by: "wt-clipper",
         kind: "edited_clip",
+        export_type: export_type_for_mode(request.mode),
         source_video_path: input_path.display().to_string(),
         output_video_path: output_path.display().to_string(),
         mode: request.mode,
         layout: request.layout,
         start_seconds: request.start_seconds,
         end_seconds: request.end_seconds,
-        duration_seconds: edited_duration(request),
+        duration_seconds,
         title: request.title.clone().filter(|value| !value.trim().is_empty()),
         subtitle: request.subtitle.clone().filter(|value| !value.trim().is_empty()),
         watermark: request.watermark,
         fps: sanitized_fps(request.fps),
         bitrate_kbps: sanitized_bitrate(request.bitrate_kbps),
         created_at: Utc::now().to_rfc3339(),
-        reason,
+        reason: reason.clone(),
+        clip_type: clip_type.clone(),
+        source_reason: reason,
+        source_clip_type: clip_type,
+        thumbnail_path: thumbnail_path.map(|path| path.display().to_string()),
     };
     let json = serde_json::to_string_pretty(&metadata)?;
     fs::write(metadata_path, json)
@@ -1203,6 +1304,13 @@ fn replacement_metadata_value(
     root.entry("created_by".to_owned())
         .or_insert_with(|| json!("wt-clipper"));
     root.insert("kind".to_owned(), json!("edited_replacement"));
+    root.insert("export_type".to_owned(), json!(export_type_for_mode(request.mode)));
+    if let Some(reason) = root.get("reason").cloned() {
+        root.entry("source_reason".to_owned()).or_insert(reason);
+    }
+    if let Some(clip_type) = root.get("clip_type").cloned() {
+        root.entry("source_clip_type".to_owned()).or_insert(clip_type);
+    }
     root.insert(
         "source_video_path".to_owned(),
         json!(paths.original_video_path.display().to_string()),
@@ -1217,6 +1325,10 @@ fn replacement_metadata_value(
         json!(backup.video_path.display().to_string()),
     );
     root.insert("duration_seconds".to_owned(), json!(edited_duration(request)));
+    root.insert(
+        "thumbnail_path".to_owned(),
+        json!(paths.target_thumbnail_path.display().to_string()),
+    );
     root.insert("edited_at".to_owned(), json!(edited_at));
     root.insert(
         "edit".to_owned(),
@@ -1247,7 +1359,10 @@ fn read_json_value(path: &Path) -> Option<Value> {
     serde_json::from_str(&content).ok()
 }
 
-fn read_source_reason(request: &ClipEditRequest, input_path: &Path) -> Option<String> {
+fn read_source_clip_details(
+    request: &ClipEditRequest,
+    input_path: &Path,
+) -> Option<SourceClipDetails> {
     let metadata_path = request
         .metadata_path
         .as_deref()
@@ -1256,7 +1371,31 @@ fn read_source_reason(request: &ClipEditRequest, input_path: &Path) -> Option<St
     let content = fs::read_to_string(metadata_path).ok()?;
     serde_json::from_str::<SourceClipMetadata>(&content)
         .ok()
-        .and_then(|metadata| metadata.reason)
+        .map(|metadata| {
+            let reason = metadata.reason;
+            let clip_type = metadata
+                .clip_type
+                .or_else(|| reason.as_deref().and_then(clip_type_from_reason).map(str::to_owned));
+            SourceClipDetails { reason, clip_type }
+        })
+}
+
+fn export_type_for_mode(mode: ClipEditorMode) -> &'static str {
+    match mode {
+        ClipEditorMode::SocialVertical => "social",
+        ClipEditorMode::TrimOriginal | ClipEditorMode::YoutubeHorizontal => "edited",
+    }
+}
+
+fn clip_type_from_reason(reason: &str) -> Option<&'static str> {
+    match reason {
+        "target-destroyed" | "target_destroyed" => Some("kill"),
+        "base-destroyed" | "base_destroyed" => Some("base"),
+        "player-destroyed" | "player_destroyed" => Some("death"),
+        "multi-kill" | "multi_kill" => Some("multi"),
+        "manual" => Some("manual"),
+        _ => None,
+    }
 }
 
 fn commit_replacement_files(paths: &ReplacementPaths, backup: &BackupPaths) -> anyhow::Result<()> {
@@ -1346,13 +1485,19 @@ fn restore_optional_backup_file(backup_path: &Option<PathBuf>, original_path: &P
 }
 
 fn run_command(mut command: Command, label: &str) -> anyhow::Result<()> {
+    info!("[EDITOR_EXPORT] ffmpeg started label={label}");
     let output = command
         .stdout(Stdio::null())
         .output()
         .with_context(|| format!("Impossible de lancer {label}"))?;
     if output.status.success() {
+        info!("[EDITOR_EXPORT] ffmpeg exited label={label} status=success");
         return Ok(());
     }
+    info!(
+        status = ?output.status.code(),
+        "[EDITOR_EXPORT] ffmpeg exited label={label} status=failed"
+    );
     anyhow::bail!("{label} a echoue: {}", stderr_summary(&output.stderr))
 }
 
@@ -1390,11 +1535,50 @@ fn emit_editor_progress(
     output_path: Option<String>,
     error: Option<String>,
 ) {
-    let payload = EditorExportProgressPayload {
-        active,
+    let payload = editor_progress_payload(
         step,
         progress,
+        message,
+        active,
+        output_path,
+        error,
+        None,
+        None,
+    );
+    info!(
+        id = payload.id,
+        export_id = payload.export_id,
+        stage = payload.stage,
+        progress = payload.progress,
+        "[EDITOR_EXPORT] progress"
+    );
+    if let Err(error) = app.emit("editor_export_progress_changed", payload) {
+        debug!(%error, "failed to emit editor export progress");
+    }
+}
+
+fn editor_progress_payload(
+    step: EditorExportProgressStep,
+    progress: u8,
+    message: &str,
+    active: bool,
+    output_path: Option<String>,
+    error: Option<String>,
+    current_time: Option<f64>,
+    duration: Option<f64>,
+) -> EditorExportProgressPayload {
+    let stage = editor_progress_step_name(step).to_owned();
+    let payload = EditorExportProgressPayload {
+        id: "editor-export".to_owned(),
+        export_id: "editor-export".to_owned(),
+        phase: stage.clone(),
+        stage,
+        active,
+        step,
+        progress: progress.clamp(1, 100),
         message: message.to_owned(),
+        current_time,
+        duration,
         output_path,
         error,
     };
@@ -1406,8 +1590,19 @@ fn emit_editor_progress(
         output_path = ?payload.output_path,
         "[EDITOR_EXPORT_PROGRESS]"
     );
-    if let Err(error) = app.emit("editor_export_progress_changed", payload) {
-        debug!(%error, "failed to emit editor export progress");
+    payload
+}
+
+fn editor_progress_step_name(step: EditorExportProgressStep) -> &'static str {
+    match step {
+        EditorExportProgressStep::Preparing => "preparing",
+        EditorExportProgressStep::Trimming => "trimming",
+        EditorExportProgressStep::Encoding => "encoding",
+        EditorExportProgressStep::Thumbnail => "thumbnail",
+        EditorExportProgressStep::Metadata => "metadata",
+        EditorExportProgressStep::Saving => "saving",
+        EditorExportProgressStep::Done => "done",
+        EditorExportProgressStep::Failed => "failed",
     }
 }
 
@@ -1667,15 +1862,95 @@ mod tests {
             &request(ClipEditorMode::TrimOriginal),
             &input,
             &output,
-            Some("target-destroyed".to_owned()),
+            Some(SourceClipDetails {
+                reason: Some("target-destroyed".to_owned()),
+                clip_type: Some("kill".to_owned()),
+            }),
+            Some(&output.with_extension("jpg")),
+            11.0,
         )
         .unwrap();
 
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(metadata).unwrap()).unwrap();
         assert_eq!(value["kind"], "edited_clip");
+        assert_eq!(value["export_type"], "edited");
         assert_eq!(value["duration_seconds"], 11.0);
         assert_eq!(value["reason"], "target-destroyed");
+        assert_eq!(value["clip_type"], "kill");
+        assert_eq!(value["source_reason"], "target-destroyed");
+        assert_eq!(value["source_clip_type"], "kill");
+        assert_eq!(value["thumbnail_path"], output.with_extension("jpg").display().to_string());
+    }
+
+    #[test]
+    fn social_export_metadata_uses_vertical_export_type() {
+        let dir = temp_dir("social-metadata");
+        let input = dir.join("clip.webm");
+        let output = dir.join("clip_vertical_00-08_00-19.mp4");
+        let metadata = output.with_extension("json");
+        fs::write(&input, b"source").unwrap();
+
+        write_edited_metadata(
+            &metadata,
+            &request(ClipEditorMode::SocialVertical),
+            &input,
+            &output,
+            Some(SourceClipDetails {
+                reason: Some("multi-kill".to_owned()),
+                clip_type: Some("multi".to_owned()),
+            }),
+            Some(&output.with_extension("jpg")),
+            11.0,
+        )
+        .unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(metadata).unwrap()).unwrap();
+        assert_eq!(value["export_type"], "social");
+        assert_eq!(value["reason"], "multi-kill");
+        assert_eq!(value["clip_type"], "multi");
+    }
+
+    #[test]
+    fn source_clip_type_is_derived_from_legacy_reason() {
+        let dir = temp_dir("legacy-source-metadata");
+        let input = dir.join("Replay_001.mp4");
+        let metadata = input.with_extension("json");
+        fs::write(&input, b"mp4").unwrap();
+        fs::write(&metadata, br#"{"reason":"base-destroyed"}"#).unwrap();
+
+        let details = read_source_clip_details(&request(ClipEditorMode::TrimOriginal), &input)
+            .expect("source metadata");
+
+        assert_eq!(details.reason.as_deref(), Some("base-destroyed"));
+        assert_eq!(details.clip_type.as_deref(), Some("base"));
+    }
+
+    #[test]
+    fn thumbnail_time_is_not_zero_for_normal_videos() {
+        assert_eq!(thumbnail_time_seconds(25.0), 1.0);
+        assert_eq!(thumbnail_time_seconds(2.0), 0.5);
+        assert_eq!(thumbnail_time_seconds(0.2), 0.1);
+    }
+
+    #[test]
+    fn backend_progress_payload_preparing_is_above_zero() {
+        let payload = editor_progress_payload(
+            EditorExportProgressStep::Preparing,
+            5,
+            "Preparation de l'export...",
+            true,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(payload.progress, 5);
+        assert_eq!(payload.stage, "preparing");
+        assert_eq!(payload.phase, "preparing");
+        assert_eq!(payload.export_id, "editor-export");
     }
 
     #[test]
@@ -1798,6 +2073,7 @@ mod tests {
         );
         let original = json!({
             "reason": "target-destroyed",
+            "clip_type": "kill",
             "player_name": "Dawson",
             "vehicle": "F-16",
             "duration_seconds": 20
@@ -1811,7 +2087,11 @@ mod tests {
         );
 
         assert_eq!(metadata["kind"], "edited_replacement");
+        assert_eq!(metadata["export_type"], "edited");
         assert_eq!(metadata["reason"], "target-destroyed");
+        assert_eq!(metadata["clip_type"], "kill");
+        assert_eq!(metadata["source_reason"], "target-destroyed");
+        assert_eq!(metadata["source_clip_type"], "kill");
         assert_eq!(metadata["player_name"], "Dawson");
         assert_eq!(metadata["edit"]["replaced_original"], true);
         assert_eq!(metadata["duration_seconds"], 11.0);
