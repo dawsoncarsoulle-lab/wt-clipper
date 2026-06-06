@@ -14,9 +14,21 @@ import {
 import {
   clampTrimEnd,
   clampTrimStart,
+  deleteTimelineSegment,
+  exportSegmentsFromTimeline,
   nextTimelineZoom,
+  recalculateTimelineSegments,
+  reorderTimelineSegment,
+  splitSegmentAtPlayhead,
   timelineContentWidthPercent,
+  timelineTimeToSegment,
+  timelineTimeToSegmentTime,
+  timelineTimeToX,
+  timelineDuration,
   timelineTimeFromClientX,
+  sourceTimeToSegmentLocalX,
+  segmentLocalXToSourceTime,
+  xToTimelineTime,
 } from "../src/editorTimelinePolicy.js";
 import type { AppConfig } from "../src/types.js";
 
@@ -311,4 +323,209 @@ test("existing_export_buttons_still_work", () => {
   const editor = source("src/components/ClipEditorModal.tsx");
   assert(editor.includes("Exporter"), "export button missing");
   assert(editor.includes("Remplacer"), "replace export button missing");
+});
+
+const baseSegments = () => recalculateTimelineSegments([
+  {
+    id: "a",
+    sourcePath: "/tmp/a.mp4",
+    sourceDuration: 20,
+    start: 0,
+    end: 20,
+    timelineStart: 0,
+    timelineEnd: 20,
+  },
+]);
+
+test("split_at_playhead_creates_two_segments", () => {
+  const result = splitSegmentAtPlayhead(baseSegments(), 8, 0.5, () => "b");
+  assertEqual(result.changed, true);
+  assertEqual(result.segments.length, 2);
+  assertEqual(result.segments[0].end, 8);
+  assertEqual(result.segments[1].start, 8);
+});
+
+test("split_near_boundary_is_ignored", () => {
+  const result = splitSegmentAtPlayhead(baseSegments(), 0.1, 0.5, () => "b");
+  assertEqual(result.changed, false);
+  assertEqual(result.segments.length, 1);
+});
+
+test("total_timeline_duration_unchanged_after_split", () => {
+  const before = baseSegments();
+  const result = splitSegmentAtPlayhead(before, 8, 0.5, () => "b");
+  assertEqual(timelineDuration(result.segments), timelineDuration(before));
+});
+
+test("delete_segment_removes_from_export", () => {
+  const split = splitSegmentAtPlayhead(baseSegments(), 8, 0.5, () => "b").segments;
+  const deleted = deleteTimelineSegment(split, "a");
+  assertEqual(exportSegmentsFromTimeline(deleted).length, 1);
+  assertEqual(exportSegmentsFromTimeline(deleted)[0].sourcePath, "/tmp/a.mp4");
+});
+
+test("cannot_export_empty_timeline", () => {
+  const deleted = deleteTimelineSegment(baseSegments(), "a");
+  assertEqual(exportSegmentsFromTimeline(deleted).length, 0);
+});
+
+test("timeline_duration_updates_after_delete", () => {
+  const split = splitSegmentAtPlayhead(baseSegments(), 8, 0.5, () => "b").segments;
+  assertEqual(timelineDuration(deleteTimelineSegment(split, "a")), 12);
+});
+
+test("reorder_segments_changes_order", () => {
+  const split = splitSegmentAtPlayhead(baseSegments(), 8, 0.5, () => "b").segments;
+  const reordered = reorderTimelineSegment(split, "b", "a");
+  assertEqual(reordered[0].id, "b");
+});
+
+test("export_uses_reordered_segment_order", () => {
+  const split = splitSegmentAtPlayhead(baseSegments(), 8, 0.5, () => "b").segments;
+  const reordered = reorderTimelineSegment(split, "b", "a");
+  assertEqual(exportSegmentsFromTimeline(reordered)[0].startSeconds, 8);
+});
+
+test("timeline_duration_unchanged_after_reorder", () => {
+  const split = splitSegmentAtPlayhead(baseSegments(), 8, 0.5, () => "b").segments;
+  assertEqual(timelineDuration(reorderTimelineSegment(split, "b", "a")), 20);
+});
+
+test("multi_clip_selection_creates_segments", () => {
+  const editor = source("src/components/ClipEditorModal.tsx");
+  const app = source("src/App.tsx");
+  assert(editor.includes("initialTimelineSegments(clips"), "editor should accept multiple clips");
+  assert(app.includes("Assembler"), "gallery should expose assemble action");
+});
+
+test("set_current_frame_as_thumbnail", () => {
+  const editor = source("src/components/ClipEditorModal.tsx");
+  assert(editor.includes("setCurrentFrameAsThumbnail"), "thumbnail action missing");
+  assert(editor.includes("thumbnailSourcePath"), "thumbnail payload missing");
+});
+
+test("export_payload_uses_timeline_segments", () => {
+  const editor = source("src/components/ClipEditorModal.tsx");
+  assert(editor.includes("segments: exportSegmentsFromTimeline(segments)"), "timeline segments missing from export payload");
+});
+
+test("video_source_is_set_from_active_segment", () => {
+  const editor = source("src/components/ClipEditorModal.tsx");
+  assert(editor.includes("activeSourcePath"), "active source path state missing");
+  assert(editor.includes("findSegmentAtTimelineTime(segments"), "active segment resolution missing");
+});
+
+test("editor_unloads_video_on_close", () => {
+  const editor = source("src/components/ClipEditorModal.tsx");
+  assert(editor.includes("unloadEditorVideo(videoRef.current)"), "editor should unload video on unmount");
+  assert(editor.includes('removeAttribute("src")'), "editor should remove video src during cleanup");
+  assert(editor.includes("[EDITOR_CLEANUP] unload video"), "editor cleanup log missing");
+});
+
+test("editor_does_not_create_multiple_video_elements", () => {
+  const editor = source("src/components/ClipEditorModal.tsx");
+  assertEqual((editor.match(/<video/g) ?? []).length, 1);
+});
+
+test("video_uses_tauri_file_url_or_existing_preview_url", () => {
+  const editor = source("src/components/ClipEditorModal.tsx");
+  assert(editor.includes("sourcePreviewUrl") && editor.includes("convertFileSrc(sourcePath)"), "video should use preview URL or Tauri file URL");
+  assert(editor.includes("src={videoSrc}"), "video src prop missing");
+});
+
+test("clicking_segment_selects_it_without_scrubbing", () => {
+  const timeline = source("src/components/TrimTimeline.tsx");
+  assert(timeline.includes("onSegmentSelect(segmentId)"), "segment select missing");
+  assert(timeline.includes("event.stopPropagation();"), "segment event propagation should stop");
+});
+
+test("click_segment_selects_without_scrubbing", () => {
+  const timeline = source("src/components/TrimTimeline.tsx");
+  assert(timeline.includes("beginSegmentPointerDrag"), "segment pointer selection should be isolated");
+  assert(timeline.includes("!drag.dragging"), "short segment click should not scrub");
+});
+
+test("clicking_timeline_background_moves_playhead", () => {
+  assertEqual(xToTimelineTime(50, 20, 100, 1), 10);
+  assertEqual(timelineTimeToX(10, 20, 100, 1), 50);
+});
+
+test("trim_start_handle_stops_event_propagation", () => {
+  const timeline = source("src/components/TrimTimeline.tsx");
+  assert(timeline.includes('beginDrag(event, "start")'), "start handle drag missing");
+});
+
+test("trim_start_does_not_move_playhead", () => {
+  const timeline = source("src/components/TrimTimeline.tsx");
+  assert(timeline.includes('setInteractionMode(mode === "start" ? "trim-start"'), "trim start mode missing");
+  assert(timeline.includes('if (mode === "start")'), "trim start should have its own branch");
+});
+
+test("trim_end_handle_stops_event_propagation", () => {
+  const timeline = source("src/components/TrimTimeline.tsx");
+  assert(timeline.includes('beginDrag(event, "end")'), "end handle drag missing");
+});
+
+test("trim_end_does_not_move_playhead", () => {
+  const timeline = source("src/components/TrimTimeline.tsx");
+  assert(timeline.includes('mode === "end" ? "trim-end"'), "trim end mode missing");
+  assert(timeline.includes('if (mode === "end")'), "trim end should have its own branch");
+});
+
+test("trim_end_handle_can_be_dragged_multiple_times", () => {
+  assertEqual(clampTrimEnd(10, 0, 25, 0.25), 10);
+  assertEqual(clampTrimEnd(14, 0, 25, 0.25), 14);
+});
+
+test("segment_drag_does_not_move_playhead", () => {
+  const timeline = source("src/components/TrimTimeline.tsx");
+  assert(timeline.includes('setInteractionMode("drag-segment")'), "segment drag mode missing");
+  assert(timeline.includes("SEGMENT_DRAG_THRESHOLD_PX"), "segment drag should use a movement threshold");
+});
+
+test("drag_segment_does_not_scrub", () => {
+  const timeline = source("src/components/TrimTimeline.tsx");
+  assert(timeline.includes("event.target !== event.currentTarget"), "background scrub should ignore segment targets");
+  assert(timeline.includes("beginSegmentPointerDrag"), "segment drag should use independent pointer handler");
+});
+
+test("drag_segment_reorders_segments", () => {
+  const split = splitSegmentAtPlayhead(baseSegments(), 8, 0.5, () => "b").segments;
+  const reordered = reorderTimelineSegment(split, "a", "");
+  assertEqual(reordered[1].id, "a");
+});
+
+test("playhead_drag_moves_playhead", () => {
+  const timeline = source("src/components/TrimTimeline.tsx");
+  assert(timeline.includes('beginDrag(event, "playhead")'), "playhead drag should call playhead drag path");
+});
+
+test("active_segment_resolves_correct_source_time", () => {
+  const split = splitSegmentAtPlayhead(baseSegments(), 8, 0.5, () => "b").segments;
+  const resolved = timelineTimeToSegment(10, split);
+  assertEqual(resolved?.segment.id, "b");
+  assertEqual(resolved?.sourceTime, 10);
+});
+
+test("video_src_uses_tauri_url_or_existing_file_asset_url", () => {
+  const editor = source("src/components/ClipEditorModal.tsx");
+  assert(editor.includes("videoUrlForSource"), "video source helper missing");
+  assert(editor.includes("convertFileSrc(sourcePath)"), "video should not use a raw file path directly");
+});
+
+test("split_segments_can_be_selected_independently", () => {
+  const split = splitSegmentAtPlayhead(baseSegments(), 8, 0.5, () => "b").segments;
+  assertEqual(split[0].id, "a");
+  assertEqual(split[1].id, "b");
+});
+
+test("timeline_time_to_segment_time_maps_to_source_time", () => {
+  const segment = { ...baseSegments()[0], start: 4, end: 14, timelineStart: 0, timelineEnd: 10 };
+  assertEqual(timelineTimeToSegmentTime(3, segment), 7);
+});
+
+test("segment_source_pixel_helpers_roundtrip", () => {
+  const segment = { ...baseSegments()[0], start: 4, end: 14, timelineStart: 0, timelineEnd: 10 };
+  assertEqual(sourceTimeToSegmentLocalX(segment, 9, 200), 100);
+  assertEqual(segmentLocalXToSourceTime(segment, 100, 200), 9);
 });

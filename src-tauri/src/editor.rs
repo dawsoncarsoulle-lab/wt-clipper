@@ -83,6 +83,9 @@ pub struct ClipEditRequest {
     pub metadata_path: Option<String>,
     pub start_seconds: f64,
     pub end_seconds: f64,
+    pub segments: Option<Vec<EditorSegmentExport>>,
+    pub thumbnail_source_path: Option<String>,
+    pub thumbnail_time_seconds: Option<f64>,
     pub mode: ClipEditorMode,
     pub output_format: OutputFormat,
     pub layout: Option<SocialLayout>,
@@ -95,6 +98,15 @@ pub struct ClipEditRequest {
     pub save_mode: SaveMode,
     #[serde(default = "default_backup_original")]
     pub backup_original: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorSegmentExport {
+    pub source_path: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub order: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,6 +189,7 @@ struct EditedClipMetadata {
     source_reason: Option<String>,
     source_clip_type: Option<String>,
     thumbnail_path: Option<String>,
+    segments: Option<Vec<EditorSegmentExport>>,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +378,19 @@ fn export_edited_copy(
     remove_if_exists(&tmp_path)?;
     let metadata_path = output_path.with_extension("json");
     let thumbnail_path = output_path.with_extension("jpg");
+    let mut timeline_temp_dir = None;
+    let mut effective_request = request.clone();
+    let mut export_input_path = input_path.to_path_buf();
+    if has_timeline_segments(request) {
+        let temp_dir = editor_temp_dir("timeline-export")?;
+        let rendered = render_timeline_source(request, &temp_dir, app)?;
+        effective_request.segments = None;
+        effective_request.clip_path = rendered.path.display().to_string();
+        effective_request.start_seconds = 0.0;
+        effective_request.end_seconds = rendered.duration_seconds;
+        export_input_path = rendered.path;
+        timeline_temp_dir = Some(temp_dir);
+    }
 
     emit_editor_progress(
         app,
@@ -376,12 +402,16 @@ fn export_edited_copy(
         None,
     );
 
-    let export_result = run_video_export(request, input_path, &tmp_path, app);
+    let export_result = run_video_export(&effective_request, &export_input_path, &tmp_path, app);
     if let Err(error) = export_result {
         cleanup_export_failure(&tmp_path, &metadata_path, &thumbnail_path);
+        cleanup_optional_dir(&timeline_temp_dir);
         return Err(error);
     }
-    validate_non_empty_file(&tmp_path, "Fichier export temporaire invalide")?;
+    if let Err(error) = validate_non_empty_file(&tmp_path, "Fichier export temporaire invalide") {
+        cleanup_optional_dir(&timeline_temp_dir);
+        return Err(error);
+    }
 
     emit_editor_progress(
         app,
@@ -394,6 +424,7 @@ fn export_edited_copy(
     );
     if output_path.exists() {
         cleanup_export_failure(&tmp_path, &metadata_path, &thumbnail_path);
+        cleanup_optional_dir(&timeline_temp_dir);
         anyhow::bail!("Le fichier de sortie existe deja: {}", output_path.display());
     }
     if let Err(error) = fs::rename(&tmp_path, &output_path).with_context(|| {
@@ -403,6 +434,7 @@ fn export_edited_copy(
         )
     }) {
         cleanup_export_failure(&tmp_path, &metadata_path, &thumbnail_path);
+        cleanup_optional_dir(&timeline_temp_dir);
         return Err(error);
     }
 
@@ -416,11 +448,7 @@ fn export_edited_copy(
         None,
     );
     let output_media_info = probe_media_info(&output_path)?;
-    let thumbnail = match generate_thumbnail(
-        &output_path,
-        &thumbnail_path,
-        output_media_info.duration_seconds,
-    ) {
+    let thumbnail = match generate_export_thumbnail(request, &output_path, &thumbnail_path, output_media_info.duration_seconds) {
         Ok(path) => Some(path),
         Err(error) => {
             debug!(%error, path = %output_path.display(), "failed to generate edited clip thumbnail");
@@ -451,6 +479,7 @@ fn export_edited_copy(
     let size_bytes = fs::metadata(&output_path)
         .with_context(|| format!("Impossible de lire {}", output_path.display()))?
         .len();
+    cleanup_optional_dir(&timeline_temp_dir);
 
     Ok(EditedClipResult {
         output_path: output_path.display().to_string(),
@@ -633,6 +662,153 @@ fn run_video_export(
             run_social_encode(request, input_path, tmp_path, app)
         }
     }
+}
+
+#[derive(Debug)]
+struct RenderedTimelineSource {
+    path: PathBuf,
+    duration_seconds: f64,
+}
+
+fn has_timeline_segments(request: &ClipEditRequest) -> bool {
+    request
+        .segments
+        .as_ref()
+        .is_some_and(|segments| active_export_segments(segments).len() > 0)
+}
+
+fn active_export_segments(segments: &[EditorSegmentExport]) -> Vec<EditorSegmentExport> {
+    let mut values = segments
+        .iter()
+        .filter(|segment| segment.end_seconds > segment.start_seconds)
+        .cloned()
+        .collect::<Vec<_>>();
+    values.sort_by_key(|segment| segment.order);
+    values
+}
+
+fn editor_temp_dir(prefix: &str) -> anyhow::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir).with_context(|| format!("Impossible de creer {}", dir.display()))?;
+    Ok(dir)
+}
+
+fn render_timeline_source(
+    request: &ClipEditRequest,
+    temp_dir: &Path,
+    app: &tauri::AppHandle,
+) -> anyhow::Result<RenderedTimelineSource> {
+    let segments = active_export_segments(
+        request
+            .segments
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Timeline vide"))?,
+    );
+    if segments.is_empty() {
+        anyhow::bail!("Timeline vide: aucun segment a exporter");
+    }
+
+    let mut segment_paths = Vec::new();
+    let total = segments.len().max(1);
+    for (index, segment) in segments.iter().enumerate() {
+        let progress = 15 + ((index as f32 / total as f32) * 35.0).round() as u8;
+        emit_editor_progress(
+            app,
+            EditorExportProgressStep::Encoding,
+            progress,
+            "Extraction des segments...",
+            true,
+            None,
+            None,
+        );
+        let source = PathBuf::from(&segment.source_path);
+        validate_input_path(&source)?;
+        validate_trim_request(segment.start_seconds, segment.end_seconds, f64::MAX)?;
+        let output = temp_dir.join(format!("segment-{index:04}.mp4"));
+        run_segment_extract(request, segment, &source, &output)?;
+        segment_paths.push(output);
+    }
+
+    emit_editor_progress(
+        app,
+        EditorExportProgressStep::Encoding,
+        50,
+        "Assemblage de la timeline...",
+        true,
+        None,
+        None,
+    );
+    let concat_list = temp_dir.join("concat.txt");
+    fs::write(
+        &concat_list,
+        segment_paths
+            .iter()
+            .map(|path| format!("file '{}'\n", escape_concat_path(path)))
+            .collect::<String>(),
+    )
+    .with_context(|| format!("Impossible d'ecrire {}", concat_list.display()))?;
+    let output = temp_dir.join("timeline-source.mp4");
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .args(["-f", "concat", "-safe", "0"])
+        .arg("-i")
+        .arg(&concat_list)
+        .args(["-c", "copy", "-movflags", "+faststart"])
+        .arg(&output);
+    run_command(command, "Assemblage timeline FFmpeg")?;
+    validate_non_empty_file(&output, "Timeline exportee invalide")?;
+    Ok(RenderedTimelineSource {
+        path: output,
+        duration_seconds: segments
+            .iter()
+            .map(|segment| segment.end_seconds - segment.start_seconds)
+            .sum(),
+    })
+}
+
+fn run_segment_extract(
+    request: &ClipEditRequest,
+    segment: &EditorSegmentExport,
+    input_path: &Path,
+    output_path: &Path,
+) -> anyhow::Result<()> {
+    let fps = sanitized_fps(request.fps).to_string();
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .args(["-ss", &format_seconds_arg(segment.start_seconds)])
+        .args(["-to", &format_seconds_arg(segment.end_seconds)])
+        .arg("-i")
+        .arg(input_path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-r",
+            &fps,
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(output_path);
+    run_command(command, "Extraction segment FFmpeg")
+}
+
+fn escape_concat_path(path: &Path) -> String {
+    path.display().to_string().replace('\'', "'\\''")
 }
 
 fn run_trim_copy(request: &ClipEditRequest, input_path: &Path, tmp_path: &Path) -> anyhow::Result<()> {
@@ -1226,6 +1402,62 @@ fn generate_thumbnail(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Generation miniature FFmpeg a echoue")))
 }
 
+fn generate_export_thumbnail(
+    request: &ClipEditRequest,
+    output_path: &Path,
+    thumbnail_path: &Path,
+    duration_seconds: f64,
+) -> anyhow::Result<PathBuf> {
+    if let (Some(source_path), Some(time)) = (
+        request.thumbnail_source_path.as_deref(),
+        request.thumbnail_time_seconds,
+    ) {
+        let source = PathBuf::from(source_path);
+        if source.is_file() && time.is_finite() && time >= 0.0 {
+            return generate_thumbnail_at_time(&source, thumbnail_path, time.max(0.1));
+        }
+    }
+    generate_thumbnail(output_path, thumbnail_path, duration_seconds)
+}
+
+fn generate_thumbnail_at_time(
+    video_path: &Path,
+    thumbnail_path: &Path,
+    time_seconds: f64,
+) -> anyhow::Result<PathBuf> {
+    info!(
+        path = %video_path.display(),
+        thumbnail = %thumbnail_path.display(),
+        thumbnail_time_seconds = time_seconds,
+        "[EDITOR_EXPORT] custom thumbnail started"
+    );
+    if let Some(parent) = thumbnail_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Impossible de creer {}", parent.display()))?;
+    }
+    let mut last_error = None;
+    for time in [time_seconds, 0.5, 0.1] {
+        let _ = remove_if_exists(thumbnail_path);
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(["-y", "-hide_banner", "-loglevel", "error"])
+            .args(["-ss", &format_seconds_arg(time)])
+            .arg("-i")
+            .arg(video_path)
+            .args(["-frames:v", "1", "-s", "640x360"])
+            .arg(thumbnail_path);
+        match run_command(command, "Generation miniature personnalisee FFmpeg")
+            .and_then(|()| validate_non_empty_file(thumbnail_path, "Miniature invalide"))
+        {
+            Ok(()) => return Ok(thumbnail_path.to_path_buf()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let _ = remove_if_exists(thumbnail_path);
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("Generation miniature personnalisee FFmpeg a echoue")))
+}
+
 fn thumbnail_time_seconds(duration_seconds: f64) -> f64 {
     if duration_seconds.is_finite() && duration_seconds > 2.0 {
         1.0
@@ -1271,6 +1503,7 @@ fn write_edited_metadata(
         source_reason: reason,
         source_clip_type: clip_type,
         thumbnail_path: thumbnail_path.map(|path| path.display().to_string()),
+        segments: request.segments.as_ref().map(|segments| active_export_segments(segments)),
     };
     let json = serde_json::to_string_pretty(&metadata)?;
     fs::write(metadata_path, json)
@@ -1624,6 +1857,16 @@ fn cleanup_replacement_temps(paths: &ReplacementPaths) {
     );
 }
 
+fn cleanup_optional_dir(path: &Option<PathBuf>) {
+    if let Some(path) = path {
+        if path.exists() {
+            if let Err(error) = fs::remove_dir_all(path) {
+                debug!(%error, path = %path.display(), "failed to clean editor temp directory");
+            }
+        }
+    }
+}
+
 fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
     if path.exists() {
         fs::remove_file(path)
@@ -1767,6 +2010,9 @@ mod tests {
             metadata_path: None,
             start_seconds: 8.0,
             end_seconds: 19.0,
+            segments: None,
+            thumbnail_source_path: None,
+            thumbnail_time_seconds: None,
             mode,
             output_format: OutputFormat::Webm,
             layout: Some(SocialLayout::VerticalBlur),
@@ -2139,6 +2385,69 @@ mod tests {
 
         assert!(result.replaced_original);
         assert!(result.backup_path.is_some());
+    }
+
+    #[test]
+    fn export_segments_are_sorted_and_invalid_excluded() {
+        let segments = vec![
+            EditorSegmentExport {
+                source_path: "/tmp/b.mp4".to_owned(),
+                start_seconds: 2.0,
+                end_seconds: 5.0,
+                order: 1,
+            },
+            EditorSegmentExport {
+                source_path: "/tmp/invalid.mp4".to_owned(),
+                start_seconds: 5.0,
+                end_seconds: 5.0,
+                order: 0,
+            },
+            EditorSegmentExport {
+                source_path: "/tmp/a.mp4".to_owned(),
+                start_seconds: 0.0,
+                end_seconds: 2.0,
+                order: 0,
+            },
+        ];
+        let active = active_export_segments(&segments);
+
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].source_path, "/tmp/a.mp4");
+        assert_eq!(active[1].source_path, "/tmp/b.mp4");
+    }
+
+    #[test]
+    fn request_with_segments_uses_timeline_export_path() {
+        let mut request = request(ClipEditorMode::TrimOriginal);
+        request.segments = Some(vec![EditorSegmentExport {
+            source_path: "/tmp/a.mp4".to_owned(),
+            start_seconds: 0.0,
+            end_seconds: 2.0,
+            order: 0,
+        }]);
+
+        assert!(has_timeline_segments(&request));
+    }
+
+    #[test]
+    fn temp_files_are_cleaned() {
+        let dir = temp_dir("cleanup-dir");
+        fs::write(dir.join("segment.mp4"), b"tmp").unwrap();
+        let holder = Some(dir.clone());
+
+        cleanup_optional_dir(&holder);
+
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn custom_thumbnail_request_fields_are_kept() {
+        let mut request = request(ClipEditorMode::TrimOriginal);
+        request.thumbnail_source_path = Some("/tmp/source.mp4".to_owned());
+        request.thumbnail_time_seconds = Some(12.5);
+
+        assert_eq!(request.thumbnail_source_path.as_deref(), Some("/tmp/source.mp4"));
+        assert_eq!(request.thumbnail_time_seconds, Some(12.5));
     }
 
     #[test]

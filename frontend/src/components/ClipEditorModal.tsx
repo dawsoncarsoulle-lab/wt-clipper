@@ -29,11 +29,26 @@ import type {
 import { EditorExportProgressModal } from "./EditorExportProgressModal";
 import { SocialExportPreview } from "./SocialExportPreview";
 import { TrimTimeline } from "./TrimTimeline";
+import {
+  activeTimelineSegments,
+  deleteTimelineSegment,
+  exportSegmentsFromTimeline,
+  findSegmentAtTimelineTime,
+  recalculateTimelineSegments,
+  reorderTimelineSegment,
+  restoreTimelineSegment,
+  sourceToTimelineTime,
+  splitSegmentAtPlayhead,
+  timelineDuration,
+  timelineToSourceTime,
+} from "../editorTimelinePolicy";
+import type { TimelineSegment } from "../types";
 
 const MIN_TRIM_GAP_SECONDS = 0.25;
 
 type ClipEditorModalProps = {
   clip: ClipInfo;
+  clips?: ClipInfo[];
   onClose: () => void;
   onExportComplete: () => Promise<void> | void;
 };
@@ -50,19 +65,25 @@ const modeOptions: Array<{
   { mode: "social_vertical", label: "TikTok / Reels / Shorts", icon: Smartphone },
 ];
 
-export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorModalProps) {
+export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: ClipEditorModalProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const resumeAfterScrubRef = useRef(false);
+  const segmentIdRef = useRef(0);
+  const pendingSeekRef = useRef<number | null>(null);
   const [mediaInfo, setMediaInfo] = useState<ClipMediaInfo | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [videoDuration, setVideoDuration] = useState(clip.durationSeconds);
-  const durationSeconds = Math.max(
-    MIN_TRIM_GAP_SECONDS,
-    mediaInfo?.durationSeconds ?? videoDuration ?? clip.durationSeconds,
-  );
+  const [segments, setSegments] = useState<TimelineSegment[]>(() => initialTimelineSegments(clips ?? [clip]));
+  const [selectedSegmentId, setSelectedSegmentId] = useState<string | undefined>(() => segments[0]?.id);
+  const [thumbnailSelection, setThumbnailSelection] = useState<{ timelineTime: number; sourcePath: string; sourceTime: number } | null>(null);
+  const activeSegments = useMemo(() => activeTimelineSegments(segments), [segments]);
+  const timelineTotalSeconds = timelineDuration(segments);
+  const durationSeconds = Math.max(MIN_TRIM_GAP_SECONDS, timelineTotalSeconds);
+  const selectedSegment = selectedSegmentId
+    ? segments.find((segment) => segment.id === selectedSegmentId)
+    : activeSegments[0];
   const [currentSeconds, setCurrentSeconds] = useState(0);
-  const [startSeconds, setStartSeconds] = useState(0);
-  const [endSeconds, setEndSeconds] = useState(Math.max(MIN_TRIM_GAP_SECONDS, clip.durationSeconds));
+  const [activeSourcePath, setActiveSourcePath] = useState(clip.path);
   const [playing, setPlaying] = useState(false);
   const [mode, setMode] = useState<ClipEditorMode>("trim_original");
   const [outputFormat, setOutputFormat] = useState<"webm" | "mp4">("webm");
@@ -79,24 +100,28 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
   const [progress, setProgress] = useState<EditorExportProgressPayload | null>(null);
   const [result, setResult] = useState<EditedClipResult | null>(null);
 
-  const videoSrc = clip.previewUrl ?? convertFileSrc(clip.path);
-  const videoMimeType = videoMimeTypeForPath(clip.path);
+  const videoSrc = videoUrlForSource(activeSourcePath, segments);
+  const videoMimeType = videoMimeTypeForPath(activeSourcePath);
   const socialLayout: SocialLayout = blurBackground ? "vertical_blur" : "vertical_crop";
   const effectiveTitle = autoTitle ? defaultEditorTitle(clip) : title;
-  const exportDuration = Math.max(0, endSeconds - startSeconds);
-  const canExport = exportDuration >= MIN_TRIM_GAP_SECONDS && !exporting;
+  const exportDuration = timelineTotalSeconds;
+  const canExport = activeSegments.length > 0 && exportDuration >= MIN_TRIM_GAP_SECONDS && !exporting;
+  const canReplaceOriginal = activeSegments.length === 1;
 
   useEffect(() => {
+    const nextSegments = initialTimelineSegments(clips ?? [clip]);
+    setSegments(nextSegments);
+    setSelectedSegmentId(nextSegments[0]?.id);
+    setThumbnailSelection(null);
+    setActiveSourcePath(nextSegments[0]?.sourcePath ?? clip.path);
     setMediaInfo(null);
     setMediaError(null);
     setVideoDuration(clip.durationSeconds);
     setCurrentSeconds(0);
-    setStartSeconds(0);
-    setEndSeconds(Math.max(MIN_TRIM_GAP_SECONDS, clip.durationSeconds));
     setTitle(defaultEditorTitle(clip));
     setSaveMode("create_copy");
     setConfirmReplaceOpen(false);
-  }, [clip]);
+  }, [clip, clips]);
 
   useEffect(() => {
     let cancelled = false;
@@ -106,7 +131,11 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
         if (!cancelled) {
           setMediaInfo(info);
           setVideoDuration(info.durationSeconds);
-          setEndSeconds(Math.max(MIN_TRIM_GAP_SECONDS, info.durationSeconds));
+          setSegments((current) => recalculateTimelineSegments(current.map((segment, index) => (
+            index === 0
+              ? { ...segment, sourceDuration: info.durationSeconds, end: Math.max(MIN_TRIM_GAP_SECONDS, info.durationSeconds) }
+              : segment
+          ))));
         }
       } catch (error) {
         if (!cancelled) {
@@ -121,6 +150,19 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
   }, [clip.path]);
 
   useEffect(() => {
+    console.info("[EDITOR_VIDEO] set src=", videoSrc);
+    setMediaError(null);
+    const video = videoRef.current;
+    if (video) {
+      video.load();
+    }
+  }, [videoSrc]);
+
+  useEffect(() => () => {
+    unloadEditorVideo(videoRef.current);
+  }, []);
+
+  useEffect(() => {
     const unsubscribe = listen<EditorExportProgressPayload>(
       "editor_export_progress_changed",
       (event) => {
@@ -131,6 +173,36 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
       void unsubscribe.then((unlisten) => unlisten());
     };
   }, []);
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA") {
+        return;
+      }
+      if (event.code === "Space") {
+        event.preventDefault();
+        void togglePlayback();
+      } else if (event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        splitAtPlayhead();
+      } else if (event.key === "Delete" || event.key === "Backspace") {
+        event.preventDefault();
+        deleteSelectedSegment();
+      } else if (event.key.toLowerCase() === "m") {
+        event.preventDefault();
+        setCurrentFrameAsThumbnail();
+      } else if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        setVideoCurrentTime(currentSeconds - 0.1);
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        setVideoCurrentTime(currentSeconds + 0.1);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [currentSeconds, selectedSegmentId, segments, playing]);
 
   const mediaSummary = useMemo(() => {
     if (!mediaInfo) {
@@ -150,31 +222,51 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
   function setVideoCurrentTime(seconds: number) {
     const video = videoRef.current;
     const next = Math.max(0, Math.min(durationSeconds, seconds));
-    if (video) {
-      video.currentTime = next;
+    const segment = findSegmentAtTimelineTime(segments, next);
+    if (segment) {
+      const sourceTime = timelineToSourceTime(segment, next);
+      console.info("[EDITOR_VIDEO] active segment=", segment.id, "sourceTime=", sourceTime);
+      if (activeSourcePath !== segment.sourcePath) {
+        unloadEditorVideo(video);
+        pendingSeekRef.current = sourceTime;
+        setActiveSourcePath(segment.sourcePath);
+      } else if (video) {
+        seekVideo(video, sourceTime);
+      }
     }
     setCurrentSeconds(next);
   }
 
   function updateStart(value: number) {
-    const next = Math.min(Math.max(0, value), endSeconds - MIN_TRIM_GAP_SECONDS);
-    setStartSeconds(next);
-    if (currentSeconds < next) {
-      setVideoCurrentTime(next);
+    if (!selectedSegment) {
+      return;
     }
+    setSegments((current) => recalculateTimelineSegments(current.map((segment) => (
+      segment.id === selectedSegment.id
+        ? { ...segment, start: Math.min(Math.max(0, value), segment.end - MIN_TRIM_GAP_SECONDS) }
+        : segment
+    ))));
   }
 
   function updateEnd(value: number) {
-    const next = Math.max(Math.min(durationSeconds, value), startSeconds + MIN_TRIM_GAP_SECONDS);
-    setEndSeconds(next);
-    if (currentSeconds > next) {
-      setVideoCurrentTime(next);
+    if (!selectedSegment) {
+      return;
     }
+    setSegments((current) => recalculateTimelineSegments(current.map((segment) => (
+      segment.id === selectedSegment.id
+        ? { ...segment, end: Math.max(Math.min(segment.sourceDuration, value), segment.start + MIN_TRIM_GAP_SECONDS) }
+        : segment
+    ))));
   }
 
   function resetTrim() {
-    setStartSeconds(0);
-    setEndSeconds(durationSeconds);
+    setSegments((current) => recalculateTimelineSegments(current.map((segment) => ({
+      ...segment,
+      start: 0,
+      end: segment.sourceDuration,
+      deleted: false,
+    }))));
+    setSelectedSegmentId(segments[0]?.id);
     setVideoCurrentTime(0);
   }
 
@@ -207,9 +299,7 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
       setPlaying(false);
       return;
     }
-    if (video.currentTime < startSeconds || video.currentTime >= endSeconds) {
-      video.currentTime = startSeconds;
-    }
+    syncVideoToTimeline(currentSeconds);
     try {
       await video.play();
       setPlaying(true);
@@ -223,12 +313,33 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
     if (!video) {
       return;
     }
-    setCurrentSeconds(video.currentTime);
-    if (video.currentTime >= endSeconds) {
+    const segment = findSegmentAtTimelineTime(segments, currentSeconds);
+    if (!segment) {
+      return;
+    }
+    const nextTimeline = sourceToTimelineTime(segment, video.currentTime);
+    setCurrentSeconds(nextTimeline);
+    if (video.currentTime >= segment.end) {
+      const nextSegment = activeSegments.find((item) => item.timelineStart >= segment.timelineEnd - 0.001 && item.id !== segment.id);
+      if (nextSegment) {
+        setCurrentSeconds(nextSegment.timelineStart);
+        if (nextSegment.sourcePath === activeSourcePath) {
+          seekVideo(video, nextSegment.start);
+        } else {
+          unloadEditorVideo(video);
+          pendingSeekRef.current = nextSegment.start;
+          setActiveSourcePath(nextSegment.sourcePath);
+        }
+        window.requestAnimationFrame(() => {
+          if (videoRef.current) {
+            void videoRef.current.play().catch((error) => console.info("[FRONTEND] editor segment advance failed", error));
+          }
+        });
+        return;
+      }
       video.pause();
-      video.currentTime = startSeconds;
       setPlaying(false);
-      setCurrentSeconds(startSeconds);
+      setCurrentSeconds(durationSeconds);
     }
   }
 
@@ -237,17 +348,81 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
     if (!video || !Number.isFinite(video.duration)) {
       return;
     }
+    console.info("[EDITOR_VIDEO] loadedmetadata duration=", video.duration);
     setVideoDuration(video.duration);
-    setEndSeconds((current) =>
-      current <= MIN_TRIM_GAP_SECONDS ? Math.max(MIN_TRIM_GAP_SECONDS, video.duration) : current,
-    );
+    if (pendingSeekRef.current != null) {
+      seekVideo(video, pendingSeekRef.current);
+      pendingSeekRef.current = null;
+    }
+  }
+
+  function handleVideoError() {
+    const video = videoRef.current;
+    const error = video?.error;
+    const message = error
+      ? `Erreur vidéo (${error.code}) pour ${activeSourcePath}`
+      : `Erreur vidéo pour ${activeSourcePath}`;
+    console.info("[EDITOR_VIDEO] error=", message);
+    setMediaError(message);
+  }
+
+  function syncVideoToTimeline(timelineTime: number) {
+    const segment = findSegmentAtTimelineTime(segments, timelineTime);
+    const video = videoRef.current;
+    if (!segment || !video) {
+      return;
+    }
+    const sourceTime = timelineToSourceTime(segment, timelineTime);
+    if (activeSourcePath !== segment.sourcePath) {
+      unloadEditorVideo(video);
+      pendingSeekRef.current = sourceTime;
+      setActiveSourcePath(segment.sourcePath);
+    } else {
+      seekVideo(video, sourceTime);
+    }
+  }
+
+  function splitAtPlayhead() {
+    const result = splitSegmentAtPlayhead(segments, currentSeconds, 0.5, () => nextSegmentId(segmentIdRef));
+    setSegments(result.segments);
+    if (result.selectedSegmentId) {
+      setSelectedSegmentId(result.selectedSegmentId);
+    }
+  }
+
+  function deleteSelectedSegment() {
+    if (!selectedSegmentId) {
+      return;
+    }
+    setSegments((current) => deleteTimelineSegment(current, selectedSegmentId));
+  }
+
+  function restoreDeletedSegment() {
+    const deleted = segments.find((segment) => segment.deleted);
+    if (!deleted) {
+      return;
+    }
+    setSegments((current) => restoreTimelineSegment(current, deleted.id));
+    setSelectedSegmentId(deleted.id);
+  }
+
+  function setCurrentFrameAsThumbnail() {
+    const segment = findSegmentAtTimelineTime(segments, currentSeconds);
+    if (!segment) {
+      return;
+    }
+    setThumbnailSelection({
+      timelineTime: currentSeconds,
+      sourcePath: segment.sourcePath,
+      sourceTime: timelineToSourceTime(segment, currentSeconds),
+    });
   }
 
   function requestExport() {
     if (!canExport) {
       return;
     }
-    if (saveMode === "replace_original") {
+    if (saveMode === "replace_original" && canReplaceOriginal) {
       setConfirmReplaceOpen(true);
       return;
     }
@@ -259,6 +434,7 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
       return;
     }
     setConfirmReplaceOpen(false);
+    const effectiveSaveMode = saveMode === "replace_original" && !canReplaceOriginal ? "create_copy" : saveMode;
     setExporting(true);
     setResult(null);
     setProgress({
@@ -272,13 +448,15 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
       mode,
       outputFormat,
       socialLayout,
-      startSeconds,
-      endSeconds,
+      startSeconds: selectedSegment?.start ?? 0,
+      endSeconds: selectedSegment?.end ?? durationSeconds,
+      segments,
+      thumbnailSelection,
       title: effectiveTitle,
       subtitle,
       watermark,
       quality,
-      saveMode,
+      saveMode: effectiveSaveMode,
     });
     try {
       const nextResult = await invoke<EditedClipResult>("export_edited_clip", { request });
@@ -337,16 +515,16 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
               <section className="editor-video-shell">
                 <video
                   ref={videoRef}
+                  src={videoSrc}
                   onEnded={() => setPlaying(false)}
+                  onError={handleVideoError}
                   onLoadedMetadata={handleLoadedMetadata}
                   onPause={() => setPlaying(false)}
                   onPlay={() => setPlaying(true)}
                   onTimeUpdate={handleTimeUpdate}
                   playsInline
                   preload="metadata"
-                >
-                  <source src={videoSrc} type={videoMimeType} />
-                </video>
+                />
                 <div className="editor-video-controls">
                   <button className="primary-action w-fit px-4" onClick={() => void togglePlayback()}>
                     {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
@@ -362,16 +540,38 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
                 currentSeconds={currentSeconds}
                 disabled={exporting}
                 durationSeconds={durationSeconds}
-                endSeconds={endSeconds}
+                endSeconds={selectedSegment?.end ?? durationSeconds}
                 onCurrentChange={setVideoCurrentTime}
                 onEndChange={updateEnd}
                 onReset={resetTrim}
                 onScrubEnd={endTimelineScrub}
                 onScrubStart={beginTimelineScrub}
-                onSetEndToCurrent={() => updateEnd(currentSeconds)}
-                onSetStartToCurrent={() => updateStart(currentSeconds)}
+                onSetEndToCurrent={() => {
+                  const segment = findSegmentAtTimelineTime(segments, currentSeconds);
+                  if (segment) {
+                    setSelectedSegmentId(segment.id);
+                    updateEnd(timelineToSourceTime(segment, currentSeconds));
+                  }
+                }}
+                onSetStartToCurrent={() => {
+                  const segment = findSegmentAtTimelineTime(segments, currentSeconds);
+                  if (segment) {
+                    setSelectedSegmentId(segment.id);
+                    updateStart(timelineToSourceTime(segment, currentSeconds));
+                  }
+                }}
                 onStartChange={updateStart}
-                startSeconds={startSeconds}
+                onSegmentReorder={(draggedId, targetId) => setSegments((current) => reorderTimelineSegment(current, draggedId, targetId))}
+                onSegmentSelect={setSelectedSegmentId}
+                onSplit={splitAtPlayhead}
+                onDeleteSegment={deleteSelectedSegment}
+                onRestoreSegment={restoreDeletedSegment}
+                canRestoreSegment={segments.some((segment) => segment.deleted)}
+                onSetThumbnail={setCurrentFrameAsThumbnail}
+                selectedSegmentId={selectedSegmentId}
+                segments={segments}
+                startSeconds={selectedSegment?.start ?? 0}
+                thumbnailTime={thumbnailSelection?.timelineTime}
               />
             </div>
 
@@ -520,7 +720,7 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
                   <label className={saveMode === "replace_original" ? "active destructive" : "destructive"}>
                     <input
                       checked={saveMode === "replace_original"}
-                      disabled={exporting}
+                      disabled={exporting || !canReplaceOriginal}
                       name="editor-save-mode"
                       onChange={() => setSaveMode("replace_original")}
                       type="radio"
@@ -528,7 +728,7 @@ export function ClipEditorModal({ clip, onClose, onExportComplete }: ClipEditorM
                     <span>
                       <strong>Remplacer l’original</strong>
                       <small>
-                        Le clip original sera remplacé. Une sauvegarde sera créée automatiquement.
+                        Disponible uniquement pour une timeline à un seul segment.
                       </small>
                     </span>
                   </label>
@@ -648,6 +848,8 @@ function buildEditRequest({
   socialLayout,
   startSeconds,
   endSeconds,
+  segments,
+  thumbnailSelection,
   title,
   subtitle,
   watermark,
@@ -660,6 +862,8 @@ function buildEditRequest({
   socialLayout: SocialLayout;
   startSeconds: number;
   endSeconds: number;
+  segments: TimelineSegment[];
+  thumbnailSelection: { sourcePath: string; sourceTime: number } | null;
   title: string;
   subtitle: string;
   watermark: boolean;
@@ -672,6 +876,9 @@ function buildEditRequest({
     metadataPath: metadataPathForClip(clip.path),
     startSeconds,
     endSeconds,
+    segments: exportSegmentsFromTimeline(segments),
+    thumbnailSourcePath: thumbnailSelection?.sourcePath,
+    thumbnailTimeSeconds: thumbnailSelection?.sourceTime,
     mode,
     outputFormat: mode === "trim_original" ? outputFormat : "mp4",
     layout: social ? socialLayout : undefined,
@@ -683,6 +890,56 @@ function buildEditRequest({
     saveMode,
     backupOriginal: true,
   };
+}
+
+function initialTimelineSegments(clips: ClipInfo[]): TimelineSegment[] {
+  return recalculateTimelineSegments(clips.map((clip, index) => {
+    const duration = Math.max(MIN_TRIM_GAP_SECONDS, clip.durationSeconds || MIN_TRIM_GAP_SECONDS);
+    return {
+      id: `segment-${index + 1}`,
+      sourcePath: clip.path,
+      sourceClipId: clip.path,
+      sourceTitle: clip.fileName,
+      sourceThumbnail: clip.thumbnailPath ?? undefined,
+      sourcePreviewUrl: clip.previewUrl ?? undefined,
+      sourceDuration: duration,
+      start: 0,
+      end: duration,
+      timelineStart: 0,
+      timelineEnd: duration,
+    };
+  }));
+}
+
+function videoUrlForSource(sourcePath: string, segments: TimelineSegment[]) {
+  return segments.find((segment) => segment.sourcePath === sourcePath)?.sourcePreviewUrl
+    ?? convertFileSrc(sourcePath);
+}
+
+function seekVideo(video: HTMLVideoElement, seconds: number) {
+  if (!Number.isFinite(seconds)) {
+    return;
+  }
+  const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : seconds;
+  const next = Math.max(0, Math.min(duration, seconds));
+  if (Math.abs(video.currentTime - next) > 0.03) {
+    video.currentTime = next;
+  }
+}
+
+function unloadEditorVideo(video: HTMLVideoElement | null) {
+  if (!video) {
+    return;
+  }
+  console.info("[EDITOR_CLEANUP] unload video");
+  video.pause();
+  video.removeAttribute("src");
+  video.load();
+}
+
+function nextSegmentId(ref: { current: number }) {
+  ref.current += 1;
+  return `segment-split-${ref.current}`;
 }
 
 function metadataPathForClip(path: string): string {

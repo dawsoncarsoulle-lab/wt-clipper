@@ -387,6 +387,8 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | ClipReason>("all");
   const [editingClip, setEditingClip] = useState<ClipInfo | null>(null);
+  const [editingClips, setEditingClips] = useState<ClipInfo[] | null>(null);
+  const [selectedClipPaths, setSelectedClipPaths] = useState<string[]>([]);
   const [activePreviewClip, setActivePreviewClip] = useState<ClipInfo | null>(null);
 
   const galleryItems = useMemo(() => {
@@ -420,6 +422,22 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
     }
   }
 
+  const selectedReadyClips = clips.filter((clip) => selectedClipPaths.includes(clip.path));
+
+  function toggleClipSelection(path: string) {
+    setSelectedClipPaths((current) =>
+      current.includes(path) ? current.filter((item) => item !== path) : [...current, path],
+    );
+  }
+
+  function openSelectedInEditor() {
+    if (selectedReadyClips.length === 0) {
+      return;
+    }
+    setEditingClip(selectedReadyClips[0]);
+    setEditingClips(selectedReadyClips);
+  }
+
   return (
     <section className="panel">
       <div className="panel-heading">
@@ -448,6 +466,15 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
             </option>
           ))}
         </select>
+        <button
+          type="button"
+          className="secondary"
+          disabled={selectedReadyClips.length === 0}
+          onClick={openSelectedInEditor}
+        >
+          <Wand2 size={16} />
+          Assembler ({selectedReadyClips.length})
+        </button>
       </div>
 
       <div className="clip-grid">
@@ -458,9 +485,14 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
               key={clip.id}
               clip={galleryItemToClipInfo(clip)}
               activePreviewPath={activePreviewClip?.path ?? null}
+              selected={Boolean(clip.filePath && selectedClipPaths.includes(clip.filePath))}
+              onSelectToggle={toggleClipSelection}
               onPreviewChange={setActivePreviewClip}
               onDelete={remove}
-              onEdit={setEditingClip}
+              onEdit={(clip) => {
+                setEditingClip(clip);
+                setEditingClips([clip]);
+              }}
             />
           ) : (
             <ClipProcessingCard key={clip.id} clip={clip} />
@@ -473,9 +505,15 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
       {editingClip && (
         <ClipEditorModal
           clip={editingClip}
-          onClose={() => setEditingClip(null)}
+          clips={editingClips ?? [editingClip]}
+          onClose={() => {
+            setEditingClip(null);
+            setEditingClips(null);
+          }}
           onExportComplete={async () => {
             setEditingClip(null);
+            setEditingClips(null);
+            setSelectedClipPaths([]);
             onRefresh();
           }}
         />
@@ -510,12 +548,16 @@ function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
 function ClipCard({
   clip,
   activePreviewPath,
+  selected,
+  onSelectToggle,
   onPreviewChange,
   onDelete,
   onEdit,
 }: {
   clip: ClipInfo;
   activePreviewPath: string | null;
+  selected: boolean;
+  onSelectToggle: (path: string) => void;
   onPreviewChange: (clip: ClipInfo | null) => void;
   onDelete: (path: string) => void;
   onEdit: (clip: ClipInfo) => void;
@@ -536,6 +578,13 @@ function ClipCard({
         ) : (
           <FilmFallback />
         )}
+        <label className="clip-select-toggle" onClick={(event) => event.stopPropagation()}>
+          <input
+            checked={selected}
+            onChange={() => onSelectToggle(clip.path)}
+            type="checkbox"
+          />
+        </label>
       </div>
       <div className="clip-meta">
         <span className={`badge ${galleryBadgeClass(clip.clipType, clip.reason, clip.exportType)}`}>

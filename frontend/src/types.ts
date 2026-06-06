@@ -29,6 +29,9 @@ export type ClipEditRequest = {
   metadataPath?: string;
   startSeconds: number;
   endSeconds: number;
+  segments?: EditorSegmentExport[];
+  thumbnailSourcePath?: string;
+  thumbnailTimeSeconds?: number;
   mode: ClipEditorMode;
   outputFormat: "webm" | "mp4";
   layout?: SocialLayout;
@@ -39,6 +42,37 @@ export type ClipEditRequest = {
   bitrateKbps: number;
   saveMode: SaveMode;
   backupOriginal: boolean;
+};
+
+export type TimelineSegment = {
+  id: string;
+  sourcePath: string;
+  sourceClipId?: string;
+  sourceTitle?: string;
+  sourceThumbnail?: string;
+  sourcePreviewUrl?: string;
+  sourceDuration: number;
+  start: number;
+  end: number;
+  timelineStart: number;
+  timelineEnd: number;
+  deleted?: boolean;
+};
+
+export type EditorTimelineState = {
+  segments: TimelineSegment[];
+  playhead: number;
+  zoom: number;
+  selectedSegmentId?: string;
+  thumbnailTime?: number;
+  thumbnailSourcePath?: string;
+};
+
+export type EditorSegmentExport = {
+  sourcePath: string;
+  startSeconds: number;
+  endSeconds: number;
+  order: number;
 };
 
 export type EditedClipResult = {
