@@ -22,7 +22,7 @@ import {
   timelineContentWidthPercent,
   timelineTimeFromClientX,
 } from "../editorTimelinePolicy";
-import type { TimelineSegment } from "../types";
+import type { TimelineSegment, TimelineThumbnail } from "../types";
 
 const MIN_TRIM_GAP_SECONDS = 0.25;
 
@@ -59,6 +59,7 @@ type TrimTimelineProps = {
   canRestoreSegment: boolean;
   onSetThumbnail: () => void;
   thumbnailTime?: number;
+  thumbnails?: TimelineThumbnail[];
 };
 
 export function TrimTimeline({
@@ -87,6 +88,7 @@ export function TrimTimeline({
   canRestoreSegment,
   onSetThumbnail,
   thumbnailTime,
+  thumbnails = [],
 }: TrimTimelineProps) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const trackRef = useRef<HTMLDivElement | null>(null);
@@ -137,6 +139,18 @@ export function TrimTimeline({
   const activeSegments = segments.filter(
     (segment) => !segment.deleted && segmentDuration(segment) > 0,
   );
+  const thumbnailsBySource = useMemo(() => {
+    const map = new Map<string, TimelineThumbnail[]>();
+    for (const thumbnail of thumbnails) {
+      const list = map.get(thumbnail.sourceClipPath) ?? [];
+      list.push(thumbnail);
+      map.set(thumbnail.sourceClipPath, list);
+    }
+    for (const list of map.values()) {
+      list.sort((a, b) => a.sourceTimeSeconds - b.sourceTimeSeconds);
+    }
+    return map;
+  }, [thumbnails]);
   const selectedIndex = selectedSegment
     ? activeSegments.findIndex((segment) => segment.id === selectedSegment.id)
     : -1;
@@ -443,7 +457,13 @@ export function TrimTimeline({
                   style={{ left: `${left}%`, width: `${Math.max(1, width)}%` }}
                   type="button"
                 >
-                  <span>{segment.sourceTitle ?? "Clip"}</span>
+                  <TimelineFilmstrip
+                    segment={segment}
+                    thumbnails={thumbnailsBySource.get(segment.sourcePath) ?? []}
+                  />
+                  <span className="timeline-segment-label">
+                    {segment.sourceTitle ?? "Clip"}
+                  </span>
                 </button>
               );
             })}
@@ -502,6 +522,19 @@ export function TrimTimeline({
           onPointerUp={endSourceTrim}
           onPointerCancel={endSourceTrim}
         >
+          {selectedSegment && (
+            <TimelineFilmstrip
+              className="source-trim-filmstrip"
+              segment={{
+                ...selectedSegment,
+                start: 0,
+                end: selectedSegment.sourceDuration,
+              }}
+              thumbnails={
+                thumbnailsBySource.get(selectedSegment.sourcePath) ?? []
+              }
+            />
+          )}
           <div className="source-trim-range" style={sourceRangeStyle} />
           <button
             aria-label="Poignée début"
@@ -601,6 +634,52 @@ export function TrimTimeline({
         </div>
       )}
     </section>
+  );
+}
+
+
+function TimelineFilmstrip({
+  className = "",
+  segment,
+  thumbnails,
+}: {
+  className?: string;
+  segment: TimelineSegment;
+  thumbnails: TimelineThumbnail[];
+}) {
+  const visible = thumbnails
+    .filter(
+      (thumbnail) =>
+        thumbnail.sourceTimeSeconds >= segment.start - 0.001 &&
+        thumbnail.sourceTimeSeconds <= segment.end + 0.001,
+    )
+    .sort((a, b) => a.sourceTimeSeconds - b.sourceTimeSeconds);
+  const classes = ["timeline-filmstrip", className].filter(Boolean).join(" ");
+
+  if (visible.length === 0) {
+    return <div className={classes} />;
+  }
+
+  return (
+    <div className={classes}>
+      {visible.map((thumbnail, index) => {
+        const width = 100 / visible.length;
+        return (
+          <img
+            alt=""
+            aria-hidden="true"
+            className="timeline-filmstrip-frame"
+            draggable={false}
+            key={thumbnail.id}
+            src={thumbnail.imageUrl ?? thumbnail.imagePath}
+            style={{
+              left: `${index * width}%`,
+              width: `${width}%`,
+            }}
+          />
+        );
+      })}
+    </div>
   );
 }
 

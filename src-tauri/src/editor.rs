@@ -1,5 +1,7 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     fs,
+    hash::{Hash, Hasher},
     io::ErrorKind,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -136,6 +138,16 @@ pub struct ClipMediaInfo {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineThumbnailDto {
+    pub image_path: String,
+    pub source_clip_path: String,
+    pub source_time_seconds: f64,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EditorExportProgressStep {
@@ -265,6 +277,148 @@ pub async fn get_clip_media_info(path: String) -> Result<ClipMediaInfo, String> 
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())
+}
+
+pub async fn get_timeline_thumbnails(
+    clip_path: String,
+    count: Option<usize>,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> Result<Vec<TimelineThumbnailDto>, String> {
+    tokio::task::spawn_blocking(move || {
+        get_timeline_thumbnails_blocking(
+            PathBuf::from(clip_path),
+            count.unwrap_or(18),
+            max_width.unwrap_or(160),
+            max_height.unwrap_or(90),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+fn get_timeline_thumbnails_blocking(
+    clip_path: PathBuf,
+    requested_count: usize,
+    max_width: u32,
+    max_height: u32,
+) -> anyhow::Result<Vec<TimelineThumbnailDto>> {
+    ensure_command_available("ffmpeg")?;
+    ensure_command_available("ffprobe")?;
+    validate_input_path(&clip_path)?;
+    let media_info = probe_media_info(&clip_path)?;
+    let duration = media_info.duration_seconds.max(0.1);
+    let count = requested_count.clamp(4, 32);
+    let width = max_width.clamp(64, 320);
+    let height = max_height.clamp(36, 180);
+    let cache_dir = timeline_thumbnail_cache_dir(&clip_path, count, width, height)?;
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("Impossible de creer {}", cache_dir.display()))?;
+
+    let timestamps = timeline_thumbnail_timestamps(duration, count);
+    let mut thumbnails = Vec::with_capacity(timestamps.len());
+    for (index, timestamp) in timestamps.iter().copied().enumerate() {
+        let image_path = cache_dir.join(format!("thumb-{index:03}.jpg"));
+        if !is_valid_non_empty_file(&image_path) {
+            generate_timeline_thumbnail(&clip_path, &image_path, timestamp, width, height)?;
+        }
+        thumbnails.push(TimelineThumbnailDto {
+            image_path: image_path.display().to_string(),
+            source_clip_path: clip_path.display().to_string(),
+            source_time_seconds: timestamp,
+            width,
+            height,
+        });
+    }
+    Ok(thumbnails)
+}
+
+fn timeline_thumbnail_timestamps(duration: f64, count: usize) -> Vec<f64> {
+    let safe_duration = duration.max(0.1);
+    let safe_count = count.max(1);
+    if safe_count == 1 {
+        return vec![(safe_duration * 0.5).clamp(0.05, safe_duration.max(0.05))];
+    }
+    let last_safe = (safe_duration - 0.05).max(0.05);
+    (0..safe_count)
+        .map(|index| {
+            let ratio = index as f64 / (safe_count - 1) as f64;
+            (0.05 + ratio * (last_safe - 0.05)).clamp(0.05, last_safe)
+        })
+        .collect()
+}
+
+fn timeline_thumbnail_cache_dir(
+    clip_path: &Path,
+    count: usize,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<PathBuf> {
+    let metadata = fs::metadata(clip_path)
+        .with_context(|| format!("Impossible de lire {}", clip_path.display()))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let mut hasher = DefaultHasher::new();
+    clip_path.display().to_string().hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified.hash(&mut hasher);
+    count.hash(&mut hasher);
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    let key = format!("{:016x}", hasher.finish());
+    Ok(editor_cache_root().join("timeline-thumbnails").join(key))
+}
+
+fn editor_cache_root() -> PathBuf {
+    if let Some(cache_home) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(cache_home).join("wt-clipper");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".cache").join("wt-clipper");
+    }
+    std::env::temp_dir().join("wt-clipper")
+}
+
+fn generate_timeline_thumbnail(
+    input_path: &Path,
+    output_path: &Path,
+    timestamp: f64,
+    max_width: u32,
+    max_height: u32,
+) -> anyhow::Result<()> {
+    let vf = format!(
+        "scale='min({max_width},iw)':'min({max_height},ih)':force_original_aspect_ratio=decrease"
+    );
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-ss")
+        .arg(format!("{timestamp:.3}"))
+        .arg("-i")
+        .arg(input_path)
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-vf")
+        .arg(vf)
+        .arg("-q:v")
+        .arg("4")
+        .arg(output_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    run_command(command, "Generation miniature timeline FFmpeg")?;
+    validate_non_empty_file(output_path, "Miniature timeline invalide")
+}
+
+fn is_valid_non_empty_file(path: &Path) -> bool {
+    path.metadata().map(|metadata| metadata.len() > 0).unwrap_or(false)
 }
 
 pub fn open_path(path: String) -> Result<(), String> {

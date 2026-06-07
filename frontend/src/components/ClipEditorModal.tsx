@@ -25,6 +25,7 @@ import type {
   EditorExportProgressPayload,
   SaveMode,
   SocialLayout,
+  TimelineThumbnail,
 } from "../types";
 import { EditorExportProgressModal } from "./EditorExportProgressModal";
 import { SocialExportPreview } from "./SocialExportPreview";
@@ -89,6 +90,9 @@ export function ClipEditorModal({
   const [selectedSegmentId, setSelectedSegmentId] = useState<
     string | undefined
   >(() => segments[0]?.id);
+  const [timelineThumbnails, setTimelineThumbnails] = useState<
+    TimelineThumbnail[]
+  >([]);
   const [thumbnailSelection, setThumbnailSelection] = useState<{
     timelineTime: number;
     sourcePath: string;
@@ -153,6 +157,55 @@ export function ClipEditorModal({
     setSaveMode("create_copy");
     setConfirmReplaceOpen(false);
   }, [clip, clips]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const uniqueSources = Array.from(
+      new Set(segments.map((segment) => segment.sourcePath).filter(Boolean)),
+    );
+    if (uniqueSources.length === 0) {
+      setTimelineThumbnails([]);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    async function loadTimelineThumbnails() {
+      try {
+        const groups = await Promise.all(
+          uniqueSources.map(async (sourcePath) => {
+            const items = await invoke<TimelineThumbnail[]>(
+              "get_timeline_thumbnails",
+              {
+                clipPath: sourcePath,
+                count: 20,
+                maxWidth: 160,
+                maxHeight: 90,
+              },
+            );
+            return items.map((item, index) => ({
+              ...item,
+              id: `${sourcePath}:${item.sourceTimeSeconds}:${index}`,
+              imageUrl: convertFileSrc(item.imagePath),
+            }));
+          }),
+        );
+        if (!cancelled) {
+          setTimelineThumbnails(groups.flat());
+        }
+      } catch (error) {
+        console.info("[EDITOR_TIMELINE] thumbnails unavailable", error);
+        if (!cancelled) {
+          setTimelineThumbnails([]);
+        }
+      }
+    }
+
+    void loadTimelineThumbnails();
+    return () => {
+      cancelled = true;
+    };
+  }, [segments.map((segment) => segment.sourcePath).join("|")]);
 
   useEffect(() => {
     let cancelled = false;
@@ -549,14 +602,15 @@ export function ClipEditorModal({
       const activeSorted = active
         .slice()
         .sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0));
-      const activeById = new Map(
-        activeSorted.map((segment) => [segment.id, segment]),
-      );
       const deleted = current.filter((segment) => segment.deleted);
-      return recalculateTimelineSegments([
-        ...activeSorted.map((segment) => activeById.get(segment.id) ?? segment),
-        ...deleted,
-      ]);
+      const next = recalculateTimelineSegments([...activeSorted, ...deleted]);
+      const movedSegment = next.find((segment) => segment.id === selectedSegmentId);
+      if (movedSegment) {
+        window.requestAnimationFrame(() => {
+          setCurrentSeconds(movedSegment.timelineStart);
+        });
+      }
+      return next;
     });
   }
 
@@ -750,6 +804,7 @@ export function ClipEditorModal({
                 segments={segments}
                 startSeconds={selectedSegment?.start ?? 0}
                 thumbnailTime={thumbnailSelection?.timelineTime}
+                thumbnails={timelineThumbnails}
               />
             </div>
 

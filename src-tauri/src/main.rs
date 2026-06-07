@@ -491,6 +491,16 @@ async fn get_clip_media_info(path: String) -> Result<editor::ClipMediaInfo, Stri
 }
 
 #[tauri::command]
+async fn get_timeline_thumbnails(
+    clip_path: String,
+    count: Option<usize>,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> Result<Vec<editor::TimelineThumbnailDto>, String> {
+    editor::get_timeline_thumbnails(clip_path, count, max_width, max_height).await
+}
+
+#[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
     editor::open_path(path)
 }
@@ -544,6 +554,7 @@ fn main() {
             get_runtime_status,
             export_edited_clip,
             get_clip_media_info,
+            get_timeline_thumbnails,
             open_path,
             open_parent_folder
         ])

@@ -59,6 +59,17 @@ export type TimelineSegment = {
   deleted?: boolean;
 };
 
+
+export type TimelineThumbnail = {
+  id: string;
+  imagePath: string;
+  imageUrl?: string;
+  sourceClipPath: string;
+  sourceTimeSeconds: number;
+  width: number;
+  height: number;
+};
+
 export type EditorTimelineState = {
   segments: TimelineSegment[];
   playhead: number;
