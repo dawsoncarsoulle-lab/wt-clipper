@@ -1,10 +1,9 @@
-import { BadgeCheck, Smartphone, Youtube } from "lucide-react";
+import { BadgeCheck, ImageIcon, Smartphone, Youtube } from "lucide-react";
 import type { ClipEditorMode, SocialLayout } from "../types";
 
 type SocialExportPreviewProps = {
   mode: ClipEditorMode;
-  videoSrc: string;
-  videoMimeType: string;
+  previewImageSrc?: string | null;
   layout: SocialLayout;
   title: string;
   subtitle: string;
@@ -13,8 +12,7 @@ type SocialExportPreviewProps = {
 
 export function SocialExportPreview({
   mode,
-  videoSrc,
-  videoMimeType,
+  previewImageSrc,
   layout,
   title,
   subtitle,
@@ -26,14 +24,20 @@ export function SocialExportPreview({
         <div className="editor-panel-heading">
           <div>
             <div className="editor-kicker">Preview</div>
-            <h3>{mode === "youtube_horizontal" ? "YouTube horizontal" : "Original coupé"}</h3>
+            <h3>
+              {mode === "youtube_horizontal"
+                ? "YouTube horizontal"
+                : "Original coupé"}
+            </h3>
           </div>
           <Youtube className="h-5 w-5 text-ember" />
         </div>
-        <div className="horizontal-export-preview">
-          <video muted playsInline preload="metadata">
-            <source src={videoSrc} type={videoMimeType} />
-          </video>
+        <div className="horizontal-export-preview static-export-preview">
+          {previewImageSrc ? (
+            <img src={previewImageSrc} alt="" />
+          ) : (
+            <StaticPreviewFallback />
+          )}
         </div>
       </section>
     );
@@ -48,22 +52,29 @@ export function SocialExportPreview({
         </div>
         <Smartphone className="h-5 w-5 text-ember" />
       </div>
-      <div className="vertical-export-preview">
-        {layout === "vertical_blur" && (
-          <video className="social-preview-bg" muted playsInline preload="metadata">
-            <source src={videoSrc} type={videoMimeType} />
-          </video>
+      <div className="vertical-export-preview static-export-preview">
+        {layout === "vertical_blur" && previewImageSrc && (
+          <img className="social-preview-bg" src={previewImageSrc} alt="" />
         )}
-        <video
-          className={layout === "vertical_blur" ? "social-preview-fg" : "social-preview-crop"}
-          muted
-          playsInline
-          preload="metadata"
-        >
-          <source src={videoSrc} type={videoMimeType} />
-        </video>
-        {title.trim().length > 0 && <div className="social-preview-title">{title}</div>}
-        {subtitle.trim().length > 0 && <div className="social-preview-subtitle">{subtitle}</div>}
+        {previewImageSrc ? (
+          <img
+            className={
+              layout === "vertical_blur"
+                ? "social-preview-fg"
+                : "social-preview-crop"
+            }
+            src={previewImageSrc}
+            alt=""
+          />
+        ) : (
+          <StaticPreviewFallback />
+        )}
+        {title.trim().length > 0 && (
+          <div className="social-preview-title">{title}</div>
+        )}
+        {subtitle.trim().length > 0 && (
+          <div className="social-preview-subtitle">{subtitle}</div>
+        )}
         {watermark && (
           <div className="social-preview-watermark">
             <BadgeCheck className="h-3.5 w-3.5" />
@@ -72,5 +83,14 @@ export function SocialExportPreview({
         )}
       </div>
     </section>
+  );
+}
+
+function StaticPreviewFallback() {
+  return (
+    <div className="static-preview-fallback">
+      <ImageIcon className="h-7 w-7" />
+      <span>Aperçu statique</span>
+    </div>
   );
 }

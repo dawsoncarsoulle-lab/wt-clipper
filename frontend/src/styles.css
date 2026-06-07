@@ -1908,3 +1908,119 @@ select {
     align-items: stretch;
   }
 }
+
+.segment-reorder-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.source-trim-panel {
+  margin-top: 12px;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 8px;
+  background: rgba(8, 12, 20, .52);
+  padding: 12px;
+}
+
+.source-trim-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.source-trim-header strong {
+  display: block;
+  overflow: hidden;
+  max-width: 44vw;
+  color: #f6f8fb;
+  font-size: 13px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-trim-header span {
+  color: #ffd0c3;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.source-trim-track {
+  position: relative;
+  height: 54px;
+  cursor: crosshair;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 8px;
+  background:
+    repeating-linear-gradient(90deg, rgba(255,255,255,.08) 0 1px, transparent 1px 24px),
+    linear-gradient(180deg, rgba(22,29,42,.94), rgba(8,12,20,.94));
+}
+
+.source-trim-range {
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  border: 1px solid rgba(255, 180, 84, .5);
+  border-radius: 7px;
+  background: linear-gradient(90deg, rgba(255, 74, 45, .52), rgba(255, 180, 84, .42));
+  box-shadow: 0 0 24px rgba(255, 90, 47, .2);
+  pointer-events: none;
+}
+
+.source-trim-handle {
+  top: 5px;
+  height: 42px;
+}
+
+.source-trim-start-label,
+.source-trim-end-label {
+  position: absolute;
+  bottom: -18px;
+  color: #6f7a8d;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  font-weight: 850;
+  pointer-events: none;
+}
+
+.source-trim-start-label {
+  left: 0;
+}
+
+.source-trim-end-label {
+  right: 0;
+}
+
+.static-export-preview img,
+.horizontal-export-preview img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.horizontal-export-preview.static-export-preview {
+  aspect-ratio: 16 / 9;
+}
+
+.static-preview-fallback {
+  display: grid;
+  min-height: 160px;
+  height: 100%;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  color: #7f8ca3;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.vertical-export-preview .static-preview-fallback {
+  position: absolute;
+  inset: 0;
+}

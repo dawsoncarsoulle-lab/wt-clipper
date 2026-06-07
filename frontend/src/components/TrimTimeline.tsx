@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
-import { Minus, Plus, RotateCcw, SkipBack, SkipForward } from "lucide-react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  Minus,
+  Plus,
+  RotateCcw,
+  SkipBack,
+  SkipForward,
+} from "lucide-react";
 import {
   buildTimelineTicks,
   clampTimelineTime,
@@ -9,7 +17,7 @@ import {
   DEFAULT_TIMELINE_ZOOM,
   formatTimelineTime,
   segmentDuration,
-  timelineToSourceTime,
+  sourceToTimelineTime,
   nextTimelineZoom,
   timelineContentWidthPercent,
   timelineTimeFromClientX,
@@ -17,15 +25,13 @@ import {
 import type { TimelineSegment } from "../types";
 
 const MIN_TRIM_GAP_SECONDS = 0.25;
-const SEGMENT_DRAG_THRESHOLD_PX = 4;
 
-type TimelineDragMode = "playhead" | "start" | "end";
-type InteractionMode = "none" | "scrubbing" | "trim-start" | "trim-end" | "drag-segment" | "drag-playhead";
-type SegmentDragState = {
-  id: string;
-  startX: number;
-  dragging: boolean;
-};
+type InteractionMode =
+  | "none"
+  | "scrubbing"
+  | "trim-start"
+  | "trim-end"
+  | "drag-playhead";
 
 type TrimTimelineProps = {
   durationSeconds: number;
@@ -38,6 +44,8 @@ type TrimTimelineProps = {
   selectedSegmentId?: string;
   onSegmentSelect: (id: string) => void;
   onSegmentReorder: (draggedId: string, targetId: string) => void;
+  onMoveSelectedLeft?: () => void;
+  onMoveSelectedRight?: () => void;
   onStartChange: (value: number) => void;
   onEndChange: (value: number) => void;
   onScrubStart?: () => void;
@@ -63,7 +71,9 @@ export function TrimTimeline({
   segments,
   selectedSegmentId,
   onSegmentSelect,
-  onSegmentReorder,
+  onSegmentReorder: _onSegmentReorder,
+  onMoveSelectedLeft,
+  onMoveSelectedRight,
   onStartChange,
   onEndChange,
   onScrubStart,
@@ -80,210 +90,242 @@ export function TrimTimeline({
 }: TrimTimelineProps) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const trackRef = useRef<HTMLDivElement | null>(null);
+  const sourceTrackRef = useRef<HTMLDivElement | null>(null);
   const frameRef = useRef<number | null>(null);
   const [zoom, setZoom] = useState(DEFAULT_TIMELINE_ZOOM);
-  const [dragMode, setDragMode] = useState<TimelineDragMode | null>(null);
-  const [interactionMode, setInteractionMode] = useState<InteractionMode>("none");
-  const [draggedSegmentId, setDraggedSegmentId] = useState<string | null>(null);
-  const segmentDragRef = useRef<SegmentDragState | null>(null);
+  const [interactionMode, setInteractionMode] =
+    useState<InteractionMode>("none");
 
   const safeDuration = Math.max(MIN_TRIM_GAP_SECONDS, durationSeconds);
-  const selectedDuration = Math.max(0, endSeconds - startSeconds);
-  const ticks = useMemo(() => buildTimelineTicks(safeDuration, zoom), [safeDuration, zoom]);
-  const contentWidth = `${timelineContentWidthPercent(zoom)}%`;
   const selectedSegment = selectedSegmentId
-    ? segments.find((segment) => segment.id === selectedSegmentId)
-    : undefined;
-
-  const startPercent = secondsToPercent(selectedSegment?.timelineStart ?? 0, safeDuration);
-  const endPercent = secondsToPercent(selectedSegment?.timelineEnd ?? 0, safeDuration);
+    ? segments.find(
+        (segment) => segment.id === selectedSegmentId && !segment.deleted,
+      )
+    : segments.find((segment) => !segment.deleted);
+  const selectedDuration = selectedSegment
+    ? Math.max(0, selectedSegment.end - selectedSegment.start)
+    : Math.max(0, endSeconds - startSeconds);
+  const ticks = useMemo(
+    () => buildTimelineTicks(safeDuration, zoom),
+    [safeDuration, zoom],
+  );
+  const contentWidth = `${timelineContentWidthPercent(zoom)}%`;
   const currentPercent = secondsToPercent(currentSeconds, safeDuration);
-  const selectedStyle: CSSProperties = {
-    left: `${startPercent}%`,
-    width: `${Math.max(0, endPercent - startPercent)}%`,
-  };
   const playheadStyle: CSSProperties = {
     left: `${currentPercent}%`,
   };
-  const startHandleStyle: CSSProperties = {
-    left: `${startPercent}%`,
-  };
-  const endHandleStyle: CSSProperties = {
-    left: `${endPercent}%`,
-  };
 
-  useEffect(() => () => {
+  const sourceDuration = Math.max(
+    MIN_TRIM_GAP_SECONDS,
+    selectedSegment?.sourceDuration ?? safeDuration,
+  );
+  const sourceStartPercent = selectedSegment
+    ? secondsToPercent(selectedSegment.start, sourceDuration)
+    : 0;
+  const sourceEndPercent = selectedSegment
+    ? secondsToPercent(selectedSegment.end, sourceDuration)
+    : 100;
+  const sourceRangeStyle: CSSProperties = {
+    left: `${sourceStartPercent}%`,
+    width: `${Math.max(0, sourceEndPercent - sourceStartPercent)}%`,
+  };
+  const sourceStartHandleStyle: CSSProperties = {
+    left: `${sourceStartPercent}%`,
+  };
+  const sourceEndHandleStyle: CSSProperties = { left: `${sourceEndPercent}%` };
+
+  const activeSegments = segments.filter(
+    (segment) => !segment.deleted && segmentDuration(segment) > 0,
+  );
+  const selectedIndex = selectedSegment
+    ? activeSegments.findIndex((segment) => segment.id === selectedSegment.id)
+    : -1;
+  const canMoveLeft = selectedIndex > 0;
+  const canMoveRight =
+    selectedIndex >= 0 && selectedIndex < activeSegments.length - 1;
+
+  useEffect(
+    () => () => {
+      if (frameRef.current != null) {
+        window.cancelAnimationFrame(frameRef.current);
+        frameRef.current = null;
+      }
+    },
+    [],
+  );
+
+  function schedule(fn: () => void) {
     if (frameRef.current != null) {
       window.cancelAnimationFrame(frameRef.current);
-      frameRef.current = null;
     }
-  }, []);
+    frameRef.current = window.requestAnimationFrame(fn);
+  }
 
-  function updateFromPointer(clientX: number, mode: TimelineDragMode) {
+  function updatePlayheadFromPointer(clientX: number) {
     const track = trackRef.current;
     if (!track) {
       return;
     }
     const rect = track.getBoundingClientRect();
-    const timelineTime = timelineTimeFromClientX(clientX, rect.left, rect.width, safeDuration);
-    const apply = () => {
-      if (mode === "start") {
-        if (!selectedSegment) {
-          return;
-        }
-        const sourceTime = timelineToSourceTime(selectedSegment, timelineTime);
-        const next = clampTrimStart(
-          sourceTime,
-          selectedSegment.end,
-          selectedSegment.sourceDuration,
-          MIN_TRIM_GAP_SECONDS,
-        );
+    const timelineTime = timelineTimeFromClientX(
+      clientX,
+      rect.left,
+      rect.width,
+      safeDuration,
+    );
+    schedule(() =>
+      onCurrentChange(clampTimelineTime(timelineTime, safeDuration)),
+    );
+  }
+
+  function sourceTimeFromPointer(clientX: number) {
+    const track = sourceTrackRef.current;
+    if (!track) {
+      return 0;
+    }
+    const rect = track.getBoundingClientRect();
+    const ratio = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
+    return Math.max(0, Math.min(sourceDuration, ratio * sourceDuration));
+  }
+
+  function beginPlayheadDrag(event: ReactPointerEvent<HTMLElement>) {
+    if (disabled) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setInteractionMode("drag-playhead");
+    onScrubStart?.();
+    updatePlayheadFromPointer(event.clientX);
+  }
+
+  function continuePlayheadDrag(event: ReactPointerEvent<HTMLElement>) {
+    if (disabled || interactionMode !== "drag-playhead") {
+      return;
+    }
+    event.preventDefault();
+    updatePlayheadFromPointer(event.clientX);
+  }
+
+  function endPlayheadDrag(event: ReactPointerEvent<HTMLElement>) {
+    if (interactionMode !== "drag-playhead") {
+      return;
+    }
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setInteractionMode("none");
+    onScrubEnd?.();
+  }
+
+  function beginSourceTrim(
+    event: ReactPointerEvent<HTMLElement>,
+    mode: "trim-start" | "trim-end",
+  ) {
+    if (disabled || !selectedSegment) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setInteractionMode(mode);
+    updateSourceTrimFromPointer(event.clientX, mode);
+  }
+
+  function continueSourceTrim(event: ReactPointerEvent<HTMLElement>) {
+    if (
+      disabled ||
+      (interactionMode !== "trim-start" && interactionMode !== "trim-end")
+    ) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    updateSourceTrimFromPointer(event.clientX, interactionMode);
+  }
+
+  function endSourceTrim(event: ReactPointerEvent<HTMLElement>) {
+    if (interactionMode !== "trim-start" && interactionMode !== "trim-end") {
+      return;
+    }
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setInteractionMode("none");
+  }
+
+  function updateSourceTrimFromPointer(
+    clientX: number,
+    mode: "trim-start" | "trim-end",
+  ) {
+    if (!selectedSegment) {
+      return;
+    }
+    const sourceTime = sourceTimeFromPointer(clientX);
+    if (mode === "trim-start") {
+      const next = clampTrimStart(
+        sourceTime,
+        selectedSegment.end,
+        selectedSegment.sourceDuration,
+        MIN_TRIM_GAP_SECONDS,
+      );
+      schedule(() => {
         onStartChange(next);
-        if (currentSeconds < selectedSegment.timelineStart) {
+        if (
+          currentSeconds < selectedSegment.timelineStart ||
+          currentSeconds > selectedSegment.timelineEnd
+        ) {
           onCurrentChange(selectedSegment.timelineStart);
         }
-        return;
+      });
+      return;
+    }
+    const next = clampTrimEnd(
+      sourceTime,
+      selectedSegment.start,
+      selectedSegment.sourceDuration,
+      MIN_TRIM_GAP_SECONDS,
+    );
+    schedule(() => {
+      onEndChange(next);
+      if (currentSeconds > selectedSegment.timelineEnd) {
+        onCurrentChange(selectedSegment.timelineEnd);
       }
-      if (mode === "end") {
-        if (!selectedSegment) {
-          return;
-        }
-        const sourceTime = timelineToSourceTime(selectedSegment, timelineTime);
-        const next = clampTrimEnd(
-          sourceTime,
-          selectedSegment.start,
-          selectedSegment.sourceDuration,
-          MIN_TRIM_GAP_SECONDS,
-        );
-        onEndChange(next);
-        if (currentSeconds > selectedSegment.timelineEnd) {
-          onCurrentChange(selectedSegment.timelineEnd);
-        }
-        return;
-      }
-      onCurrentChange(clampTimelineTime(timelineTime, safeDuration));
-    };
-
-    if (frameRef.current != null) {
-      window.cancelAnimationFrame(frameRef.current);
-    }
-    frameRef.current = window.requestAnimationFrame(apply);
+    });
   }
 
-  function beginDrag(event: ReactPointerEvent<HTMLElement>, mode: TimelineDragMode) {
-    if (disabled) {
-      return;
-    }
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    setDragMode(mode);
-    setInteractionMode(mode === "start" ? "trim-start" : mode === "end" ? "trim-end" : "drag-playhead");
-    if (mode === "playhead") {
-      onScrubStart?.();
-    }
-    updateFromPointer(event.clientX, mode);
-  }
-
-  function continueDrag(event: ReactPointerEvent<HTMLElement>) {
-    if (!dragMode || disabled) {
-      return;
-    }
-    updateFromPointer(event.clientX, dragMode);
-  }
-
-  function endDrag(event: ReactPointerEvent<HTMLElement>) {
-    if (!dragMode) {
-      return;
-    }
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    setDragMode(null);
-    setInteractionMode("none");
-    if (dragMode === "playhead") {
-      onScrubEnd?.();
-    }
-  }
-
-  function beginSegmentPointerDrag(event: ReactPointerEvent<HTMLButtonElement>, segmentId: string) {
-    if (disabled) {
+  function sourceTrackSeek(event: ReactPointerEvent<HTMLDivElement>) {
+    if (disabled || !selectedSegment || event.target !== event.currentTarget) {
       return;
     }
     event.preventDefault();
     event.stopPropagation();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    segmentDragRef.current = { id: segmentId, startX: event.clientX, dragging: false };
-    setDraggedSegmentId(segmentId);
-    setInteractionMode("drag-segment");
+    const sourceTime = Math.max(
+      selectedSegment.start,
+      Math.min(selectedSegment.end, sourceTimeFromPointer(event.clientX)),
+    );
+    onCurrentChange(sourceToTimelineTime(selectedSegment, sourceTime));
   }
 
-  function continueSegmentPointerDrag(event: ReactPointerEvent<HTMLButtonElement>, segmentId: string) {
-    const drag = segmentDragRef.current;
-    if (!drag || drag.id !== segmentId || disabled) {
-      return;
-    }
+  function selectSegment(
+    event: ReactPointerEvent<HTMLButtonElement>,
+    segmentId: string,
+  ) {
     event.preventDefault();
     event.stopPropagation();
-    if (!drag.dragging && Math.abs(event.clientX - drag.startX) >= SEGMENT_DRAG_THRESHOLD_PX) {
-      segmentDragRef.current = { ...drag, dragging: true };
-    }
-  }
-
-  function endSegmentPointerDrag(event: ReactPointerEvent<HTMLButtonElement>, segmentId: string) {
-    const drag = segmentDragRef.current;
-    if (!drag || drag.id !== segmentId) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    if (!drag.dragging) {
+    if (!disabled) {
       onSegmentSelect(segmentId);
-    } else {
-      onSegmentReorder(segmentId, segmentDropTargetFromClientX(event.clientX, segmentId));
     }
-    segmentDragRef.current = null;
-    setDraggedSegmentId(null);
-    setInteractionMode("none");
-  }
-
-  function cancelSegmentPointerDrag(event: ReactPointerEvent<HTMLButtonElement>, segmentId: string) {
-    const drag = segmentDragRef.current;
-    if (!drag || drag.id !== segmentId) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    segmentDragRef.current = null;
-    setDraggedSegmentId(null);
-    setInteractionMode("none");
-  }
-
-  function segmentDropTargetFromClientX(clientX: number, draggedId: string) {
-    const track = trackRef.current;
-    if (!track) {
-      return "";
-    }
-    const rect = track.getBoundingClientRect();
-    const timelineTime = timelineTimeFromClientX(clientX, rect.left, rect.width, safeDuration);
-    const target = segments.find((segment) => (
-      !segment.deleted
-      && segment.id !== draggedId
-      && timelineTime < segment.timelineStart + segmentDuration(segment) / 2
-    ));
-    return target?.id ?? "";
   }
 
   function changeZoom(direction: "in" | "out") {
     const next = nextTimelineZoom(zoom, direction);
     setZoom(next);
     if (direction === "in") {
-      requestAnimationFrame(() => keepPlayheadVisible(viewportRef.current, currentPercent));
+      requestAnimationFrame(() =>
+        keepPlayheadVisible(viewportRef.current, currentPercent),
+      );
     }
   }
 
@@ -292,21 +334,31 @@ export function TrimTimeline({
       <div className="editor-panel-heading">
         <div>
           <div className="editor-kicker">Timeline</div>
-          <h3>Trim visuel</h3>
+          <h3>Montage</h3>
         </div>
         <div className="trim-duration">
-          {formatTimelineTime(selectedDuration)}
+          {formatTimelineTime(selectedDuration)} sélectionné
         </div>
       </div>
 
       <div className="trim-time-row">
-        <span>Début {formatTimelineTime(startSeconds)}</span>
+        <span>
+          Segment{" "}
+          {selectedSegment
+            ? formatTimelineTime(selectedSegment.start)
+            : "--:--"}
+        </span>
         <span>Lecture {formatTimelineTime(currentSeconds)}</span>
-        <span>Fin {formatTimelineTime(endSeconds)}</span>
+        <span>
+          Fin{" "}
+          {selectedSegment ? formatTimelineTime(selectedSegment.end) : "--:--"}
+        </span>
       </div>
 
       <div className="timeline-toolbar">
-        <div className="timeline-total">Total {formatTimelineTime(safeDuration)}</div>
+        <div className="timeline-total">
+          Total {formatTimelineTime(safeDuration)}
+        </div>
         <div className="timeline-zoom">
           <button
             className="icon-button"
@@ -334,24 +386,25 @@ export function TrimTimeline({
         <div
           className="trim-timeline-content"
           style={{ width: contentWidth }}
-          onPointerCancel={endDrag}
-          onPointerLeave={continueDrag}
-          onPointerMove={continueDrag}
-          onPointerUp={endDrag}
+          onPointerCancel={endPlayheadDrag}
+          onPointerMove={continuePlayheadDrag}
+          onPointerUp={endPlayheadDrag}
         >
           <div className="trim-ruler">
             {ticks.map((tick) => (
               <div
                 className={tick.major ? "trim-tick major" : "trim-tick"}
                 key={`${tick.seconds}-${tick.label}`}
-                style={{ left: `${secondsToPercent(tick.seconds, safeDuration)}%` }}
+                style={{
+                  left: `${secondsToPercent(tick.seconds, safeDuration)}%`,
+                }}
               >
                 <span>{tick.label}</span>
               </div>
             ))}
           </div>
           <div
-            aria-label="Timeline"
+            aria-label="Timeline montage"
             className="trim-track"
             ref={trackRef}
             role="slider"
@@ -360,30 +413,33 @@ export function TrimTimeline({
             aria-valuenow={currentSeconds}
             tabIndex={disabled ? -1 : 0}
             onPointerDown={(event) => {
-              if (interactionMode !== "none" || event.target !== event.currentTarget) {
+              if (
+                interactionMode !== "none" ||
+                event.target !== event.currentTarget
+              ) {
                 return;
               }
-              beginDrag(event, "playhead");
+              beginPlayheadDrag(event);
             }}
           >
-            {segments.map((segment) => {
-              const left = secondsToPercent(segment.timelineStart, safeDuration);
-              const width = secondsToPercent(segmentDuration(segment), safeDuration);
+            {activeSegments.map((segment) => {
+              const left = secondsToPercent(
+                segment.timelineStart,
+                safeDuration,
+              );
+              const width = secondsToPercent(
+                segmentDuration(segment),
+                safeDuration,
+              );
               const selected = segment.id === selectedSegmentId;
               return (
                 <button
                   key={segment.id}
-                  className={[
-                    "timeline-segment",
-                    selected ? "selected" : "",
-                    draggedSegmentId === segment.id ? "timeline-segment--dragging" : "",
-                    segment.deleted ? "deleted" : "",
-                  ].filter(Boolean).join(" ")}
+                  className={["timeline-segment", selected ? "selected" : ""]
+                    .filter(Boolean)
+                    .join(" ")}
                   draggable={false}
-                  onPointerCancel={(event) => cancelSegmentPointerDrag(event, segment.id)}
-                  onPointerDown={(event) => beginSegmentPointerDrag(event, segment.id)}
-                  onPointerMove={(event) => continueSegmentPointerDrag(event, segment.id)}
-                  onPointerUp={(event) => endSegmentPointerDrag(event, segment.id)}
+                  onPointerDown={(event) => selectSegment(event, segment.id)}
                   style={{ left: `${left}%`, width: `${Math.max(1, width)}%` }}
                   type="button"
                 >
@@ -391,44 +447,12 @@ export function TrimTimeline({
                 </button>
               );
             })}
-            <div className="trim-selected" style={selectedStyle} />
-            <button
-              aria-label="Poignée début"
-              className="trim-handle trim-handle-start"
-              disabled={disabled}
-              onPointerDown={(event) => {
-                event.stopPropagation();
-                beginDrag(event, "start");
-              }}
-              onPointerMove={continueDrag}
-              onPointerUp={endDrag}
-              onPointerCancel={endDrag}
-              style={startHandleStyle}
-              type="button"
-            />
-            <button
-              aria-label="Poignée fin"
-              className="trim-handle trim-handle-end"
-              disabled={disabled}
-              onPointerDown={(event) => {
-                event.stopPropagation();
-                beginDrag(event, "end");
-              }}
-              onPointerMove={continueDrag}
-              onPointerUp={endDrag}
-              onPointerCancel={endDrag}
-              style={endHandleStyle}
-              type="button"
-            />
             <div
               className="trim-playhead"
-              onPointerCancel={endDrag}
-              onPointerDown={(event) => {
-                event.stopPropagation();
-                beginDrag(event, "playhead");
-              }}
-              onPointerMove={continueDrag}
-              onPointerUp={endDrag}
+              onPointerCancel={endPlayheadDrag}
+              onPointerDown={beginPlayheadDrag}
+              onPointerMove={continuePlayheadDrag}
+              onPointerUp={endPlayheadDrag}
               style={playheadStyle}
             >
               <span>{formatTimelineTime(currentSeconds)}</span>
@@ -437,30 +461,137 @@ export function TrimTimeline({
         </div>
       </div>
 
+      <div className="segment-reorder-actions">
+        <button
+          className="ghost-button"
+          disabled={disabled || !canMoveLeft}
+          onClick={onMoveSelectedLeft}
+          type="button"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Déplacer à gauche
+        </button>
+        <button
+          className="ghost-button"
+          disabled={disabled || !canMoveRight}
+          onClick={onMoveSelectedRight}
+          type="button"
+        >
+          Déplacer à droite
+          <ArrowRight className="h-4 w-4" />
+        </button>
+      </div>
+
+      <div className="source-trim-panel">
+        <div className="source-trim-header">
+          <div>
+            <div className="editor-kicker">Trim du segment sélectionné</div>
+            <strong>{selectedSegment?.sourceTitle ?? "Aucun segment"}</strong>
+          </div>
+          <span>
+            {selectedSegment
+              ? `${formatTimelineTime(selectedSegment.start)} → ${formatTimelineTime(selectedSegment.end)}`
+              : "--"}
+          </span>
+        </div>
+        <div
+          className="source-trim-track"
+          ref={sourceTrackRef}
+          onPointerDown={sourceTrackSeek}
+          onPointerMove={continueSourceTrim}
+          onPointerUp={endSourceTrim}
+          onPointerCancel={endSourceTrim}
+        >
+          <div className="source-trim-range" style={sourceRangeStyle} />
+          <button
+            aria-label="Poignée début"
+            className="trim-handle source-trim-handle source-trim-handle-start"
+            disabled={disabled || !selectedSegment}
+            onPointerDown={(event) => beginSourceTrim(event, "trim-start")}
+            onPointerMove={continueSourceTrim}
+            onPointerUp={endSourceTrim}
+            onPointerCancel={endSourceTrim}
+            style={sourceStartHandleStyle}
+            type="button"
+          />
+          <button
+            aria-label="Poignée fin"
+            className="trim-handle source-trim-handle source-trim-handle-end"
+            disabled={disabled || !selectedSegment}
+            onPointerDown={(event) => beginSourceTrim(event, "trim-end")}
+            onPointerMove={continueSourceTrim}
+            onPointerUp={endSourceTrim}
+            onPointerCancel={endSourceTrim}
+            style={sourceEndHandleStyle}
+            type="button"
+          />
+          <div className="source-trim-start-label">00:00</div>
+          <div className="source-trim-end-label">
+            {formatTimelineTime(sourceDuration)}
+          </div>
+        </div>
+      </div>
+
       <div className="trim-actions">
-        <button className="ghost-button" disabled={disabled} onClick={onSetStartToCurrent} type="button">
+        <button
+          className="ghost-button"
+          disabled={disabled || !selectedSegment}
+          onClick={onSetStartToCurrent}
+          type="button"
+        >
           <SkipBack className="h-4 w-4" />
           Début = temps actuel
         </button>
-        <button className="ghost-button" disabled={disabled} onClick={onSetEndToCurrent} type="button">
+        <button
+          className="ghost-button"
+          disabled={disabled || !selectedSegment}
+          onClick={onSetEndToCurrent}
+          type="button"
+        >
           <SkipForward className="h-4 w-4" />
           Fin = temps actuel
         </button>
-        <button className="icon-button" disabled={disabled} onClick={onReset} title="Reset" type="button">
+        <button
+          className="icon-button"
+          disabled={disabled}
+          onClick={onReset}
+          title="Reset"
+          type="button"
+        >
           <RotateCcw className="h-4 w-4" />
         </button>
       </div>
       <div className="trim-actions editor-cut-actions">
-        <button className="ghost-button" disabled={disabled} onClick={onSplit} type="button">
+        <button
+          className="ghost-button"
+          disabled={disabled}
+          onClick={onSplit}
+          type="button"
+        >
           Couper à la position
         </button>
-        <button className="ghost-button destructive" disabled={disabled || !selectedSegmentId} onClick={onDeleteSegment} type="button">
+        <button
+          className="ghost-button destructive"
+          disabled={disabled || !selectedSegmentId}
+          onClick={onDeleteSegment}
+          type="button"
+        >
           Supprimer segment
         </button>
-        <button className="ghost-button" disabled={disabled || !canRestoreSegment} onClick={onRestoreSegment} type="button">
+        <button
+          className="ghost-button"
+          disabled={disabled || !canRestoreSegment}
+          onClick={onRestoreSegment}
+          type="button"
+        >
           Restaurer
         </button>
-        <button className="ghost-button" disabled={disabled} onClick={onSetThumbnail} type="button">
+        <button
+          className="ghost-button"
+          disabled={disabled}
+          onClick={onSetThumbnail}
+          type="button"
+        >
           Utiliser cette frame comme miniature
         </button>
       </div>
@@ -477,7 +608,10 @@ function secondsToPercent(seconds: number, durationSeconds: number) {
   return Math.max(0, Math.min(100, (seconds / durationSeconds) * 100));
 }
 
-function keepPlayheadVisible(viewport: HTMLDivElement | null, currentPercent: number) {
+function keepPlayheadVisible(
+  viewport: HTMLDivElement | null,
+  currentPercent: number,
+) {
   if (!viewport) {
     return;
   }
@@ -487,7 +621,10 @@ function keepPlayheadVisible(viewport: HTMLDivElement | null, currentPercent: nu
   const rightPadding = 64;
   if (playheadX < viewport.scrollLeft + leftPadding) {
     viewport.scrollLeft = Math.max(0, playheadX - leftPadding);
-  } else if (playheadX > viewport.scrollLeft + viewport.clientWidth - rightPadding) {
+  } else if (
+    playheadX >
+    viewport.scrollLeft + viewport.clientWidth - rightPadding
+  ) {
     viewport.scrollLeft = playheadX - viewport.clientWidth + rightPadding;
   }
 }

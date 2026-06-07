@@ -500,7 +500,7 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
         )}
       </div>
 
-      <HoverVideoPreview clip={activePreviewClip} startSeconds={HOVER_PREVIEW_START_SECONDS} />
+      <HoverVideoPreview clip={editingClip ? null : activePreviewClip} startSeconds={HOVER_PREVIEW_START_SECONDS} />
 
       {editingClip && (
         <ClipEditorModal

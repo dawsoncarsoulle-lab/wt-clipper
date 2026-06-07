@@ -62,21 +62,42 @@ const modeOptions: Array<{
 }> = [
   { mode: "trim_original", label: "Original coupé", icon: Scissors },
   { mode: "youtube_horizontal", label: "YouTube", icon: Monitor },
-  { mode: "social_vertical", label: "TikTok / Reels / Shorts", icon: Smartphone },
+  {
+    mode: "social_vertical",
+    label: "TikTok / Reels / Shorts",
+    icon: Smartphone,
+  },
 ];
 
-export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: ClipEditorModalProps) {
+export function ClipEditorModal({
+  clip,
+  clips,
+  onClose,
+  onExportComplete,
+}: ClipEditorModalProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const resumeAfterScrubRef = useRef(false);
   const segmentIdRef = useRef(0);
   const pendingSeekRef = useRef<number | null>(null);
+  const playAfterSourceLoadRef = useRef(false);
   const [mediaInfo, setMediaInfo] = useState<ClipMediaInfo | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [videoDuration, setVideoDuration] = useState(clip.durationSeconds);
-  const [segments, setSegments] = useState<TimelineSegment[]>(() => initialTimelineSegments(clips ?? [clip]));
-  const [selectedSegmentId, setSelectedSegmentId] = useState<string | undefined>(() => segments[0]?.id);
-  const [thumbnailSelection, setThumbnailSelection] = useState<{ timelineTime: number; sourcePath: string; sourceTime: number } | null>(null);
-  const activeSegments = useMemo(() => activeTimelineSegments(segments), [segments]);
+  const [segments, setSegments] = useState<TimelineSegment[]>(() =>
+    initialTimelineSegments(clips ?? [clip]),
+  );
+  const [selectedSegmentId, setSelectedSegmentId] = useState<
+    string | undefined
+  >(() => segments[0]?.id);
+  const [thumbnailSelection, setThumbnailSelection] = useState<{
+    timelineTime: number;
+    sourcePath: string;
+    sourceTime: number;
+  } | null>(null);
+  const activeSegments = useMemo(
+    () => activeTimelineSegments(segments),
+    [segments],
+  );
   const timelineTotalSeconds = timelineDuration(segments);
   const durationSeconds = Math.max(MIN_TRIM_GAP_SECONDS, timelineTotalSeconds);
   const selectedSegment = selectedSegmentId
@@ -86,7 +107,7 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
   const [activeSourcePath, setActiveSourcePath] = useState(clip.path);
   const [playing, setPlaying] = useState(false);
   const [mode, setMode] = useState<ClipEditorMode>("trim_original");
-  const [outputFormat, setOutputFormat] = useState<"webm" | "mp4">("webm");
+  const [outputFormat, setOutputFormat] = useState<"webm" | "mp4">("mp4");
   const [blurBackground, setBlurBackground] = useState(true);
   const [watermark, setWatermark] = useState(true);
   const [autoTitle, setAutoTitle] = useState(true);
@@ -97,15 +118,25 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
   const [confirmReplaceOpen, setConfirmReplaceOpen] = useState(false);
   const [openFolderAfterExport, setOpenFolderAfterExport] = useState(false);
   const [exporting, setExporting] = useState(false);
-  const [progress, setProgress] = useState<EditorExportProgressPayload | null>(null);
+  const [progress, setProgress] = useState<EditorExportProgressPayload | null>(
+    null,
+  );
   const [result, setResult] = useState<EditedClipResult | null>(null);
 
   const videoSrc = videoUrlForSource(activeSourcePath, segments);
   const videoMimeType = videoMimeTypeForPath(activeSourcePath);
-  const socialLayout: SocialLayout = blurBackground ? "vertical_blur" : "vertical_crop";
+  const previewImageSrc = thumbnailUrlForSegment(
+    selectedSegment ?? activeSegments[0],
+  );
+  const socialLayout: SocialLayout = blurBackground
+    ? "vertical_blur"
+    : "vertical_crop";
   const effectiveTitle = autoTitle ? defaultEditorTitle(clip) : title;
   const exportDuration = timelineTotalSeconds;
-  const canExport = activeSegments.length > 0 && exportDuration >= MIN_TRIM_GAP_SECONDS && !exporting;
+  const canExport =
+    activeSegments.length > 0 &&
+    exportDuration >= MIN_TRIM_GAP_SECONDS &&
+    !exporting;
   const canReplaceOriginal = activeSegments.length === 1;
 
   useEffect(() => {
@@ -127,15 +158,25 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
     let cancelled = false;
     async function loadMediaInfo() {
       try {
-        const info = await invoke<ClipMediaInfo>("get_clip_media_info", { path: clip.path });
+        const info = await invoke<ClipMediaInfo>("get_clip_media_info", {
+          path: clip.path,
+        });
         if (!cancelled) {
           setMediaInfo(info);
           setVideoDuration(info.durationSeconds);
-          setSegments((current) => recalculateTimelineSegments(current.map((segment, index) => (
-            index === 0
-              ? { ...segment, sourceDuration: info.durationSeconds, end: Math.max(MIN_TRIM_GAP_SECONDS, info.durationSeconds) }
-              : segment
-          ))));
+          setSegments((current) =>
+            recalculateTimelineSegments(
+              current.map((segment, index) =>
+                index === 0
+                  ? {
+                      ...segment,
+                      sourceDuration: info.durationSeconds,
+                      end: Math.max(MIN_TRIM_GAP_SECONDS, info.durationSeconds),
+                    }
+                  : segment,
+              ),
+            ),
+          );
         }
       } catch (error) {
         if (!cancelled) {
@@ -150,17 +191,32 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
   }, [clip.path]);
 
   useEffect(() => {
-    console.info("[EDITOR_VIDEO] set src=", videoSrc);
-    setMediaError(null);
     const video = videoRef.current;
-    if (video) {
+    console.info("[EDITOR_VIDEO] sourcePath=", activeSourcePath);
+    console.info("[EDITOR_VIDEO] videoUrl=", videoSrc);
+    console.info(
+      "[EDITOR_VIDEO] usingPreviewUrl=",
+      Boolean(segments.find((segment) => segment.sourcePath === activeSourcePath)?.sourcePreviewUrl),
+    );
+    setMediaError(null);
+    if (!video || !videoSrc) {
+      return;
+    }
+
+    const currentSrc = video.currentSrc || video.getAttribute("src") || "";
+    if (currentSrc !== videoSrc) {
+      video.pause();
+      video.setAttribute("src", videoSrc);
       video.load();
     }
-  }, [videoSrc]);
+  }, [activeSourcePath, segments, videoSrc]);
 
-  useEffect(() => () => {
-    unloadEditorVideo(videoRef.current);
-  }, []);
+  useEffect(
+    () => () => {
+      unloadEditorVideo(videoRef.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     const unsubscribe = listen<EditorExportProgressPayload>(
@@ -208,7 +264,8 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
     if (!mediaInfo) {
       return `${formatClipDuration(durationSeconds)} · ${videoMimeType.replace("video/", "").toUpperCase()}`;
     }
-    const fps = mediaInfo.fps > 0 ? `${Math.round(mediaInfo.fps)} FPS` : "FPS inconnu";
+    const fps =
+      mediaInfo.fps > 0 ? `${Math.round(mediaInfo.fps)} FPS` : "FPS inconnu";
     return `${mediaInfo.width}x${mediaInfo.height} · ${fps} · ${mediaInfo.codec}`;
   }, [durationSeconds, mediaInfo, videoMimeType]);
 
@@ -220,20 +277,8 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
   }
 
   function setVideoCurrentTime(seconds: number) {
-    const video = videoRef.current;
     const next = Math.max(0, Math.min(durationSeconds, seconds));
-    const segment = findSegmentAtTimelineTime(segments, next);
-    if (segment) {
-      const sourceTime = timelineToSourceTime(segment, next);
-      console.info("[EDITOR_VIDEO] active segment=", segment.id, "sourceTime=", sourceTime);
-      if (activeSourcePath !== segment.sourcePath) {
-        unloadEditorVideo(video);
-        pendingSeekRef.current = sourceTime;
-        setActiveSourcePath(segment.sourcePath);
-      } else if (video) {
-        seekVideo(video, sourceTime);
-      }
-    }
+    syncVideoToTimeline(next, false);
     setCurrentSeconds(next);
   }
 
@@ -241,31 +286,55 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
     if (!selectedSegment) {
       return;
     }
-    setSegments((current) => recalculateTimelineSegments(current.map((segment) => (
-      segment.id === selectedSegment.id
-        ? { ...segment, start: Math.min(Math.max(0, value), segment.end - MIN_TRIM_GAP_SECONDS) }
-        : segment
-    ))));
+    setSegments((current) =>
+      recalculateTimelineSegments(
+        current.map((segment) =>
+          segment.id === selectedSegment.id
+            ? {
+                ...segment,
+                start: Math.min(
+                  Math.max(0, value),
+                  segment.end - MIN_TRIM_GAP_SECONDS,
+                ),
+              }
+            : segment,
+        ),
+      ),
+    );
   }
 
   function updateEnd(value: number) {
     if (!selectedSegment) {
       return;
     }
-    setSegments((current) => recalculateTimelineSegments(current.map((segment) => (
-      segment.id === selectedSegment.id
-        ? { ...segment, end: Math.max(Math.min(segment.sourceDuration, value), segment.start + MIN_TRIM_GAP_SECONDS) }
-        : segment
-    ))));
+    setSegments((current) =>
+      recalculateTimelineSegments(
+        current.map((segment) =>
+          segment.id === selectedSegment.id
+            ? {
+                ...segment,
+                end: Math.max(
+                  Math.min(segment.sourceDuration, value),
+                  segment.start + MIN_TRIM_GAP_SECONDS,
+                ),
+              }
+            : segment,
+        ),
+      ),
+    );
   }
 
   function resetTrim() {
-    setSegments((current) => recalculateTimelineSegments(current.map((segment) => ({
-      ...segment,
-      start: 0,
-      end: segment.sourceDuration,
-      deleted: false,
-    }))));
+    setSegments((current) =>
+      recalculateTimelineSegments(
+        current.map((segment) => ({
+          ...segment,
+          start: 0,
+          end: segment.sourceDuration,
+          deleted: false,
+        })),
+      ),
+    );
     setSelectedSegmentId(segments[0]?.id);
     setVideoCurrentTime(0);
   }
@@ -299,7 +368,10 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
       setPlaying(false);
       return;
     }
-    syncVideoToTimeline(currentSeconds);
+    const switchedSource = syncVideoToTimeline(currentSeconds, true);
+    if (switchedSource) {
+      return;
+    }
     try {
       await video.play();
       setPlaying(true);
@@ -320,21 +392,24 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
     const nextTimeline = sourceToTimelineTime(segment, video.currentTime);
     setCurrentSeconds(nextTimeline);
     if (video.currentTime >= segment.end) {
-      const nextSegment = activeSegments.find((item) => item.timelineStart >= segment.timelineEnd - 0.001 && item.id !== segment.id);
+      const nextSegment = activeSegments.find(
+        (item) =>
+          item.timelineStart >= segment.timelineEnd - 0.001 &&
+          item.id !== segment.id,
+      );
       if (nextSegment) {
         setCurrentSeconds(nextSegment.timelineStart);
-        if (nextSegment.sourcePath === activeSourcePath) {
-          seekVideo(video, nextSegment.start);
-        } else {
-          unloadEditorVideo(video);
-          pendingSeekRef.current = nextSegment.start;
-          setActiveSourcePath(nextSegment.sourcePath);
+        const switchedSource = syncVideoToTimeline(
+          nextSegment.timelineStart,
+          true,
+        );
+        if (!switchedSource && videoRef.current) {
+          void videoRef.current
+            .play()
+            .catch((error) =>
+              console.info("[FRONTEND] editor segment advance failed", error),
+            );
         }
-        window.requestAnimationFrame(() => {
-          if (videoRef.current) {
-            void videoRef.current.play().catch((error) => console.info("[FRONTEND] editor segment advance failed", error));
-          }
-        });
         return;
       }
       video.pause();
@@ -350,8 +425,38 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
     }
     console.info("[EDITOR_VIDEO] loadedmetadata duration=", video.duration);
     setVideoDuration(video.duration);
-    if (pendingSeekRef.current != null) {
-      seekVideo(video, pendingSeekRef.current);
+    const seekTo = pendingSeekRef.current;
+    if (seekTo != null) {
+      seekVideo(video, seekTo);
+      pendingSeekRef.current = null;
+    } else {
+      const segment = findSegmentAtTimelineTime(segments, currentSeconds);
+      if (segment && segment.sourcePath === activeSourcePath) {
+        seekVideo(video, timelineToSourceTime(segment, currentSeconds));
+      }
+    }
+    if (playAfterSourceLoadRef.current) {
+      playAfterSourceLoadRef.current = false;
+      void video
+        .play()
+        .then(() => setPlaying(true))
+        .catch((error) => {
+          console.info(
+            "[FRONTEND] editor playback after source load failed",
+            error,
+          );
+        });
+    }
+  }
+
+  function handleLoadedData() {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+    const seekTo = pendingSeekRef.current;
+    if (seekTo != null) {
+      seekVideo(video, seekTo);
       pendingSeekRef.current = null;
     }
   }
@@ -366,24 +471,27 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
     setMediaError(message);
   }
 
-  function syncVideoToTimeline(timelineTime: number) {
+  function syncVideoToTimeline(timelineTime: number, playAfterLoad = false) {
     const segment = findSegmentAtTimelineTime(segments, timelineTime);
     const video = videoRef.current;
     if (!segment || !video) {
-      return;
+      return false;
     }
     const sourceTime = timelineToSourceTime(segment, timelineTime);
     if (activeSourcePath !== segment.sourcePath) {
-      unloadEditorVideo(video);
       pendingSeekRef.current = sourceTime;
+      playAfterSourceLoadRef.current = playAfterLoad;
       setActiveSourcePath(segment.sourcePath);
-    } else {
-      seekVideo(video, sourceTime);
+      return true;
     }
+    seekVideo(video, sourceTime);
+    return false;
   }
 
   function splitAtPlayhead() {
-    const result = splitSegmentAtPlayhead(segments, currentSeconds, 0.5, () => nextSegmentId(segmentIdRef));
+    const result = splitSegmentAtPlayhead(segments, currentSeconds, 0.5, () =>
+      nextSegmentId(segmentIdRef),
+    );
     setSegments(result.segments);
     if (result.selectedSegmentId) {
       setSelectedSegmentId(result.selectedSegmentId);
@@ -418,6 +526,40 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
     });
   }
 
+  function moveSelectedSegment(direction: "left" | "right") {
+    if (!selectedSegmentId) {
+      return;
+    }
+    setSegments((current) => {
+      const active = activeTimelineSegments(current);
+      const index = active.findIndex(
+        (segment) => segment.id === selectedSegmentId,
+      );
+      if (index < 0) {
+        return current;
+      }
+      const targetIndex = direction === "left" ? index - 1 : index + 1;
+      if (targetIndex < 0 || targetIndex >= active.length) {
+        return current;
+      }
+      const orderedIds = active.map((segment) => segment.id);
+      const [moved] = orderedIds.splice(index, 1);
+      orderedIds.splice(targetIndex, 0, moved);
+      const rank = new Map(orderedIds.map((id, nextIndex) => [id, nextIndex]));
+      const activeSorted = active
+        .slice()
+        .sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0));
+      const activeById = new Map(
+        activeSorted.map((segment) => [segment.id, segment]),
+      );
+      const deleted = current.filter((segment) => segment.deleted);
+      return recalculateTimelineSegments([
+        ...activeSorted.map((segment) => activeById.get(segment.id) ?? segment),
+        ...deleted,
+      ]);
+    });
+  }
+
   function requestExport() {
     if (!canExport) {
       return;
@@ -434,7 +576,10 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
       return;
     }
     setConfirmReplaceOpen(false);
-    const effectiveSaveMode = saveMode === "replace_original" && !canReplaceOriginal ? "create_copy" : saveMode;
+    const effectiveSaveMode =
+      saveMode === "replace_original" && !canReplaceOriginal
+        ? "create_copy"
+        : saveMode;
     setExporting(true);
     setResult(null);
     setProgress({
@@ -459,13 +604,17 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
       saveMode: effectiveSaveMode,
     });
     try {
-      const nextResult = await invoke<EditedClipResult>("export_edited_clip", { request });
+      const nextResult = await invoke<EditedClipResult>("export_edited_clip", {
+        request,
+      });
       setResult(nextResult);
       setProgress({
         active: false,
         step: "done",
         progress: 100,
-        message: nextResult.replacedOriginal ? "Clip original remplacé" : "Export terminé",
+        message: nextResult.replacedOriginal
+          ? "Clip original remplacé"
+          : "Export terminé",
         outputPath: nextResult.outputPath,
       });
       await onExportComplete();
@@ -503,9 +652,16 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
             <div className="min-w-0">
               <div className="editor-kicker">Éditeur vidéo</div>
               <h2 className="truncate">{clip.fileName}</h2>
-              <div className="mt-1 truncate text-sm text-zinc-500">{mediaSummary}</div>
+              <div className="mt-1 truncate text-sm text-zinc-500">
+                {mediaSummary}
+              </div>
             </div>
-            <button className="icon-button" disabled={exporting} onClick={close} title="Fermer">
+            <button
+              className="icon-button"
+              disabled={exporting}
+              onClick={close}
+              title="Fermer"
+            >
               <XCircle className="h-4 w-4" />
             </button>
           </header>
@@ -514,24 +670,34 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
             <div className="editor-main-column">
               <section className="editor-video-shell">
                 <video
+                  key={activeSourcePath}
                   ref={videoRef}
-                  src={videoSrc}
+                  poster={previewImageSrc ?? undefined}
                   onEnded={() => setPlaying(false)}
                   onError={handleVideoError}
+                  onLoadedData={handleLoadedData}
                   onLoadedMetadata={handleLoadedMetadata}
                   onPause={() => setPlaying(false)}
                   onPlay={() => setPlaying(true)}
                   onTimeUpdate={handleTimeUpdate}
                   playsInline
-                  preload="metadata"
+                  preload="auto"
                 />
                 <div className="editor-video-controls">
-                  <button className="primary-action w-fit px-4" onClick={() => void togglePlayback()}>
-                    {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                  <button
+                    className="primary-action w-fit px-4"
+                    onClick={() => void togglePlayback()}
+                  >
+                    {playing ? (
+                      <Pause className="h-4 w-4" />
+                    ) : (
+                      <Play className="h-4 w-4" />
+                    )}
                     {playing ? "Pause" : "Lecture"}
                   </button>
                   <div className="editor-timecode">
-                    {formatClipDuration(currentSeconds)} / {formatClipDuration(durationSeconds)}
+                    {formatClipDuration(currentSeconds)} /{" "}
+                    {formatClipDuration(durationSeconds)}
                   </div>
                 </div>
               </section>
@@ -547,21 +713,33 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
                 onScrubEnd={endTimelineScrub}
                 onScrubStart={beginTimelineScrub}
                 onSetEndToCurrent={() => {
-                  const segment = findSegmentAtTimelineTime(segments, currentSeconds);
+                  const segment = findSegmentAtTimelineTime(
+                    segments,
+                    currentSeconds,
+                  );
                   if (segment) {
                     setSelectedSegmentId(segment.id);
                     updateEnd(timelineToSourceTime(segment, currentSeconds));
                   }
                 }}
                 onSetStartToCurrent={() => {
-                  const segment = findSegmentAtTimelineTime(segments, currentSeconds);
+                  const segment = findSegmentAtTimelineTime(
+                    segments,
+                    currentSeconds,
+                  );
                   if (segment) {
                     setSelectedSegmentId(segment.id);
                     updateStart(timelineToSourceTime(segment, currentSeconds));
                   }
                 }}
                 onStartChange={updateStart}
-                onSegmentReorder={(draggedId, targetId) => setSegments((current) => reorderTimelineSegment(current, draggedId, targetId))}
+                onSegmentReorder={(draggedId, targetId) =>
+                  setSegments((current) =>
+                    reorderTimelineSegment(current, draggedId, targetId),
+                  )
+                }
+                onMoveSelectedLeft={() => moveSelectedSegment("left")}
+                onMoveSelectedRight={() => moveSelectedSegment("right")}
                 onSegmentSelect={setSelectedSegmentId}
                 onSplit={splitAtPlayhead}
                 onDeleteSegment={deleteSelectedSegment}
@@ -633,7 +811,9 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
                     <input
                       checked={blurBackground}
                       disabled={exporting || mode !== "social_vertical"}
-                      onChange={(event) => setBlurBackground(event.target.checked)}
+                      onChange={(event) =>
+                        setBlurBackground(event.target.checked)
+                      }
                       type="checkbox"
                     />
                     <span>Fond flou</span>
@@ -661,7 +841,9 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
                   <label className="field compact-field">
                     <span>Titre</span>
                     <input
-                      disabled={exporting || autoTitle || mode !== "social_vertical"}
+                      disabled={
+                        exporting || autoTitle || mode !== "social_vertical"
+                      }
                       onChange={(event) => setTitle(event.target.value)}
                       value={effectiveTitle}
                     />
@@ -713,11 +895,18 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
                     <span>
                       <strong>Créer une copie</strong>
                       <small>
-                        Le clip original reste intact. La nouvelle vidéo sera créée dans Edited/ ou Social/.
+                        Le clip original reste intact. La nouvelle vidéo sera
+                        créée dans Edited/ ou Social/.
                       </small>
                     </span>
                   </label>
-                  <label className={saveMode === "replace_original" ? "active destructive" : "destructive"}>
+                  <label
+                    className={
+                      saveMode === "replace_original"
+                        ? "active destructive"
+                        : "destructive"
+                    }
+                  >
                     <input
                       checked={saveMode === "replace_original"}
                       disabled={exporting || !canReplaceOriginal}
@@ -728,7 +917,8 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
                     <span>
                       <strong>Remplacer l’original</strong>
                       <small>
-                        Disponible uniquement pour une timeline à un seul segment.
+                        Disponible uniquement pour une timeline à un seul
+                        segment.
                       </small>
                     </span>
                   </label>
@@ -737,7 +927,8 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
                   <div className="editor-warning">
                     <AlertTriangle className="h-4 w-4" />
                     <span>
-                      Attention : cette action remplacera le clip original. Une sauvegarde sera créée dans Backups/.
+                      Attention : cette action remplacera le clip original. Une
+                      sauvegarde sera créée dans Backups/.
                     </span>
                   </div>
                 )}
@@ -746,32 +937,35 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
               <SocialExportPreview
                 layout={socialLayout}
                 mode={mode}
+                previewImageSrc={previewImageSrc}
                 subtitle={mode === "social_vertical" ? subtitle : ""}
                 title={mode === "social_vertical" ? effectiveTitle : ""}
-                videoMimeType={videoMimeType}
-                videoSrc={videoSrc}
                 watermark={mode === "social_vertical" && watermark}
               />
             </aside>
           </div>
 
-          {mediaError && (
-            <p className="editor-error">{mediaError}</p>
-          )}
+          {mediaError && <p className="editor-error">{mediaError}</p>}
 
           <footer className="editor-footer">
             <label className="editor-folder-toggle">
               <input
                 checked={openFolderAfterExport}
                 disabled={exporting}
-                onChange={(event) => setOpenFolderAfterExport(event.target.checked)}
+                onChange={(event) =>
+                  setOpenFolderAfterExport(event.target.checked)
+                }
                 type="checkbox"
               />
               <FolderOpen className="h-4 w-4" />
               Ouvrir dossier après export
             </label>
             <div className="flex gap-2">
-              <button className="ghost-button" disabled={exporting} onClick={close}>
+              <button
+                className="ghost-button"
+                disabled={exporting}
+                onClick={close}
+              >
                 Annuler
               </button>
               <button
@@ -809,7 +1003,8 @@ export function ClipEditorModal({ clip, clips, onClose, onExportComplete }: Clip
                 <div className="editor-kicker">Confirmation</div>
                 <h3>Remplacer l’original ?</h3>
                 <p>
-                  Voulez-vous vraiment remplacer ce clip ? Le fichier original sera sauvegardé avant modification.
+                  Voulez-vous vraiment remplacer ce clip ? Le fichier original
+                  sera sauvegardé avant modification.
                 </p>
               </div>
               <div className="editor-confirm-actions">
@@ -893,34 +1088,52 @@ function buildEditRequest({
 }
 
 function initialTimelineSegments(clips: ClipInfo[]): TimelineSegment[] {
-  return recalculateTimelineSegments(clips.map((clip, index) => {
-    const duration = Math.max(MIN_TRIM_GAP_SECONDS, clip.durationSeconds || MIN_TRIM_GAP_SECONDS);
-    return {
-      id: `segment-${index + 1}`,
-      sourcePath: clip.path,
-      sourceClipId: clip.path,
-      sourceTitle: clip.fileName,
-      sourceThumbnail: clip.thumbnailPath ?? undefined,
-      sourcePreviewUrl: clip.previewUrl ?? undefined,
-      sourceDuration: duration,
-      start: 0,
-      end: duration,
-      timelineStart: 0,
-      timelineEnd: duration,
-    };
-  }));
+  return recalculateTimelineSegments(
+    clips.map((clip, index) => {
+      const duration = Math.max(
+        MIN_TRIM_GAP_SECONDS,
+        clip.durationSeconds || MIN_TRIM_GAP_SECONDS,
+      );
+      return {
+        id: `segment-${index + 1}`,
+        sourcePath: clip.path,
+        sourceClipId: clip.path,
+        sourceTitle: clip.fileName,
+        sourceThumbnail: clip.thumbnailPath ?? undefined,
+        sourcePreviewUrl: clip.previewUrl ?? undefined,
+        sourceDuration: duration,
+        start: 0,
+        end: duration,
+        timelineStart: 0,
+        timelineEnd: duration,
+      };
+    }),
+  );
 }
 
 function videoUrlForSource(sourcePath: string, segments: TimelineSegment[]) {
-  return segments.find((segment) => segment.sourcePath === sourcePath)?.sourcePreviewUrl
-    ?? convertFileSrc(sourcePath);
+  const segment = segments.find((item) => item.sourcePath === sourcePath);
+  if (segment?.sourcePreviewUrl) {
+    return segment.sourcePreviewUrl;
+  }
+  return convertFileSrc(sourcePath);
+}
+
+function thumbnailUrlForSegment(segment?: TimelineSegment | null) {
+  if (!segment?.sourceThumbnail) {
+    return null;
+  }
+  return convertFileSrc(segment.sourceThumbnail);
 }
 
 function seekVideo(video: HTMLVideoElement, seconds: number) {
   if (!Number.isFinite(seconds)) {
     return;
   }
-  const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : seconds;
+  const duration =
+    Number.isFinite(video.duration) && video.duration > 0
+      ? video.duration
+      : seconds;
   const next = Math.max(0, Math.min(duration, seconds));
   if (Math.abs(video.currentTime - next) > 0.03) {
     video.currentTime = next;
