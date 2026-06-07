@@ -61,6 +61,7 @@ pub struct GsrStatus {
     pub total_saves_completed: u64,
     pub total_saves_failed: u64,
     pub target: String,
+    pub target_valid: bool,
     pub monitors: Vec<String>,
     pub command_line: Option<String>,
     pub output_dir: PathBuf,
@@ -121,6 +122,7 @@ pub struct GpuScreenRecorderState {
     pub recorder_pid: Option<u32>,
     pub health: GsrHealth,
     pub target: String,
+    pub target_valid: bool,
     pub output_dir: PathBuf,
     pub output_prefix: PathBuf,
     pub last_output: Option<PathBuf>,
@@ -176,6 +178,7 @@ impl GpuScreenRecorderHandle {
             recorder_pid: None,
             health: GsrHealth::Stopped,
             target: config.target.clone(),
+            target_valid: false,
             output_dir,
             output_prefix,
             last_output: None,
@@ -209,6 +212,7 @@ impl GpuScreenRecorderHandle {
         inner.child = None;
         inner.state.health = GsrHealth::Starting;
         inner.state.last_error = None;
+        refresh_monitors_and_effective_target(&mut inner);
 
         let command_line = match build_gsr_command(&inner.config) {
             Ok(command_line) => command_line,
@@ -375,11 +379,13 @@ impl GpuScreenRecorderHandle {
             inner.state.wrapper_pid = None;
             inner.state.recorder_pid = None;
         }
+        refresh_monitors_snapshot(&mut inner);
         status_from_inner(&inner)
     }
 
     pub async fn status(&self) -> GsrStatus {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
+        refresh_monitors_snapshot(&mut inner);
         status_from_inner(&inner)
     }
 
@@ -775,6 +781,7 @@ fn status_from_inner(inner: &GpuScreenRecorderInner) -> GsrStatus {
         total_saves_completed: inner.state.total_saves_completed,
         total_saves_failed: inner.state.total_saves_failed,
         target: inner.config.target.clone(),
+        target_valid: target_is_valid(&inner.config.target, &inner.state.monitors),
         monitors: inner.state.monitors.clone(),
         command_line,
         output_dir,
@@ -1102,15 +1109,102 @@ fn sanitized_fps(fps: u32) -> u32 {
     fps.clamp(1, 240)
 }
 
+fn refresh_monitors_snapshot(inner: &mut GpuScreenRecorderInner) {
+    inner.state.monitors = list_monitors(&inner.config);
+    inner.state.target = inner.config.target.clone();
+    inner.state.target_valid = target_is_valid(&inner.config.target, &inner.state.monitors);
+}
+
+fn refresh_monitors_and_effective_target(inner: &mut GpuScreenRecorderInner) {
+    let monitors = list_monitors(&inner.config);
+    let requested_target = inner.config.target.clone();
+    let effective_target = select_effective_target(&requested_target, &monitors);
+    if effective_target != requested_target {
+        println!(
+            "[GPU_RECORDER] target '{}' invalid, using '{}'",
+            requested_target, effective_target
+        );
+        inner.config.target = effective_target.clone();
+        inner.state.last_error = Some(format!(
+            "Target GSR '{}' invalide, utilisation automatique de '{}'",
+            requested_target, effective_target
+        ));
+    }
+    inner.state.monitors = monitors;
+    inner.state.target = inner.config.target.clone();
+    inner.state.target_valid = target_is_valid(&inner.config.target, &inner.state.monitors);
+}
+
+fn select_effective_target(requested: &str, monitors: &[String]) -> String {
+    let requested = requested.trim();
+    if target_is_valid(requested, monitors) {
+        return requested.to_owned();
+    }
+    monitors
+        .iter()
+        .find(|monitor| !is_special_capture_target(monitor))
+        .cloned()
+        .or_else(|| monitors.first().cloned())
+        .unwrap_or_else(|| requested.to_owned())
+}
+
+fn target_is_valid(target: &str, monitors: &[String]) -> bool {
+    let target = target.trim();
+    if target.is_empty() {
+        return false;
+    }
+    is_special_capture_target(target) || monitors.iter().any(|monitor| monitor == target)
+}
+
+fn is_special_capture_target(target: &str) -> bool {
+    matches!(target, "portal" | "focused")
+}
+
 fn list_monitors(config: &CaptureConfig) -> Vec<String> {
-    let mut values = vec![
-        config.target.clone(),
-        "portal".to_owned(),
-        "focused".to_owned(),
-    ];
+    let mut values = query_gsr_monitors(config).unwrap_or_default();
+    values.extend(["portal".to_owned(), "focused".to_owned()]);
     values.sort();
     values.dedup();
     values
+}
+
+pub fn query_gsr_monitors(config: &CaptureConfig) -> anyhow::Result<Vec<String>> {
+    let mode = resolve_mode(config.gpu_screen_recorder_mode)?;
+    let output = match mode {
+        GsrMode::Native => Command::new("gpu-screen-recorder")
+            .arg("--list-monitors")
+            .output()
+            .context("failed to run gpu-screen-recorder --list-monitors")?,
+        GsrMode::Flatpak => Command::new("flatpak")
+            .args([
+                "run",
+                "--command=gpu-screen-recorder",
+                FLATPAK_APP_ID,
+                "--list-monitors",
+            ])
+            .output()
+            .context("failed to run flatpak GPU Screen Recorder --list-monitors")?,
+    };
+    if !output.status.success() {
+        anyhow::bail!(
+            "GPU Screen Recorder --list-monitors exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(parse_gsr_monitor_output(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_gsr_monitor_output(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let name = line.split('|').next().unwrap_or(line).trim();
+            (!name.is_empty()).then(|| name.to_owned())
+        })
+        .collect()
 }
 
 fn write_gsr_metadata(
@@ -1795,6 +1889,7 @@ mod tests {
     #[test]
     fn save_replay_sends_signal_to_recorder_pid_not_wrapper_pid() {
         let mut state = GpuScreenRecorderState {
+            target_valid: true,
             mode: Some(GsrMode::Flatpak),
             wrapper_pid: Some(100),
             recorder_pid: Some(101),

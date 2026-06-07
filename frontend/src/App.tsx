@@ -786,6 +786,14 @@ function Configuration() {
   const updateStorage = <K extends keyof AppConfig["storage"]>(key: K, value: AppConfig["storage"][K]) =>
     setDraft({ ...draft, storage: { ...draft.storage, [key]: value } });
 
+  const detectedTargets = Array.from(
+    new Set([
+      ...(runtimeStatus?.gsrMonitors ?? []),
+      draft.capture.target,
+    ].filter(Boolean)),
+  );
+  const targetValid = runtimeStatus?.gsrTargetValid ?? detectedTargets.includes(draft.capture.target);
+
   async function save() {
     const nextConfig = draft;
     if (!nextConfig) {
@@ -846,7 +854,25 @@ function Configuration() {
 
       <ConfigSection title="GPU Screen Recorder">
         <Field label="Target">
-          <input value={draft.capture.target} onChange={(event) => updateCapture("target", event.target.value)} />
+          {detectedTargets.length > 0 ? (
+            <select
+              value={draft.capture.target}
+              onChange={(event) => updateCapture("target", event.target.value)}
+            >
+              {detectedTargets.map((target) => (
+                <option key={target} value={target}>
+                  {target}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input value={draft.capture.target} onChange={(event) => updateCapture("target", event.target.value)} />
+          )}
+          <p className={targetValid ? "help-text" : "help-text warning-text"}>
+            {targetValid
+              ? `Target valide${runtimeStatus?.gsrMonitors?.length ? ` · détectés: ${runtimeStatus.gsrMonitors.join(", ")}` : ""}`
+              : `Target introuvable. Sélectionne une valeur détectée${runtimeStatus?.gsrMonitors?.length ? `: ${runtimeStatus.gsrMonitors.join(", ")}` : "."}`}
+          </p>
         </Field>
         <Field label="Mode">
           <select value={draft.capture.mode} onChange={(event) => updateCapture("mode", event.target.value as AppConfig["capture"]["mode"])}>
@@ -1140,6 +1166,8 @@ function Diagnostics() {
           <KeyValue label="PID recorder" value={runtimeStatus?.gsrRecorderPid ?? "-"} />
           <KeyValue label="PID signal" value={runtimeStatus?.gsrSignalPid ?? "-"} />
           <KeyValue label="Target" value={runtimeStatus?.gsrTarget ?? "-"} />
+          <KeyValue label="Target valide" value={runtimeStatus?.gsrTargetValid ? "Oui" : "Non"} />
+          <KeyValue label="Targets détectées" value={runtimeStatus?.gsrMonitors?.join(", ") || "-"} />
           <KeyValue label="FPS" value={runtimeStatus?.gsrFps ?? "-"} />
           <KeyValue label="Replay seconds" value={runtimeStatus?.gsrReplaySeconds ?? "-"} />
           <KeyValue label="Quality" value={runtimeStatus?.gsrQuality ?? "-"} />

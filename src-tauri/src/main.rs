@@ -229,6 +229,7 @@ struct RuntimeStatus {
     gsr_signal_pid: Option<u32>,
     gsr_mode: Option<String>,
     gsr_target: String,
+    gsr_target_valid: bool,
     gsr_monitors: Vec<String>,
     gsr_command_line: Option<String>,
     gsr_recorder_command_line: Option<String>,
@@ -292,6 +293,7 @@ impl RuntimeStatus {
             gsr_signal_pid: None,
             gsr_mode: None,
             gsr_target: config.capture.target.clone(),
+            gsr_target_valid: false,
             gsr_monitors: Vec::new(),
             gsr_command_line: None,
             gsr_recorder_command_line: None,
@@ -360,6 +362,8 @@ async fn save_config(
     if let Ok(mut status) = state.runtime_status.lock() {
         status.config_restart_required = result.restart_required;
         status.gsr_target = status_config.capture.target.clone();
+        status.gsr_target_valid = status.gsr_monitors.iter().any(|monitor| monitor == &status_config.capture.target)
+            || matches!(status_config.capture.target.as_str(), "portal" | "focused");
         status.gsr_replay_seconds = status_config.capture.replay_seconds;
         status.gsr_fps = status_config.capture.fps;
         status.gsr_quality = status_config.capture.quality.as_arg().to_owned();
@@ -879,6 +883,7 @@ fn apply_gsr_runtime_status(status: &mut RuntimeStatus, gsr: &GsrStatus) {
         .mode
         .map(|mode| format!("{mode:?}").to_ascii_lowercase());
     status.gsr_target = gsr.target.clone();
+    status.gsr_target_valid = gsr.target_valid;
     status.gsr_monitors = gsr.monitors.clone();
     status.gsr_command_line = gsr.command_line.clone();
     status.gsr_recorder_command_line = gsr.recorder_command_line.clone();

@@ -1827,6 +1827,10 @@ select {
   line-height: 1.5;
 }
 
+.warning-text {
+  color: #ffb86b;
+}
+
 .kv {
   min-width: 0;
   border: 1px solid rgba(255,255,255,.08);

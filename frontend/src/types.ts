@@ -230,6 +230,7 @@ export type RuntimeStatus = {
   gsrSignalPid?: number | null;
   gsrMode?: string | null;
   gsrTarget: string;
+  gsrTargetValid: boolean;
   gsrMonitors: string[];
   gsrCommandLine?: string | null;
   gsrRecorderCommandLine?: string | null;

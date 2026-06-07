@@ -441,7 +441,7 @@ multi_kill_window_seconds = 8
 output_dir = "~/Videos/WarThunder Clips"
 
 [capture]
-target = "eDP"
+target = ""
 mode = "flatpak"
 fps = 60
 replay_seconds = 25
@@ -510,7 +510,7 @@ fn default_capture_audio_input() -> String {
 }
 
 fn default_capture_target() -> String {
-    "eDP".to_owned()
+    String::new()
 }
 
 fn default_capture_replay_seconds() -> u64 {
