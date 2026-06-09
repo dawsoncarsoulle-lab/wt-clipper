@@ -231,6 +231,9 @@ struct RuntimeStatus {
     gsr_target: String,
     gsr_target_valid: bool,
     gsr_monitors: Vec<String>,
+    gsr_capture_strategy: String,
+    gsr_session_type: String,
+    gsr_target_reason: String,
     gsr_command_line: Option<String>,
     gsr_recorder_command_line: Option<String>,
     gsr_stderr_handling: String,
@@ -295,6 +298,9 @@ impl RuntimeStatus {
             gsr_target: config.capture.target.clone(),
             gsr_target_valid: false,
             gsr_monitors: Vec::new(),
+            gsr_capture_strategy: format!("{:?}", config.capture.capture_strategy).to_ascii_lowercase(),
+            gsr_session_type: std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".to_owned()),
+            gsr_target_reason: "configured".to_owned(),
             gsr_command_line: None,
             gsr_recorder_command_line: None,
             gsr_stderr_handling: "null".to_owned(),
@@ -896,6 +902,9 @@ fn apply_gsr_runtime_status(status: &mut RuntimeStatus, gsr: &GsrStatus) {
     status.gsr_target = gsr.target.clone();
     status.gsr_target_valid = gsr.target_valid;
     status.gsr_monitors = gsr.monitors.clone();
+    status.gsr_capture_strategy = gsr.capture_strategy.clone();
+    status.gsr_session_type = gsr.session_type.clone();
+    status.gsr_target_reason = gsr.target_reason.clone();
     status.gsr_command_line = gsr.command_line.clone();
     status.gsr_recorder_command_line = gsr.recorder_command_line.clone();
     status.gsr_stderr_handling = gsr.stderr_handling.clone();
