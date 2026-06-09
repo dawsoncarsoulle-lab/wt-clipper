@@ -38,6 +38,8 @@ pub struct LibraryConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct CaptureConfig {
+    #[serde(default = "default_capture_strategy")]
+    pub capture_strategy: CaptureStrategy,
     #[serde(default = "default_capture_target")]
     pub target: String,
     #[serde(default, alias = "gpu_screen_recorder_mode", rename = "mode")]
@@ -70,6 +72,29 @@ pub struct CaptureConfig {
     pub audio_enabled: bool,
     #[serde(default = "default_capture_audio_input")]
     pub audio_input: String,
+}
+
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureStrategy {
+    /// Pick the best capture target for the current session.
+    /// X11: try the War Thunder window after the localhost API is reachable, then fallback to monitor.
+    /// Wayland: use the system portal when available after the localhost API is reachable, then fallback to monitor.
+    #[default]
+    Auto,
+    /// Always capture the configured monitor/target.
+    Monitor,
+    /// Capture the currently focused window. Advanced fallback mode.
+    Focused,
+    /// Use desktop portal. Mainly useful on Wayland; unsupported by GSR on X11.
+    Portal,
+}
+
+impl CaptureStrategy {
+    pub fn should_wait_for_war_thunder(self) -> bool {
+        matches!(self, Self::Auto | Self::Portal)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -249,6 +274,7 @@ impl Default for LibraryConfig {
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
+            capture_strategy: default_capture_strategy(),
             target: default_capture_target(),
             gpu_screen_recorder_mode: GpuScreenRecorderMode::Flatpak,
             fps: default_gsr_fps(),
@@ -441,6 +467,7 @@ multi_kill_window_seconds = 8
 output_dir = "~/Videos/WarThunder Clips"
 
 [capture]
+capture_strategy = "auto"
 target = ""
 mode = "flatpak"
 fps = 60
@@ -507,6 +534,10 @@ fn default_capture_audio_enabled() -> bool {
 
 fn default_capture_audio_input() -> String {
     "default_output".to_owned()
+}
+
+fn default_capture_strategy() -> CaptureStrategy {
+    CaptureStrategy::Auto
 }
 
 fn default_capture_target() -> String {

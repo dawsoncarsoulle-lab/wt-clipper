@@ -185,6 +185,7 @@ export type AppConfig = {
     output_dir: string;
   };
   capture: {
+    capture_strategy: "auto" | "monitor" | "focused" | "portal";
     target: string;
     mode: "auto" | "native" | "flatpak";
     fps: number;
@@ -243,6 +244,9 @@ export type RuntimeStatus = {
   gsrTarget: string;
   gsrTargetValid: boolean;
   gsrMonitors: string[];
+  gsrCaptureStrategy: string;
+  gsrSessionType: string;
+  gsrTargetReason: string;
   gsrCommandLine?: string | null;
   gsrRecorderCommandLine?: string | null;
   gsrStderrHandling: string;

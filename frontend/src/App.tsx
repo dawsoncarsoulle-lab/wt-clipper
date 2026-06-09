@@ -76,6 +76,14 @@ const statusLabel: Record<ClipStatus, string> = {
   failed: "Erreur",
 };
 
+function isWaitingForWarThunder(status?: RuntimeStatus | null) {
+  return (
+    status?.gsrCaptureStrategy === "auto" &&
+    status?.gsrHealth === "stopped" &&
+    status?.gsrTargetReason?.toLowerCase().includes("waiting for war thunder")
+  );
+}
+
 function gsrHealthLabel(health?: GsrHealth | null) {
   switch (health) {
     case "running":
@@ -92,6 +100,13 @@ function gsrHealthLabel(health?: GsrHealth | null) {
     default:
       return "Arrêté";
   }
+}
+
+function gsrStatusLabel(status?: RuntimeStatus | null) {
+  if (isWaitingForWarThunder(status)) {
+    return "En attente de War Thunder";
+  }
+  return gsrHealthLabel(status?.gsrHealth);
 }
 
 export function App() {
@@ -307,7 +322,7 @@ function Topbar() {
         <StatusPill connected={wtConnected} />
         <span className={`status-chip ${runtimeStatus?.gsrHealth === "running" ? "ok" : "warn"}`}>
           <Cpu size={15} />
-          {gsrHealthLabel(runtimeStatus?.gsrHealth)}
+          {gsrStatusLabel(runtimeStatus)}
         </span>
         <img className="topbar-logo" src={appLogo} alt="WT Clip" />
       </div>
@@ -334,7 +349,7 @@ function Dashboard() {
           <span className="eyebrow">Backend actif</span>
           <h2>GPU Screen Recorder</h2>
           <p>
-            {gsrHealthLabel(status?.gsrHealth)} · {status?.gsrMode ?? state.config?.capture.mode ?? "auto"} ·{" "}
+            {gsrStatusLabel(status)} · {status?.gsrMode ?? state.config?.capture.mode ?? "auto"} ·{" "}
             {status?.gsrTarget ?? state.config?.capture.target ?? "target non configurée"}
           </p>
         </div>
@@ -853,7 +868,21 @@ function Configuration() {
       </ConfigSection>
 
       <ConfigSection title="GPU Screen Recorder">
-        <Field label="Target">
+        <Field label="Stratégie capture">
+          <select
+            value={draft.capture.capture_strategy}
+            onChange={(event) => updateCapture("capture_strategy", event.target.value as AppConfig["capture"]["capture_strategy"])}
+          >
+            <option value="auto">Automatique recommandé</option>
+            <option value="monitor">Moniteur entier</option>
+            <option value="focused">Fenêtre active</option>
+            <option value="portal">Sélection système / portal</option>
+          </select>
+          <p className="help-text">
+            Auto attend que l'API War Thunder soit détectée avant de résoudre la cible: fenêtre War Thunder sur X11, portal sur Wayland, sinon fallback moniteur.
+          </p>
+        </Field>
+        <Field label={draft.capture.capture_strategy === "monitor" ? "Target" : "Target fallback"}>
           {detectedTargets.length > 0 ? (
             <select
               value={draft.capture.target}
@@ -1160,12 +1189,15 @@ function Diagnostics() {
         </div>
         <div className="kv-grid">
           <KeyValue label="Disponible" value={runtimeStatus?.gsrAvailable ? "Oui" : "Non"} />
-          <KeyValue label="État" value={gsrHealthLabel(runtimeStatus?.gsrHealth)} />
+          <KeyValue label="État" value={gsrStatusLabel(runtimeStatus)} />
           <KeyValue label="Mode" value={runtimeStatus?.gsrMode ?? "-"} />
           <KeyValue label="PID wrapper" value={runtimeStatus?.gsrWrapperPid ?? "-"} />
           <KeyValue label="PID recorder" value={runtimeStatus?.gsrRecorderPid ?? "-"} />
           <KeyValue label="PID signal" value={runtimeStatus?.gsrSignalPid ?? "-"} />
-          <KeyValue label="Target" value={runtimeStatus?.gsrTarget ?? "-"} />
+          <KeyValue label="Stratégie capture" value={runtimeStatus?.gsrCaptureStrategy ?? "-"} />
+          <KeyValue label="Session graphique" value={runtimeStatus?.gsrSessionType ?? "-"} />
+          <KeyValue label="Target effective" value={runtimeStatus?.gsrTarget ?? "-"} />
+          <KeyValue label="Raison target" value={runtimeStatus?.gsrTargetReason ?? "-"} />
           <KeyValue label="Target valide" value={runtimeStatus?.gsrTargetValid ? "Oui" : "Non"} />
           <KeyValue label="Targets détectées" value={runtimeStatus?.gsrMonitors?.join(", ") || "-"} />
           <KeyValue label="FPS" value={runtimeStatus?.gsrFps ?? "-"} />

@@ -19,3 +19,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
+x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code"] }

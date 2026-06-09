@@ -16,7 +16,7 @@ use crate::{
         clip_types::{ClipContext, ClipReason},
         events::{AppEvent, ClipStatus, ClipStatusPayload},
     },
-    capture::gpu_screen_recorder::{GpuScreenRecorderHandle, SavedGsrReplay},
+    capture::gpu_screen_recorder::{GpuScreenRecorderHandle, GsrHealth, SavedGsrReplay},
     config::{AppConfig, CaptureConfig, TriggerConfig, WarThunderConfig},
     warthunder::{
         client::{ChatMessage, WarThunderClient},
@@ -231,7 +231,13 @@ pub async fn run_auto_clip(
 ) -> anyhow::Result<()> {
     let mut command_rx = auto_config.command_rx.take();
     let gsr = GpuScreenRecorderHandle::new(auto_config.capture.clone());
-    if let Err(error) = gsr.start().await {
+    if auto_config.capture.capture_strategy.should_wait_for_war_thunder() {
+        gsr.mark_waiting_for_war_thunder().await;
+        println!(
+            "[CAPTURE] strategy={:?}: waiting for War Thunder localhost before resolving capture target",
+            auto_config.capture.capture_strategy
+        );
+    } else if let Err(error) = gsr.start().await {
         let message = format!("GPU Screen Recorder: {error}");
         error!(%message, "failed to start GSR backend");
         send_ui_event(
@@ -312,7 +318,12 @@ pub async fn run_auto_clip(
                         let _ = respond_to.send(result.map_err(|error| error.to_string()));
                     }
                     AutoClipCommand::RestartGpuRecorder => {
-                        if let Err(error) = gsr.restart(None, "manual GPU Screen Recorder restart request").await {
+                        if auto_config.capture.capture_strategy.should_wait_for_war_thunder()
+                            && last_wt_connected != Some(true)
+                        {
+                            let message = "War Thunder n'est pas encore détecté; GPU Screen Recorder démarrera automatiquement quand l'API localhost sera disponible.".to_owned();
+                            send_ui_event(&auto_config, AppEvent::ClipFailed { message });
+                        } else if let Err(error) = gsr.restart(None, "manual GPU Screen Recorder restart request").await {
                             send_ui_event(
                                 &auto_config,
                                 AppEvent::ClipFailed {
@@ -327,24 +338,32 @@ pub async fn run_auto_clip(
                         let mut response = apply_runtime_config(&mut auto_config, &config);
                         configured_post_event_delay = auto_config.post_event_delay;
                         effective_save_delay = configured_post_event_delay;
-                        match gsr.update_config_and_restart_if_needed(capture_config).await {
-                            Ok(restarted) => {
-                                response.restart_required = false;
-                                response.message = if restarted {
-                                    "Configuration appliquée; GPU Screen Recorder redémarré avec la nouvelle commande.".to_owned()
-                                } else {
-                                    "Configuration appliquée au backend GPU Screen Recorder.".to_owned()
-                                };
-                            }
-                            Err(error) => {
-                                response.restart_required = true;
-                                response.message = format!("Configuration sauvegardée; redémarrage GPU Screen Recorder impossible: {error}");
-                                send_ui_event(
-                                    &auto_config,
-                                    AppEvent::ClipFailed {
-                                        message: response.message.clone(),
-                                    },
-                                );
+                        if auto_config.capture.capture_strategy.should_wait_for_war_thunder()
+                            && last_wt_connected != Some(true)
+                        {
+                            gsr.update_config_without_restart(capture_config).await;
+                            response.restart_required = false;
+                            response.message = "Configuration appliquée; GSR attend War Thunder avant de résoudre la cible capture.".to_owned();
+                        } else {
+                            match gsr.update_config_and_restart_if_needed(capture_config).await {
+                                Ok(restarted) => {
+                                    response.restart_required = false;
+                                    response.message = if restarted {
+                                        "Configuration appliquée; GPU Screen Recorder redémarré avec la nouvelle commande.".to_owned()
+                                    } else {
+                                        "Configuration appliquée au backend GPU Screen Recorder.".to_owned()
+                                    };
+                                }
+                                Err(error) => {
+                                    response.restart_required = true;
+                                    response.message = format!("Configuration sauvegardée; redémarrage GPU Screen Recorder impossible: {error}");
+                                    send_ui_event(
+                                        &auto_config,
+                                        AppEvent::ClipFailed {
+                                            message: response.message.clone(),
+                                        },
+                                    );
+                                }
                             }
                         }
                         send_gsr_status(&auto_config, &gsr).await;
@@ -364,6 +383,9 @@ pub async fn run_auto_clip(
                         },
                     );
                     last_wt_connected = Some(wt_connected);
+                    if wt_connected {
+                        ensure_gsr_started_after_war_thunder_connected(&gsr, &auto_config).await;
+                    }
                 }
                 for detected in events {
                     let event = detected.event;
@@ -471,6 +493,26 @@ pub async fn run_auto_clip(
         debug!(%error, "failed to stop GPU Screen Recorder after auto-clip error");
     }
     result
+}
+
+
+async fn ensure_gsr_started_after_war_thunder_connected(
+    gsr: &GpuScreenRecorderHandle,
+    auto_config: &AutoClipConfig,
+) {
+    let status = gsr.status().await;
+    if matches!(status.health, GsrHealth::Running | GsrHealth::SavingReplay | GsrHealth::Starting) {
+        return;
+    }
+    println!(
+        "[CAPTURE] War Thunder localhost detected; resolving capture target and starting GSR"
+    );
+    if let Err(error) = gsr.start().await {
+        let message = format!("GPU Screen Recorder: {error}");
+        error!(%message, "failed to start GSR after War Thunder localhost connection");
+        send_ui_event(auto_config, AppEvent::ClipFailed { message });
+    }
+    send_gsr_status(auto_config, gsr).await;
 }
 
 fn schedule_pending_clip(
