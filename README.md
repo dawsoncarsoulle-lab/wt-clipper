@@ -10,7 +10,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/dawsoncarsoulle-lab/wt-clipper/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/dawsoncarsoulle-lab/wt-clipper?include_prereleases&style=for-the-badge"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge"></a>
   <img alt="Linux" src="https://img.shields.io/badge/platform-Linux-2ea44f?style=for-the-badge">
   <img alt="Status" src="https://img.shields.io/badge/status-beta-orange?style=for-the-badge">
