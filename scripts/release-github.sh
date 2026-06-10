@@ -1,184 +1,254 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Publish a WT Clip GitHub release that is compatible with the Tauri updater.
-# Usage:
-#   ./scripts/release-github.sh 0.2.3
-#
-# Requirements:
-#   - gh authenticated: gh auth login
-#   - jq installed
-#   - Tauri updater private key available either as:
-#       TAURI_SIGNING_PRIVATE_KEY
-#     or in:
-#       ~/.local/share/wt-clipper/updater.key
-#
-# Important:
-#   The installed app checks:
-#   https://github.com/dawsoncarsoulle-lab/wt-clipper/releases/latest/download/latest.json
-#   so this release must be published as the latest GitHub release.
-
-VERSION="${1:-}"
-if [[ -z "$VERSION" ]]; then
-  echo "Usage: $0 <version>" >&2
-  echo "Example: $0 0.2.3" >&2
+if [ $# -ne 1 ]; then
+  echo "Usage: $0 <version>"
+  echo "Example: $0 0.2.3"
   exit 1
 fi
 
-TAG="v${VERSION#v}"
-VERSION="${VERSION#v}"
-REPO="${GITHUB_REPOSITORY:-dawsoncarsoulle-lab/wt-clipper}"
-RELEASE_TITLE="WT Clip ${TAG}"
-NOTES_FILE="${NOTES_FILE:-/tmp/wt-clip-release-notes-${VERSION}.md}"
-KEY_PATH="${WT_CLIPPER_UPDATER_KEY_PATH:-$HOME/.local/share/wt-clipper/updater.key}"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUNDLE_DIR="$ROOT/src-tauri/target/release/bundle"
+VERSION="$1"
+TAG="v${VERSION}"
 
-cd "$ROOT"
+REPO="dawsoncarsoulle-lab/wt-clipper"
+APP_NAME="WT.Clipper"
 
-need_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "Missing required command: $1" >&2
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+echo "==> Release ${TAG}"
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+require_command() {
+  if ! command_exists "$1"; then
+    echo "Missing required command: $1"
     exit 1
   fi
 }
 
-need_cmd git
-need_cmd gh
-need_cmd jq
-need_cmd npm
-need_cmd cargo
+require_command git
+require_command cargo
+require_command npm
+require_command gh
+require_command curl
+require_command jq
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  echo "Working tree is not clean. Commit or stash your changes before releasing." >&2
-  git status --short >&2
+echo "==> Validating git state"
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "Git working tree is not clean."
+  echo
+  git status --short
+  echo
+  echo "Commit or stash your changes before releasing."
   exit 1
 fi
 
-TAURI_VERSION="$(jq -r '.version' src-tauri/tauri.conf.json)"
-if [[ "$TAURI_VERSION" != "$VERSION" ]]; then
-  echo "Version mismatch:" >&2
-  echo "  requested: $VERSION" >&2
-  echo "  src-tauri/tauri.conf.json: $TAURI_VERSION" >&2
-  echo "Fix the project version before releasing." >&2
+CURRENT_BRANCH="$(git branch --show-current)"
+if [ "$CURRENT_BRANCH" != "main" ]; then
+  echo "You are on branch '$CURRENT_BRANCH', not 'main'."
+  echo "Switch to main before releasing."
   exit 1
 fi
 
-if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
-  if [[ ! -f "$KEY_PATH" ]]; then
-    echo "Missing Tauri updater signing key." >&2
-    echo "Expected: $KEY_PATH" >&2
-    echo "Or export TAURI_SIGNING_PRIVATE_KEY manually." >&2
+echo "==> Validating project version"
+
+if [ -f "src-tauri/tauri.conf.json" ]; then
+  TAURI_VERSION="$(jq -r '.version // empty' src-tauri/tauri.conf.json)"
+  if [ "$TAURI_VERSION" != "$VERSION" ]; then
+    echo "src-tauri/tauri.conf.json version is '$TAURI_VERSION', expected '$VERSION'."
     exit 1
   fi
-  export TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY_PATH")"
 fi
 
-# Empty password is valid when the key was generated without a password.
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
+if [ -f "frontend/package.json" ]; then
+  FRONTEND_VERSION="$(jq -r '.version // empty' frontend/package.json)"
+  if [ "$FRONTEND_VERSION" != "$VERSION" ]; then
+    echo "frontend/package.json version is '$FRONTEND_VERSION', expected '$VERSION'."
+    exit 1
+  fi
+fi
 
-echo "==> Validating project"
+if [ -f "src-tauri/Cargo.toml" ]; then
+  if ! grep -q "^version = \"${VERSION}\"" src-tauri/Cargo.toml; then
+    echo "src-tauri/Cargo.toml does not seem to be version '$VERSION'."
+    exit 1
+  fi
+fi
+
+echo "==> Running checks"
+
 cargo fmt --check
 cargo check
 cargo test
 npm --prefix frontend run build
 
-echo "==> Building signed Tauri bundles for ${TAG}"
+echo "==> Building signed Tauri bundles"
+
 cargo tauri build
 
-if [[ ! -d "$BUNDLE_DIR" ]]; then
-  echo "Bundle directory not found: $BUNDLE_DIR" >&2
+BUNDLE_DIR="src-tauri/target/release/bundle"
+DEB_ORIGINAL="$(find "$BUNDLE_DIR/deb" -maxdepth 1 -type f -name "*.deb" | head -n 1 || true)"
+RPM_ORIGINAL="$(find "$BUNDLE_DIR/rpm" -maxdepth 1 -type f -name "*.rpm" | head -n 1 || true)"
+
+if [ -z "$DEB_ORIGINAL" ]; then
+  echo "No .deb bundle found in $BUNDLE_DIR/deb"
   exit 1
 fi
 
-mapfile -t ASSETS < <(
-  find "$BUNDLE_DIR" -type f \
-    \( -name "*.deb" -o -name "*.rpm" -o -name "*.sig" -o -name "latest.json" \) \
-    | sort
+if [ ! -f "${DEB_ORIGINAL}.sig" ]; then
+  echo "No updater signature found for .deb:"
+  echo "${DEB_ORIGINAL}.sig"
+  exit 1
+fi
+
+echo "==> Normalizing asset names"
+
+RELEASE_ASSET_DIR="target/release-assets/${TAG}"
+rm -rf "$RELEASE_ASSET_DIR"
+mkdir -p "$RELEASE_ASSET_DIR"
+
+DEB_ASSET_NAME="${APP_NAME}_${VERSION}_amd64.deb"
+DEB_SIG_ASSET_NAME="${DEB_ASSET_NAME}.sig"
+
+DEB_ASSET_PATH="${RELEASE_ASSET_DIR}/${DEB_ASSET_NAME}"
+DEB_SIG_ASSET_PATH="${RELEASE_ASSET_DIR}/${DEB_SIG_ASSET_NAME}"
+
+cp "$DEB_ORIGINAL" "$DEB_ASSET_PATH"
+cp "${DEB_ORIGINAL}.sig" "$DEB_SIG_ASSET_PATH"
+
+UPLOAD_ASSETS=(
+  "$DEB_ASSET_PATH"
+  "$DEB_SIG_ASSET_PATH"
 )
 
-if [[ "${#ASSETS[@]}" -eq 0 ]]; then
-  echo "No release assets found under $BUNDLE_DIR" >&2
-  exit 1
+if [ -n "$RPM_ORIGINAL" ] && [ -f "${RPM_ORIGINAL}.sig" ]; then
+  RPM_ASSET_NAME="${APP_NAME}-${VERSION}-1.x86_64.rpm"
+  RPM_SIG_ASSET_NAME="${RPM_ASSET_NAME}.sig"
+
+  RPM_ASSET_PATH="${RELEASE_ASSET_DIR}/${RPM_ASSET_NAME}"
+  RPM_SIG_ASSET_PATH="${RELEASE_ASSET_DIR}/${RPM_SIG_ASSET_NAME}"
+
+  cp "$RPM_ORIGINAL" "$RPM_ASSET_PATH"
+  cp "${RPM_ORIGINAL}.sig" "$RPM_SIG_ASSET_PATH"
+
+  UPLOAD_ASSETS+=(
+    "$RPM_ASSET_PATH"
+    "$RPM_SIG_ASSET_PATH"
+  )
 fi
 
-LATEST_JSON=""
-for asset in "${ASSETS[@]}"; do
-  if [[ "$(basename "$asset")" == "latest.json" ]]; then
-    LATEST_JSON="$asset"
-  fi
-done
+echo "==> Generating latest.json"
 
-if [[ -z "$LATEST_JSON" ]]; then
-  echo "latest.json was not generated. The updater will not work without it." >&2
-  exit 1
-fi
+SIG_CONTENT="$(cat "$DEB_SIG_ASSET_PATH")"
 
-jq -e '.version | type == "string" and length > 0' "$LATEST_JSON" >/dev/null
-jq -e '.platforms["linux-x86_64"].url | type == "string" and length > 0' "$LATEST_JSON" >/dev/null
-jq -e '.platforms["linux-x86_64"].signature | type == "string" and length > 0' "$LATEST_JSON" >/dev/null
+LATEST_JSON="${RELEASE_ASSET_DIR}/latest.json"
 
-JSON_VERSION="$(jq -r '.version' "$LATEST_JSON")"
-if [[ "$JSON_VERSION" != "$VERSION" ]]; then
-  echo "latest.json version mismatch:" >&2
-  echo "  requested: $VERSION" >&2
-  echo "  latest.json: $JSON_VERSION" >&2
-  exit 1
-fi
+cat > "$LATEST_JSON" <<EOF
+{
+  "version": "${VERSION}",
+  "notes": "Automatic capture target strategy, X11 and Wayland capture improvements, frontend internationalization, and README improvements.",
+  "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "platforms": {
+    "linux-x86_64": {
+      "signature": "${SIG_CONTENT}",
+      "url": "https://github.com/${REPO}/releases/download/${TAG}/${DEB_ASSET_NAME}"
+    }
+  }
+}
+EOF
 
-echo "==> Assets to upload"
-printf ' - %s\n' "${ASSETS[@]}"
+jq . "$LATEST_JSON" >/dev/null
 
-if [[ ! -f "$NOTES_FILE" ]]; then
-  cat > "$NOTES_FILE" <<NOTES
-## WT Clip ${TAG}
+UPLOAD_ASSETS+=("$LATEST_JSON")
 
-### Highlights
+echo "==> Assets prepared"
 
-- Automatic capture target strategy improvements.
-- Frontend internationalization.
-- Better X11 and Wayland capture flow.
-- Improved waiting state before War Thunder is launched.
+printf '%s\n' "${UPLOAD_ASSETS[@]}"
 
-### Update test
+echo "==> Creating or updating git tag"
 
-This release is intended to be detected by installed WT Clip builds through the Tauri updater endpoint.
-NOTES
-fi
-
-if ! git rev-parse "$TAG" >/dev/null 2>&1; then
-  echo "==> Creating git tag ${TAG}"
+if git rev-parse "$TAG" >/dev/null 2>&1; then
+  echo "Local tag $TAG already exists."
+else
   git tag "$TAG"
 fi
 
-if ! git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
-  echo "==> Pushing tag ${TAG}"
+if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+  echo "Remote tag $TAG already exists."
+else
   git push origin "$TAG"
 fi
 
-echo "==> Pushing current branch"
-git push
+echo "==> Creating or updating GitHub release"
 
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-  echo "==> Release ${TAG} already exists, uploading assets with --clobber"
-  gh release upload "$TAG" "${ASSETS[@]}" --repo "$REPO" --clobber
+  echo "Release $TAG already exists. Uploading assets with --clobber."
+  gh release upload "$TAG" "${UPLOAD_ASSETS[@]}" --repo "$REPO" --clobber
 else
-  echo "==> Creating GitHub release ${TAG}"
   gh release create "$TAG" \
-    "${ASSETS[@]}" \
     --repo "$REPO" \
-    --title "$RELEASE_TITLE" \
-    --notes-file "$NOTES_FILE" \
-    --latest
+    --title "WT Clip ${TAG}" \
+    --notes "Automatic capture target strategy, X11 and Wayland capture improvements, frontend internationalization, and README improvements." \
+    "${UPLOAD_ASSETS[@]}"
 fi
+
+echo "==> Marking release as latest"
+
+gh release edit "$TAG" --repo "$REPO" --latest
 
 echo "==> Validating public updater endpoint"
-if [[ -x "$ROOT/scripts/validate-latest-json.sh" ]]; then
-  "$ROOT/scripts/validate-latest-json.sh"
-else
-  ENDPOINT="$(jq -r '.plugins.updater.endpoints[0]' src-tauri/tauri.conf.json)"
-  curl -fsSL "$ENDPOINT" | jq . >/dev/null
+
+LATEST_URL="https://github.com/${REPO}/releases/latest/download/latest.json"
+DEB_URL="https://github.com/${REPO}/releases/download/${TAG}/${DEB_ASSET_NAME}"
+
+echo "Checking latest.json:"
+echo "$LATEST_URL"
+
+curl -sS -L "$LATEST_URL" -o /tmp/wtclip_latest.json
+
+REMOTE_VERSION="$(jq -r '.version' /tmp/wtclip_latest.json)"
+REMOTE_URL="$(jq -r '.platforms["linux-x86_64"].url' /tmp/wtclip_latest.json)"
+REMOTE_SIGNATURE="$(jq -r '.platforms["linux-x86_64"].signature' /tmp/wtclip_latest.json)"
+
+if [ "$REMOTE_VERSION" != "$VERSION" ]; then
+  echo "Remote latest.json version is '$REMOTE_VERSION', expected '$VERSION'."
+  cat /tmp/wtclip_latest.json
+  exit 1
 fi
 
-echo "Release ${TAG} published successfully."
-echo "Now launch the installed WT Clip ${VERSION} updater test from the old installed app, not from cargo run."
+if [ "$REMOTE_URL" != "$DEB_URL" ]; then
+  echo "Remote latest.json URL is wrong."
+  echo "Expected: $DEB_URL"
+  echo "Got:      $REMOTE_URL"
+  cat /tmp/wtclip_latest.json
+  exit 1
+fi
+
+if [ -z "$REMOTE_SIGNATURE" ] || [ "$REMOTE_SIGNATURE" = "null" ]; then
+  echo "Remote latest.json signature is missing."
+  cat /tmp/wtclip_latest.json
+  exit 1
+fi
+
+echo "Checking .deb download:"
+echo "$DEB_URL"
+
+HTTP_CODE="$(curl -sS -L -o /dev/null -w "%{http_code}" "$DEB_URL")"
+
+if [ "$HTTP_CODE" != "200" ]; then
+  echo ".deb URL returned HTTP $HTTP_CODE"
+  exit 1
+fi
+
+echo
+echo "Release ${TAG} is ready."
+echo
+echo "Updater endpoint:"
+echo "$LATEST_URL"
+echo
+echo "Package URL:"
+echo "$DEB_URL"
