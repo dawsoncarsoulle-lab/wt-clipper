@@ -23,6 +23,8 @@ import {
   Zap,
 } from "lucide-react";
 import { ClipEditorModal } from "./components/ClipEditorModal";
+import { LanguageSelector } from "./components/LanguageSelector";
+import { useI18n } from "./i18n/I18nProvider";
 import appLogo from "./assets/brand/WT_clipper_brand.png";
 import {
   galleryBadgeClass,
@@ -47,34 +49,44 @@ import type {
 } from "./types";
 
 const nav = [
-  { id: "dashboard", label: "Tableau", icon: Home },
-  { id: "clips", label: "Clips", icon: Video },
-  { id: "config", label: "Configuration", icon: Settings },
-  { id: "diagnostics", label: "Diagnostics", icon: Activity },
+  { id: "dashboard", labelKey: "nav.dashboard", icon: Home },
+  { id: "clips", labelKey: "nav.clips", icon: Video },
+  { id: "config", labelKey: "nav.config", icon: Settings },
+  { id: "diagnostics", labelKey: "nav.diagnostics", icon: Activity },
 ] as const;
+
+type Translate = ReturnType<typeof useI18n>["t"];
 
 const GALLERY_CACHE_TTL_MS = 10_000;
 const GALLERY_REFRESH_DEBOUNCE_MS = 800;
 const GALLERY_AUTO_REFRESH_MS = 5000;
 const HOVER_PREVIEW_START_SECONDS = 0.75;
 
-const reasonLabel: Record<ClipReason, string> = {
-  target_destroyed: "Cible détruite",
-  base_destroyed: "Base détruite",
-  player_destroyed: "Joueur détruit",
-  multi_kill: "Multi-kill",
-  manual: "Manuel",
-  unknown: "Clip",
+const reasonLabelKey: Record<ClipReason, string> = {
+  target_destroyed: "reason.target_destroyed",
+  base_destroyed: "reason.base_destroyed",
+  player_destroyed: "reason.player_destroyed",
+  multi_kill: "reason.multi_kill",
+  manual: "reason.manual",
+  unknown: "reason.unknown",
 };
 
-const statusLabel: Record<ClipStatus, string> = {
-  detected: "Détecté",
-  recording: "Capture",
-  encoding: "Encodage",
-  saving: "Sauvegarde",
-  ready: "Prêt",
-  failed: "Erreur",
+const statusLabelKey: Record<ClipStatus, string> = {
+  detected: "clipStatus.detected",
+  recording: "clipStatus.recording",
+  encoding: "clipStatus.encoding",
+  saving: "clipStatus.saving",
+  ready: "clipStatus.ready",
+  failed: "clipStatus.failed",
 };
+
+function reasonLabel(reason: ClipReason, t: Translate) {
+  return t(reasonLabelKey[reason] ?? "events.generic");
+}
+
+function clipStatusLabel(status: ClipStatus, t: Translate) {
+  return t(statusLabelKey[status] ?? "clipStatus.ready");
+}
 
 function isWaitingForWarThunder(status?: RuntimeStatus | null) {
   return (
@@ -84,33 +96,34 @@ function isWaitingForWarThunder(status?: RuntimeStatus | null) {
   );
 }
 
-function gsrHealthLabel(health?: GsrHealth | null) {
+function gsrHealthLabel(health: GsrHealth | null | undefined, t: Translate) {
   switch (health) {
     case "running":
-      return "GPU Replay armé";
+      return t("status.gpuReplayArmed");
     case "saving_replay":
-      return "Sauvegarde replay";
+      return t("status.savingReplay");
     case "starting":
-      return "Démarrage";
+      return t("status.starting");
     case "error":
-      return "Erreur";
+      return t("status.error");
     case "not_available":
-      return "Indisponible";
+      return t("status.notAvailable");
     case "stopped":
     default:
-      return "Arrêté";
+      return t("status.stopped");
   }
 }
 
-function gsrStatusLabel(status?: RuntimeStatus | null) {
+function gsrStatusLabel(status: RuntimeStatus | null | undefined, t: Translate) {
   if (isWaitingForWarThunder(status)) {
-    return "En attente de War Thunder";
+    return t("status.waitingForWarThunder");
   }
-  return gsrHealthLabel(status?.gsrHealth);
+  return gsrHealthLabel(status?.gsrHealth, t);
 }
 
 export function App() {
   const store = useAppStore();
+  const { t } = useI18n();
   const galleryRefreshTimeout = useRef<number | null>(null);
   const galleryLoadSeq = useRef(0);
   const lastGalleryLoadAt = useRef(0);
@@ -130,7 +143,7 @@ export function App() {
       listen<{ kind: ClipReason; description?: string }>("kill-detected", (event) => {
         store.addEvent({
           kind: event.payload.kind,
-          title: reasonLabel[event.payload.kind] ?? "Événement",
+          title: reasonLabel(event.payload.kind, t),
           detail: event.payload.description,
         });
         const timeout = window.setTimeout(() => {
@@ -143,7 +156,7 @@ export function App() {
         store.addClip(event.payload);
         store.addEvent({
           kind: event.payload.reason,
-          title: "Clip sauvegardé",
+          title: t("events.clipSaved"),
           detail: event.payload.fileName,
         });
         scheduleGalleryRefresh({ force: true });
@@ -155,8 +168,8 @@ export function App() {
         }
       }),
       listen<{ message: string }>("clip-failed", (event) => {
-        store.addEvent({ kind: "system", title: "Clip échoué", detail: event.payload.message });
-        store.showToast(`Clip échoué: ${event.payload.message}`);
+        store.addEvent({ kind: "system", title: t("events.clipFailed"), detail: event.payload.message });
+        store.showToast(t("events.clipFailedToast", { message: event.payload.message }));
       }),
       listen<number>("disk-usage", (event) => store.setDiskUsedBytes(event.payload)),
       listen<ClipInfo[]>("clips-loaded", (event) => store.setClips(event.payload)),
@@ -250,7 +263,7 @@ export function App() {
           id: event.id,
           at: event.at,
           kind: event.kind,
-          title: reasonLabel[event.kind] ?? "Événement",
+          title: reasonLabel(event.kind, t),
           detail: event.description,
         });
       }
@@ -276,10 +289,11 @@ export function App() {
 
 function Sidebar() {
   const { activeView, setActiveView, config } = useAppStore();
+  const { t } = useI18n();
   return (
     <aside className="sidebar">
       <div className="brand">
-        <img className="logo brand-logo" src={appLogo} alt="WT Clipper" />
+        <img className="logo brand-logo" src={appLogo} alt={t("app.logoAlt")} />
         <div>
           <strong>WT Clip</strong>
           <span>GPU Screen Recorder</span>
@@ -297,14 +311,15 @@ function Sidebar() {
               type="button"
             >
               <Icon size={18} />
-              {item.label}
+              {t(item.labelKey)}
             </button>
           );
         })}
       </nav>
+      <LanguageSelector />
       <div className="sidebar-footer">
-        <span>Capture GSR</span>
-        <strong>{config?.capture.target || "Target non configurée"}</strong>
+        <span>{t("sidebar.captureBackend")}</span>
+        <strong>{config?.capture.target || t("sidebar.targetNotConfigured")}</strong>
       </div>
     </aside>
   );
@@ -312,67 +327,70 @@ function Sidebar() {
 
 function Topbar() {
   const { wtConnected, runtimeStatus } = useAppStore();
+  const { t } = useI18n();
   return (
     <header className="topbar">
       <div>
-        <h1>War Thunder clips</h1>
-        <p>Capture replay GPU Screen Recorder, galerie et exports sociaux.</p>
+        <h1>{t("app.topbar.title")}</h1>
+        <p>{t("app.topbar.subtitle")}</p>
       </div>
       <div className="topbar-status">
         <StatusPill connected={wtConnected} />
         <span className={`status-chip ${runtimeStatus?.gsrHealth === "running" ? "ok" : "warn"}`}>
           <Cpu size={15} />
-          {gsrStatusLabel(runtimeStatus)}
+          {gsrStatusLabel(runtimeStatus, t)}
         </span>
-        <img className="topbar-logo" src={appLogo} alt="WT Clip" />
+        <img className="topbar-logo" src={appLogo} alt={t("app.logoAlt")} />
       </div>
     </header>
   );
 }
 
 function StatusPill({ connected }: { connected: boolean }) {
+  const { t } = useI18n();
   return (
     <span className={`status-chip ${connected ? "ok" : "warn"}`}>
       <Zap size={15} />
-      {connected ? "War Thunder connecté" : "War Thunder en attente"}
+      {connected ? t("status.wtConnected") : t("status.wtWaiting")}
     </span>
   );
 }
 
 function Dashboard() {
   const state = useAppStore();
+  const { t } = useI18n();
   const status = state.runtimeStatus;
   return (
     <section className="view-grid">
       <div className="hero-panel">
         <div>
-          <span className="eyebrow">Backend actif</span>
+          <span className="eyebrow">{t("dashboard.backendActive")}</span>
           <h2>GPU Screen Recorder</h2>
           <p>
-            {gsrStatusLabel(status)} · {status?.gsrMode ?? state.config?.capture.mode ?? "auto"} ·{" "}
-            {status?.gsrTarget ?? state.config?.capture.target ?? "target non configurée"}
+            {gsrStatusLabel(status, t)} · {status?.gsrMode ?? state.config?.capture.mode ?? "auto"} ·{" "}
+            {status?.gsrTarget ?? state.config?.capture.target ?? t("dashboard.targetNotConfigured")}
           </p>
         </div>
         <button type="button" className="primary" onClick={() => void invoke("save_manual_clip")}>
           <Save size={18} />
-          Clip manuel
+          {t("actions.manualClip")}
         </button>
       </div>
 
-      <Metric icon={Video} label="Clips" value={state.clips.length} />
-      <Metric icon={Gauge} label="Kills session" value={state.sessionKills} />
-      <Metric icon={Wand2} label="Multi-kills" value={state.sessionMultiKills} />
-      <Metric icon={HardDrive} label="Stockage" value={formatBytes(state.diskUsedBytes)} />
+      <Metric icon={Video} label={t("dashboard.metric.clips")} value={state.clips.length} />
+      <Metric icon={Gauge} label={t("dashboard.metric.sessionKills")} value={state.sessionKills} />
+      <Metric icon={Wand2} label={t("dashboard.metric.multiKills")} value={state.sessionMultiKills} />
+      <Metric icon={HardDrive} label={t("dashboard.metric.storage")} value={formatBytes(state.diskUsedBytes)} />
 
       <section className="panel wide">
         <div className="panel-heading">
           <div>
-            <span className="eyebrow">Activité</span>
-            <h3>Événements récents</h3>
+            <span className="eyebrow">{t("events.activity")}</span>
+            <h3>{t("events.recent")}</h3>
           </div>
         </div>
         <div className="event-list">
-          {state.events.length === 0 && <Empty label="Aucun événement reçu." />}
+          {state.events.length === 0 && <Empty label={t("events.empty")} />}
           {state.events.map((event) => (
             <article key={event.id} className="event-row">
               <span>{event.at}</span>
@@ -397,6 +415,7 @@ function Metric({ icon: Icon, label, value }: { icon: typeof Zap; label: string;
 }
 
 function Clips({ onRefresh }: { onRefresh: () => void }) {
+  const { t } = useI18n();
   const { clips, processingClips, setClips, showToast, setGalleryRenderedClipCount, setGalleryMountedVideoCount } =
     useAppStore();
   const [query, setQuery] = useState("");
@@ -431,7 +450,7 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
     try {
       await invoke("delete_clip", { path });
       setClips(clips.filter((clip) => clip.path !== path));
-      showToast("Clip supprimé");
+      showToast(t("gallery.deletedToast"));
     } catch (error) {
       showToast(String(error));
     }
@@ -457,12 +476,12 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
     <section className="panel">
       <div className="panel-heading">
         <div>
-          <span className="eyebrow">Galerie</span>
-          <h2>Clips</h2>
+          <span className="eyebrow">{t("gallery.eyebrow")}</span>
+          <h2>{t("gallery.title")}</h2>
         </div>
         <button type="button" className="secondary" onClick={onRefresh}>
           <RefreshCcw size={17} />
-          Rafraîchir
+          {t("actions.refresh")}
         </button>
       </div>
 
@@ -471,13 +490,13 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
           type="search"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          placeholder="Rechercher un clip"
+          placeholder={t("gallery.searchPlaceholder")}
         />
         <select value={filter} onChange={(event) => setFilter(event.target.value as "all" | ClipReason)}>
-          <option value="all">Tous</option>
-          {Object.entries(reasonLabel).map(([value, label]) => (
+          <option value="all">{t("gallery.filter.all")}</option>
+          {Object.keys(reasonLabelKey).map((value) => (
             <option key={value} value={value}>
-              {label}
+              {reasonLabel(value as ClipReason, t)}
             </option>
           ))}
         </select>
@@ -488,12 +507,12 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
           onClick={openSelectedInEditor}
         >
           <Wand2 size={16} />
-          Assembler ({selectedReadyClips.length})
+          {t("actions.assemble", { count: selectedReadyClips.length })}
         </button>
       </div>
 
       <div className="clip-grid">
-        {galleryItems.length === 0 && <Empty label="Aucun clip dans la bibliothèque." />}
+        {galleryItems.length === 0 && <Empty label={t("gallery.empty")} />}
         {galleryItems.map((clip) =>
           clip.status === "ready" && clip.filePath ? (
             <ClipCard
@@ -538,6 +557,7 @@ function Clips({ onRefresh }: { onRefresh: () => void }) {
 }
 
 function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
+  const { t } = useI18n();
   const progress = clip.progress ?? (clip.status === "failed" ? 0 : 48);
   return (
     <article className="clip-card processing">
@@ -549,7 +569,7 @@ function ClipProcessingCard({ clip }: { clip: GalleryClipItem }) {
           {galleryBadgeLabel(clip.clipType, clip.reason, clip.exportType)}
         </span>
         <h3>{clip.title}</h3>
-        <p>{clip.error ?? statusLabel[clip.status]}</p>
+        <p>{clip.error ?? clipStatusLabel(clip.status, t)}</p>
         {clip.status !== "failed" && (
           <div className="progress">
             <span style={{ width: `${Math.max(8, Math.min(100, progress))}%` }} />
@@ -579,6 +599,7 @@ function ClipCard({
 }) {
   const previewActive = activePreviewPath === clip.path;
   const thumbnailSrc = clip.thumbnailPath ? convertFileSrc(clip.thumbnailPath) : null;
+  const { t } = useI18n();
 
   return (
     <article
@@ -608,17 +629,17 @@ function ClipCard({
         <h3>{clip.fileName}</h3>
         <p>
           {formatClipDuration(clip.durationSeconds)} · {formatBytes(clip.sizeBytes)} ·{" "}
-          {relativeTime(clip.modifiedSecsAgo)}
+          {relativeTime(clip.modifiedSecsAgo, t)}
         </p>
       </div>
       <div className="clip-actions">
-        <button type="button" title="Éditer" onClick={() => onEdit(clip)}>
+        <button type="button" title={t("actions.edit")} onClick={() => onEdit(clip)}>
           <Wand2 size={16} />
         </button>
-        <button type="button" title="Ouvrir le dossier" onClick={() => void invoke("open_parent_folder", { path: clip.path })}>
+        <button type="button" title={t("actions.openFolder")} onClick={() => void invoke("open_parent_folder", { path: clip.path })}>
           <FolderOpen size={16} />
         </button>
-        <button type="button" title="Supprimer" onClick={() => onDelete(clip.path)}>
+        <button type="button" title={t("actions.delete")} onClick={() => onDelete(clip.path)}>
           <Trash2 size={16} />
         </button>
       </div>
@@ -775,6 +796,7 @@ function findPreviewThumb(path: string) {
 }
 
 function Configuration() {
+  const { t } = useI18n();
   const { config, runtimeStatus, setConfig, setRuntimeStatus, showToast } = useAppStore();
   const [draft, setDraft] = useState<AppConfig | null>(config);
   const [saving, setSaving] = useState(false);
@@ -785,7 +807,7 @@ function Configuration() {
   }, [config]);
 
   if (!draft) {
-    return <Empty label="Configuration en chargement." />;
+    return <Empty label={t("config.loading")} />;
   }
 
   const updateClip = <K extends keyof AppConfig["clip"]>(key: K, value: AppConfig["clip"][K]) =>
@@ -820,7 +842,7 @@ function Configuration() {
       const status = await invoke<RuntimeStatus>("get_runtime_status");
       setConfig(nextConfig);
       setRuntimeStatus(status);
-      showToast("Configuration sauvegardée");
+      showToast(t("config.savedToast"));
     } catch (error) {
       showToast(String(error));
     } finally {
@@ -832,7 +854,7 @@ function Configuration() {
     setCheckingUpdate(true);
     try {
       const result = await invoke<{ available: boolean }>("check_for_updates");
-      showToast(result.available ? "Mise à jour disponible" : "WT Clip est à jour");
+      showToast(result.available ? t("config.updateAvailable") : t("config.upToDate"));
     } catch (error) {
       showToast(String(error));
     } finally {
@@ -842,8 +864,8 @@ function Configuration() {
 
   return (
     <section className="config-layout">
-      <ConfigSection title="Clip">
-        <Field label="Délai après événement">
+      <ConfigSection title={t("config.section.clip")}>
+        <Field label={t("config.field.postEventDelay")}>
           <input
             type="number"
             min={0}
@@ -851,7 +873,7 @@ function Configuration() {
             onChange={(event) => updateClip("post_event_seconds", Number(event.target.value))}
           />
         </Field>
-        <Field label="Fenêtre multi-kill">
+        <Field label={t("config.field.multiKillWindow")}>
           <input
             type="number"
             min={1}
@@ -861,28 +883,28 @@ function Configuration() {
         </Field>
       </ConfigSection>
 
-      <ConfigSection title="Bibliothèque">
-        <Field label="Dossier bibliothèque">
+      <ConfigSection title={t("config.section.library")}>
+        <Field label={t("config.field.libraryFolder")}>
           <input value={draft.library.output_dir} onChange={(event) => updateLibrary("output_dir", event.target.value)} />
         </Field>
       </ConfigSection>
 
       <ConfigSection title="GPU Screen Recorder">
-        <Field label="Stratégie capture">
+        <Field label={t("config.field.captureStrategy")}>
           <select
             value={draft.capture.capture_strategy}
             onChange={(event) => updateCapture("capture_strategy", event.target.value as AppConfig["capture"]["capture_strategy"])}
           >
-            <option value="auto">Automatique recommandé</option>
-            <option value="monitor">Moniteur entier</option>
-            <option value="focused">Fenêtre active</option>
-            <option value="portal">Sélection système / portal</option>
+            <option value="auto">{t("config.strategy.auto")}</option>
+            <option value="monitor">{t("config.strategy.monitor")}</option>
+            <option value="focused">{t("config.strategy.focused")}</option>
+            <option value="portal">{t("config.strategy.portal")}</option>
           </select>
           <p className="help-text">
-            Auto attend que l'API War Thunder soit détectée avant de résoudre la cible: fenêtre War Thunder sur X11, portal sur Wayland, sinon fallback moniteur.
+            {t("config.strategyHelp.auto")}
           </p>
         </Field>
-        <Field label={draft.capture.capture_strategy === "monitor" ? "Target" : "Target fallback"}>
+        <Field label={draft.capture.capture_strategy === "monitor" ? t("config.field.target") : t("config.field.fallbackTarget")}>
           {detectedTargets.length > 0 ? (
             <select
               value={draft.capture.target}
@@ -899,31 +921,39 @@ function Configuration() {
           )}
           <p className={targetValid ? "help-text" : "help-text warning-text"}>
             {targetValid
-              ? `Target valide${runtimeStatus?.gsrMonitors?.length ? ` · détectés: ${runtimeStatus.gsrMonitors.join(", ")}` : ""}`
-              : `Target introuvable. Sélectionne une valeur détectée${runtimeStatus?.gsrMonitors?.length ? `: ${runtimeStatus.gsrMonitors.join(", ")}` : "."}`}
+              ? t("config.target.valid", {
+                  detected: runtimeStatus?.gsrMonitors?.length
+                    ? t("config.target.detectedSuffix", { targets: runtimeStatus.gsrMonitors.join(", ") })
+                    : "",
+                })
+              : t("config.target.invalid", {
+                  targets: runtimeStatus?.gsrMonitors?.length
+                    ? t("config.target.detectedList", { targets: runtimeStatus.gsrMonitors.join(", ") })
+                    : t("config.target.detectedEnd"),
+                })}
           </p>
         </Field>
-        <Field label="Mode">
+        <Field label={t("config.field.mode")}>
           <select value={draft.capture.mode} onChange={(event) => updateCapture("mode", event.target.value as AppConfig["capture"]["mode"])}>
             <option value="auto">Auto</option>
             <option value="native">Native</option>
             <option value="flatpak">Flatpak</option>
           </select>
         </Field>
-        <Field label="FPS">
+        <Field label={t("config.field.fps")}>
           <input type="number" min={1} value={draft.capture.fps} onChange={(event) => updateCapture("fps", Number(event.target.value))} />
         </Field>
-        <Field label="Mode FPS">
+        <Field label={t("config.field.fpsMode")}>
           <select
             value={draft.capture.frame_rate_mode}
             onChange={(event) => updateCapture("frame_rate_mode", event.target.value as AppConfig["capture"]["frame_rate_mode"])}
           >
-            <option value="cfr">Constant (CFR)</option>
-            <option value="vfr">Variable (VFR)</option>
-            <option value="content">Content</option>
+            <option value="cfr">{t("config.fpsMode.cfr")}</option>
+            <option value="vfr">{t("config.fpsMode.vfr")}</option>
+            <option value="content">{t("config.fpsMode.content")}</option>
           </select>
         </Field>
-        <Field label="Intervalle keyframe">
+        <Field label={t("config.field.keyframeInterval")}>
           <input
             type="number"
             min={0.1}
@@ -939,7 +969,7 @@ function Configuration() {
             <option value="2.0" />
           </datalist>
         </Field>
-        <Field label="Durée replay">
+        <Field label={t("config.field.replayDuration")}>
           <input
             type="number"
             min={5}
@@ -947,38 +977,38 @@ function Configuration() {
             onChange={(event) => updateCapture("replay_seconds", Number(event.target.value))}
           />
         </Field>
-        <Field label="Conteneur">
+        <Field label={t("config.field.container")}>
           <select value={draft.capture.container} onChange={(event) => updateCapture("container", event.target.value as AppConfig["capture"]["container"])}>
             <option value="mp4">MP4</option>
             <option value="mkv">MKV</option>
           </select>
         </Field>
-        <Field label="Codec">
+        <Field label={t("config.field.codec")}>
           <select value={draft.capture.codec} onChange={(event) => updateCapture("codec", event.target.value as AppConfig["capture"]["codec"])}>
             <option value="h264">H.264</option>
             <option value="hevc">HEVC</option>
             <option value="av1">AV1</option>
           </select>
         </Field>
-        <Field label="Encodeur">
+        <Field label={t("config.field.encoder")}>
           <select value={draft.capture.encoder} onChange={(event) => updateCapture("encoder", event.target.value as AppConfig["capture"]["encoder"])}>
             <option value="gpu">GPU</option>
             <option value="cpu">CPU</option>
           </select>
         </Field>
-        <Field label="Mode bitrate">
+        <Field label={t("config.field.bitrateMode")}>
           <select
             value={draft.capture.bitrate_mode}
             onChange={(event) => updateCapture("bitrate_mode", event.target.value as AppConfig["capture"]["bitrate_mode"])}
           >
             <option value="auto">Auto</option>
-            <option value="qp">QP qualité constante</option>
+            <option value="qp">{t("config.bitrate.qp")}</option>
             <option value="vbr">VBR</option>
-            <option value="cbr">CBR bitrate fixe</option>
+            <option value="cbr">{t("config.bitrate.cbr")}</option>
           </select>
         </Field>
         {draft.capture.bitrate_mode === "cbr" ? (
-          <Field label="Bitrate vidéo kbps">
+          <Field label={t("config.field.videoBitrateKbps")}>
             <input
               type="number"
               min={1000}
@@ -988,7 +1018,7 @@ function Configuration() {
             />
           </Field>
         ) : (
-          <Field label="Qualité">
+          <Field label={t("config.field.quality")}>
             <select value={draft.capture.quality} onChange={(event) => updateCapture("quality", event.target.value as AppConfig["capture"]["quality"])}>
               <option value="medium">Medium</option>
               <option value="high">High</option>
@@ -998,47 +1028,47 @@ function Configuration() {
           </Field>
         )}
         <p className="help-text">
-          Pour War Thunder en 1080p60, 20000-30000 kbps donne une meilleure qualité mais augmente la taille des fichiers.
+          {t("config.captureHelp.bitrate")}
         </p>
-        <Field label="Redémarrer le replay après sauvegarde" className="toggle-field">
+        <Field label={t("config.field.restartReplayOnSave")} className="toggle-field">
           <div className="checkbox-row">
             <input
               type="checkbox"
               checked={draft.capture.restart_replay_on_save}
               onChange={(event) => updateCapture("restart_replay_on_save", event.target.checked)}
             />
-            <strong>{draft.capture.restart_replay_on_save ? "Oui, vider le buffer" : "Non, conserver le buffer"}</strong>
+            <strong>{draft.capture.restart_replay_on_save ? t("config.restartReplay.yes") : t("config.restartReplay.no")}</strong>
           </div>
         </Field>
-        <Field label="Audio" className="toggle-field">
+        <Field label={t("config.field.audio")} className="toggle-field">
           <div className="checkbox-row">
             <input
               type="checkbox"
               checked={draft.capture.audio_enabled}
               onChange={(event) => updateCapture("audio_enabled", event.target.checked)}
             />
-            <strong>Activé</strong>
+            <strong>{t("config.audio.enabled")}</strong>
           </div>
         </Field>
-        <Field label="Entrée audio">
+        <Field label={t("config.field.audioInput")}>
           <input value={draft.capture.audio_input} onChange={(event) => updateCapture("audio_input", event.target.value)} />
         </Field>
-        <Field label="Dossier capture GSR">
+        <Field label={t("config.field.captureFolder")}>
           <input value={draft.capture.output_dir} onChange={(event) => updateCapture("output_dir", event.target.value)} />
         </Field>
       </ConfigSection>
 
-      <ConfigSection title="War Thunder">
-        <Field label="Base URL">
+      <ConfigSection title={t("config.section.warThunder")}>
+        <Field label={t("config.field.baseUrl")}>
           <input value={draft.war_thunder.base_url} onChange={(event) => updateWt("base_url", event.target.value)} />
         </Field>
-        <Field label="Joueur">
+        <Field label={t("config.field.player")}>
           <input
             value={draft.war_thunder.player_name ?? ""}
             onChange={(event) => updateWt("player_name", event.target.value || null)}
           />
         </Field>
-        <Field label="Poll ms">
+        <Field label={t("config.field.pollMs")}>
           <input
             type="number"
             min={100}
@@ -1046,7 +1076,7 @@ function Configuration() {
             onChange={(event) => updateWt("poll_interval_ms", Number(event.target.value))}
           />
         </Field>
-        <Field label="Timeout ms">
+        <Field label={t("config.field.timeoutMs")}>
           <input
             type="number"
             min={100}
@@ -1056,20 +1086,20 @@ function Configuration() {
         </Field>
       </ConfigSection>
 
-      <ConfigSection title="Déclencheurs">
+      <ConfigSection title={t("config.section.triggers")}>
         {Object.entries(draft.triggers).map(([key, value]) => (
           <label key={key} className="inline-toggle">
             <input type="checkbox" checked={value} onChange={(event) => updateTrigger(key as keyof AppConfig["triggers"], event.target.checked)} />
-            {reasonLabel[key as ClipReason] ?? key}
+            {reasonLabel(key as ClipReason, t) ?? key}
           </label>
         ))}
       </ConfigSection>
 
-      <ConfigSection title="Stockage">
-        <Field label="Max clips">
+      <ConfigSection title={t("config.section.storage")}>
+        <Field label={t("config.field.maxClips")}>
           <input type="number" min={1} value={draft.storage.max_clips} onChange={(event) => updateStorage("max_clips", Number(event.target.value))} />
         </Field>
-        <Field label="Max Go">
+        <Field label={t("config.field.maxGb")}>
           <input
             type="number"
             min={1}
@@ -1082,19 +1112,20 @@ function Configuration() {
       <div className="config-actions">
         <button type="button" className="primary" onClick={save} disabled={saving}>
           <Save size={17} />
-          {saving ? "Sauvegarde..." : "Sauvegarder"}
+          {saving ? t("actions.saving") : t("actions.save")}
         </button>
         <button type="button" className="secondary" onClick={checkForUpdates} disabled={checkingUpdate}>
           <RefreshCcw size={17} />
-          {checkingUpdate ? "Vérification..." : "Vérifier les mises à jour"}
+          {checkingUpdate ? t("actions.checking") : t("actions.checkUpdates")}
         </button>
-        {runtimeStatus?.configRestartRequired && <span className="status-chip warn">Redémarrage GSR requis</span>}
+        {runtimeStatus?.configRestartRequired && <span className="status-chip warn">{t("config.restartRequired")}</span>}
       </div>
     </section>
   );
 }
 
 function Diagnostics() {
+  const { t } = useI18n();
   const { diagnostics, runtimeStatus, setDiagnostics, setDiagnosticsRunning, setRuntimeStatus, diagnosticsRunning, showToast } =
     useAppStore();
   const [gsrTestRunning, setGsrTestRunning] = useState(false);
@@ -1119,7 +1150,7 @@ function Diagnostics() {
       await invoke("restart_gpu_recorder");
       const status = await invoke<RuntimeStatus>("get_runtime_status");
       setRuntimeStatus(status);
-      showToast("GPU recorder redémarré");
+      showToast(t("diagnostics.restartedToast"));
     } catch (error) {
       showToast(String(error));
     }
@@ -1131,7 +1162,7 @@ function Diagnostics() {
       const path = await invoke<string>("test_gsr_save_replay");
       const status = await invoke<RuntimeStatus>("get_runtime_status");
       setRuntimeStatus(status);
-      showToast(`Replay GSR sauvegardé: ${path}`);
+      showToast(t("diagnostics.replaySavedToast", { path }));
     } catch (error) {
       showToast(String(error));
     } finally {
@@ -1150,28 +1181,28 @@ function Diagnostics() {
       <div className="panel wide">
         <div className="panel-heading">
           <div>
-            <span className="eyebrow">Diagnostics</span>
-            <h2>GPU Screen Recorder</h2>
+            <span className="eyebrow">{t("diagnostics.eyebrow")}</span>
+            <h2>{t("diagnostics.title")}</h2>
           </div>
           <div className="button-row">
             <button type="button" className="secondary" onClick={run} disabled={diagnosticsRunning}>
               <RefreshCcw size={17} />
-              {diagnosticsRunning ? "Analyse..." : "Relancer"}
+              {diagnosticsRunning ? t("actions.analyzing") : t("actions.rerun")}
             </button>
             <button type="button" className="secondary" onClick={restartGpuRecorder}>
               <Cpu size={17} />
-              Redémarrer GPU Recorder
+              {t("actions.restartGpuRecorder")}
             </button>
             <button type="button" className="primary" onClick={testGsrSaveReplay} disabled={gsrTestRunning}>
               <Play size={17} />
-              Tester sauvegarde GSR
+              {t("actions.testGsrSave")}
             </button>
           </div>
         </div>
         <div className="status-summary">
           <span className="status-chip ok">{counts.ok} OK</span>
-          <span className="status-chip warn">{counts.warn} avertissements</span>
-          <span className="status-chip error">{counts.error} erreurs</span>
+          <span className="status-chip warn">{counts.warn} {counts.warn === 1 ? t("status.warning_one") : t("status.warning_other")}</span>
+          <span className="status-chip error">{counts.error} {counts.error === 1 ? t("status.error_one") : t("status.error_other")}</span>
         </div>
         <div className="diagnostic-list">
           {checks.map((check) => (
@@ -1183,47 +1214,47 @@ function Diagnostics() {
       <div className="panel wide">
         <div className="panel-heading">
           <div>
-            <span className="eyebrow">Runtime</span>
-            <h3>État GSR</h3>
+            <span className="eyebrow">{t("diagnostics.runtime")}</span>
+            <h3>{t("diagnostics.gsrState")}</h3>
           </div>
         </div>
         <div className="kv-grid">
-          <KeyValue label="Disponible" value={runtimeStatus?.gsrAvailable ? "Oui" : "Non"} />
-          <KeyValue label="État" value={gsrStatusLabel(runtimeStatus)} />
-          <KeyValue label="Mode" value={runtimeStatus?.gsrMode ?? "-"} />
-          <KeyValue label="PID wrapper" value={runtimeStatus?.gsrWrapperPid ?? "-"} />
-          <KeyValue label="PID recorder" value={runtimeStatus?.gsrRecorderPid ?? "-"} />
-          <KeyValue label="PID signal" value={runtimeStatus?.gsrSignalPid ?? "-"} />
-          <KeyValue label="Stratégie capture" value={runtimeStatus?.gsrCaptureStrategy ?? "-"} />
-          <KeyValue label="Session graphique" value={runtimeStatus?.gsrSessionType ?? "-"} />
-          <KeyValue label="Target effective" value={runtimeStatus?.gsrTarget ?? "-"} />
-          <KeyValue label="Raison target" value={runtimeStatus?.gsrTargetReason ?? "-"} />
-          <KeyValue label="Target valide" value={runtimeStatus?.gsrTargetValid ? "Oui" : "Non"} />
-          <KeyValue label="Targets détectées" value={runtimeStatus?.gsrMonitors?.join(", ") || "-"} />
-          <KeyValue label="FPS" value={runtimeStatus?.gsrFps ?? "-"} />
-          <KeyValue label="Replay seconds" value={runtimeStatus?.gsrReplaySeconds ?? "-"} />
-          <KeyValue label="Quality" value={runtimeStatus?.gsrQuality ?? "-"} />
-          <KeyValue label="Bitrate mode" value={runtimeStatus?.gsrBitrateMode ?? "-"} />
-          <KeyValue label="Frame rate mode" value={runtimeStatus?.gsrFrameRateMode ?? "-"} />
-          <KeyValue label="Keyframe interval seconds" value={runtimeStatus?.gsrKeyframeIntervalSeconds ?? "-"} />
+          <KeyValue label={t("diagnostics.key.available")} value={runtimeStatus?.gsrAvailable ? t("status.yes") : t("status.no")} />
+          <KeyValue label={t("diagnostics.key.state")} value={gsrStatusLabel(runtimeStatus, t)} />
+          <KeyValue label={t("diagnostics.key.mode")} value={runtimeStatus?.gsrMode ?? "-"} />
+          <KeyValue label={t("diagnostics.key.wrapperPid")} value={runtimeStatus?.gsrWrapperPid ?? "-"} />
+          <KeyValue label={t("diagnostics.key.recorderPid")} value={runtimeStatus?.gsrRecorderPid ?? "-"} />
+          <KeyValue label={t("diagnostics.key.signalPid")} value={runtimeStatus?.gsrSignalPid ?? "-"} />
+          <KeyValue label={t("diagnostics.key.captureStrategy")} value={runtimeStatus?.gsrCaptureStrategy ?? "-"} />
+          <KeyValue label={t("diagnostics.key.sessionType")} value={runtimeStatus?.gsrSessionType ?? "-"} />
+          <KeyValue label={t("diagnostics.key.effectiveTarget")} value={runtimeStatus?.gsrTarget ?? "-"} />
+          <KeyValue label={t("diagnostics.key.targetReason")} value={runtimeStatus?.gsrTargetReason ?? "-"} />
+          <KeyValue label={t("diagnostics.key.targetValid")} value={runtimeStatus?.gsrTargetValid ? t("status.yes") : t("status.no")} />
+          <KeyValue label={t("diagnostics.key.detectedTargets")} value={runtimeStatus?.gsrMonitors?.join(", ") || "-"} />
+          <KeyValue label={t("diagnostics.key.fps")} value={runtimeStatus?.gsrFps ?? "-"} />
+          <KeyValue label={t("diagnostics.key.replaySeconds")} value={runtimeStatus?.gsrReplaySeconds ?? "-"} />
+          <KeyValue label={t("diagnostics.key.quality")} value={runtimeStatus?.gsrQuality ?? "-"} />
+          <KeyValue label={t("diagnostics.key.bitrateMode")} value={runtimeStatus?.gsrBitrateMode ?? "-"} />
+          <KeyValue label={t("diagnostics.key.frameRateMode")} value={runtimeStatus?.gsrFrameRateMode ?? "-"} />
+          <KeyValue label={t("diagnostics.key.keyframeInterval")} value={runtimeStatus?.gsrKeyframeIntervalSeconds ?? "-"} />
           <KeyValue
-            label="Restart replay on save"
-            value={runtimeStatus?.gsrRestartReplayOnSave ? "yes" : "no"}
+            label={t("diagnostics.key.restartReplay")}
+            value={runtimeStatus?.gsrRestartReplayOnSave ? t("status.yes") : t("status.no")}
           />
-          <KeyValue label="Video bitrate kbps" value={runtimeStatus?.gsrVideoBitrateKbps ?? "-"} />
-          <KeyValue label="Effective -q" value={runtimeStatus?.gsrEffectiveQArgument ?? "-"} />
-          <KeyValue label="Save queue" value={runtimeStatus?.gsrSaveQueueLen ?? "-"} />
-          <KeyValue label="Saves requested" value={runtimeStatus?.gsrTotalSavesRequested ?? "-"} />
-          <KeyValue label="Saves completed" value={runtimeStatus?.gsrTotalSavesCompleted ?? "-"} />
-          <KeyValue label="Saves failed" value={runtimeStatus?.gsrTotalSavesFailed ?? "-"} />
-          <KeyValue label="FD backend" value={runtimeStatus?.backendFdCount ?? "-"} />
-          <KeyValue label="Scans galerie" value={runtimeStatus?.galleryScanCount ?? "-"} />
-          <KeyValue label="Dernier scan ms" value={runtimeStatus?.galleryLastScanMs ?? "-"} />
-          <KeyValue label="Scans actifs" value={runtimeStatus?.galleryActiveScans ?? "-"} />
-          <KeyValue label="Dernière sortie" value={runtimeStatus?.gsrLastOutput ?? "-"} />
-          <KeyValue label="Erreur GSR" value={runtimeStatus?.gsrLastError ?? "-"} />
+          <KeyValue label={t("diagnostics.key.videoBitrate")} value={runtimeStatus?.gsrVideoBitrateKbps ?? "-"} />
+          <KeyValue label={t("diagnostics.key.effectiveQ")} value={runtimeStatus?.gsrEffectiveQArgument ?? "-"} />
+          <KeyValue label={t("diagnostics.key.saveQueue")} value={runtimeStatus?.gsrSaveQueueLen ?? "-"} />
+          <KeyValue label={t("diagnostics.key.savesRequested")} value={runtimeStatus?.gsrTotalSavesRequested ?? "-"} />
+          <KeyValue label={t("diagnostics.key.savesCompleted")} value={runtimeStatus?.gsrTotalSavesCompleted ?? "-"} />
+          <KeyValue label={t("diagnostics.key.savesFailed")} value={runtimeStatus?.gsrTotalSavesFailed ?? "-"} />
+          <KeyValue label={t("diagnostics.key.fdBackend")} value={runtimeStatus?.backendFdCount ?? "-"} />
+          <KeyValue label={t("diagnostics.key.galleryScans")} value={runtimeStatus?.galleryScanCount ?? "-"} />
+          <KeyValue label={t("diagnostics.key.lastScanMs")} value={runtimeStatus?.galleryLastScanMs ?? "-"} />
+          <KeyValue label={t("diagnostics.key.activeScans")} value={runtimeStatus?.galleryActiveScans ?? "-"} />
+          <KeyValue label={t("diagnostics.key.lastOutput")} value={runtimeStatus?.gsrLastOutput ?? "-"} />
+          <KeyValue label={t("diagnostics.key.gsrError")} value={runtimeStatus?.gsrLastError ?? "-"} />
         </div>
-        <pre className="command-line">{runtimeStatus?.gsrCommandLine ?? "Commande GSR indisponible"}</pre>
+        <pre className="command-line">{runtimeStatus?.gsrCommandLine ?? t("diagnostics.commandUnavailable")}</pre>
       </div>
     </section>
   );
@@ -1352,17 +1383,17 @@ function formatBytes(bytes: number) {
   return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
-function relativeTime(seconds: number) {
+function relativeTime(seconds: number, t: Translate) {
   if (seconds < 60) {
-    return "à l'instant";
+    return t("gallery.modifiedNow");
   }
   if (seconds < 3600) {
-    return `${Math.floor(seconds / 60)} min`;
+    return t("gallery.modifiedMinutes", { count: Math.floor(seconds / 60) });
   }
   if (seconds < 86_400) {
-    return `${Math.floor(seconds / 3600)} h`;
+    return t("gallery.modifiedHours", { count: Math.floor(seconds / 3600) });
   }
-  return `${Math.floor(seconds / 86_400)} j`;
+  return t("gallery.modifiedDays", { count: Math.floor(seconds / 86_400) });
 }
 
 function secondsAgo(value: string) {

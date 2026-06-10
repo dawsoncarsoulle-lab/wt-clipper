@@ -2088,3 +2088,55 @@ select {
 .source-trim-end-label {
   z-index: 3;
 }
+
+.language-selector {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  margin-top: auto;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 8px;
+  background: rgba(17,23,34,.72);
+  padding: 10px 12px;
+  color: #cfd7e6;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.language-selector select {
+  min-width: 0;
+  flex: 1;
+  border: 1px solid rgba(255,255,255,.16);
+  border-radius: 7px;
+  appearance: none;
+  color-scheme: dark;
+  background-color: #0b1220;
+  background-image:
+    linear-gradient(45deg, transparent 50%, #f4f7fb 50%),
+    linear-gradient(135deg, #f4f7fb 50%, transparent 50%);
+  background-position:
+    calc(100% - 16px) 50%,
+    calc(100% - 11px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  color: #f4f7fb;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 7px 28px 7px 8px;
+}
+
+.language-selector select:focus {
+  border-color: rgba(255, 111, 74, .75);
+  box-shadow: 0 0 0 3px rgba(255, 111, 74, .2);
+  outline: none;
+}
+
+.language-selector select option {
+  background: #0b1220;
+  color: #f4f7fb;
+}
+
+.language-selector + .sidebar-footer {
+  margin-top: 12px;
+}

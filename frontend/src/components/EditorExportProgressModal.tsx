@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { AnimatePresence, motion } from "framer-motion";
 import { AlertTriangle, CheckCircle2, FileVideo, FolderOpen, XCircle } from "lucide-react";
 import type { EditedClipResult, EditorExportProgressPayload } from "../types";
+import { useI18n } from "../i18n/I18nProvider";
 
 type EditorExportProgressModalProps = {
   progress: EditorExportProgressPayload | null;
@@ -14,6 +15,7 @@ export function EditorExportProgressModal({
   result,
   onClose,
 }: EditorExportProgressModalProps) {
+  const { t } = useI18n();
   if (!progress) {
     return null;
   }
@@ -48,19 +50,19 @@ export function EditorExportProgressModal({
           <div className="flex items-start justify-between gap-5">
             <div>
               <div className="text-xs uppercase tracking-wide text-zinc-500">
-                {finished ? "Export éditeur" : "Export en cours"}
+                {finished ? t("editorProgress.idle") : t("editorProgress.active")}
               </div>
               <h2 className="mt-1 text-xl font-black text-white">
                 {failed
-                  ? "Export impossible"
+                  ? t("editorProgress.failedTitle")
                   : finished && replacedOriginal
-                    ? "Clip original remplacé"
+                    ? t("editorProgress.replacedTitle")
                     : finished
-                      ? "Export terminé"
-                      : "Création du clip"}
+                      ? t("editorProgress.doneTitle")
+                      : t("editorProgress.creatingTitle")}
               </h2>
             </div>
-            <button className="icon-button" disabled={!finished} onClick={close} title="Fermer">
+            <button className="icon-button" disabled={!finished} onClick={close} title={t("editor.close")}>
               <XCircle className="h-4 w-4" />
             </button>
           </div>
@@ -77,7 +79,7 @@ export function EditorExportProgressModal({
               <div className="text-sm font-bold text-white">{progress.message}</div>
               {finished && replacedOriginal && (
                 <div className="mt-1 text-sm text-zinc-300">
-                  Une sauvegarde a été créée dans Backups/.
+                  {t("editorProgress.backupCreated")}
                 </div>
               )}
               <div className="mt-1 text-xs uppercase text-zinc-500">{progress.step}</div>
@@ -103,7 +105,7 @@ export function EditorExportProgressModal({
 
           {finished && replacedOriginal && backupPath && (
             <p className="mt-2 break-words text-xs text-[#ffd0c3]">
-              Sauvegarde : {backupPath}
+              {t("editorProgress.backup", { path: backupPath })}
             </p>
           )}
 
@@ -117,7 +119,7 @@ export function EditorExportProgressModal({
                       onClick={() => void invoke("open_parent_folder", { path: outputPath })}
                     >
                       <FolderOpen className="h-4 w-4" />
-                      Ouvrir le dossier
+                      {t("editorProgress.openFolder")}
                     </button>
                   )}
                   <button
@@ -125,7 +127,7 @@ export function EditorExportProgressModal({
                     onClick={() => void invoke("open_path", { path: outputPath })}
                   >
                     <FileVideo className="h-4 w-4" />
-                    {replacedOriginal ? "Ouvrir clip" : "Ouvrir le fichier"}
+                    {replacedOriginal ? t("editorProgress.openClip") : t("editorProgress.openFile")}
                   </button>
                 </>
               )}
@@ -135,11 +137,11 @@ export function EditorExportProgressModal({
                   onClick={() => void invoke("open_path", { path: backupPath })}
                 >
                   <FolderOpen className="h-4 w-4" />
-                  Ouvrir sauvegarde
+                  {t("editorProgress.openBackup")}
                 </button>
               )}
               <button className="primary-action w-fit px-5" onClick={close}>
-                Fermer
+                {t("editor.close")}
               </button>
             </div>
           )}

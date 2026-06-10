@@ -23,6 +23,7 @@ import {
   timelineTimeFromClientX,
 } from "../editorTimelinePolicy";
 import type { TimelineSegment, TimelineThumbnail } from "../types";
+import { useI18n } from "../i18n/I18nProvider";
 
 const MIN_TRIM_GAP_SECONDS = 0.25;
 
@@ -90,6 +91,7 @@ export function TrimTimeline({
   thumbnailTime,
   thumbnails = [],
 }: TrimTimelineProps) {
+  const { t } = useI18n();
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const trackRef = useRef<HTMLDivElement | null>(null);
   const sourceTrackRef = useRef<HTMLDivElement | null>(null);
@@ -347,31 +349,27 @@ export function TrimTimeline({
     <section className="editor-panel trim-panel">
       <div className="editor-panel-heading">
         <div>
-          <div className="editor-kicker">Timeline</div>
-          <h3>Montage</h3>
+          <div className="editor-kicker">{t("timeline.kicker")}</div>
+          <h3>{t("timeline.title")}</h3>
         </div>
         <div className="trim-duration">
-          {formatTimelineTime(selectedDuration)} sélectionné
+          {t("timeline.selected", { duration: formatTimelineTime(selectedDuration) })}
         </div>
       </div>
 
       <div className="trim-time-row">
         <span>
-          Segment{" "}
-          {selectedSegment
-            ? formatTimelineTime(selectedSegment.start)
-            : "--:--"}
+          {t("timeline.segment", { time: selectedSegment ? formatTimelineTime(selectedSegment.start) : "--:--" })}
         </span>
-        <span>Lecture {formatTimelineTime(currentSeconds)}</span>
+        <span>{t("timeline.playback", { time: formatTimelineTime(currentSeconds) })}</span>
         <span>
-          Fin{" "}
-          {selectedSegment ? formatTimelineTime(selectedSegment.end) : "--:--"}
+          {t("timeline.end", { time: selectedSegment ? formatTimelineTime(selectedSegment.end) : "--:--" })}
         </span>
       </div>
 
       <div className="timeline-toolbar">
         <div className="timeline-total">
-          Total {formatTimelineTime(safeDuration)}
+          {t("timeline.total", { duration: formatTimelineTime(safeDuration) })}
         </div>
         <div className="timeline-zoom">
           <button
@@ -418,7 +416,7 @@ export function TrimTimeline({
             ))}
           </div>
           <div
-            aria-label="Timeline montage"
+            aria-label={t("timeline.aria")}
             className="trim-track"
             ref={trackRef}
             role="slider"
@@ -489,7 +487,7 @@ export function TrimTimeline({
           type="button"
         >
           <ArrowLeft className="h-4 w-4" />
-          Déplacer à gauche
+          {t("timeline.moveLeft")}
         </button>
         <button
           className="ghost-button"
@@ -497,7 +495,7 @@ export function TrimTimeline({
           onClick={onMoveSelectedRight}
           type="button"
         >
-          Déplacer à droite
+          {t("timeline.moveRight")}
           <ArrowRight className="h-4 w-4" />
         </button>
       </div>
@@ -505,8 +503,8 @@ export function TrimTimeline({
       <div className="source-trim-panel">
         <div className="source-trim-header">
           <div>
-            <div className="editor-kicker">Trim du segment sélectionné</div>
-            <strong>{selectedSegment?.sourceTitle ?? "Aucun segment"}</strong>
+            <div className="editor-kicker">{t("timeline.trimKicker")}</div>
+            <strong>{selectedSegment?.sourceTitle ?? t("timeline.noSegment")}</strong>
           </div>
           <span>
             {selectedSegment
@@ -537,7 +535,7 @@ export function TrimTimeline({
           )}
           <div className="source-trim-range" style={sourceRangeStyle} />
           <button
-            aria-label="Poignée début"
+            aria-label={t("timeline.startHandle")}
             className="trim-handle source-trim-handle source-trim-handle-start"
             disabled={disabled || !selectedSegment}
             onPointerDown={(event) => beginSourceTrim(event, "trim-start")}
@@ -548,7 +546,7 @@ export function TrimTimeline({
             type="button"
           />
           <button
-            aria-label="Poignée fin"
+            aria-label={t("timeline.endHandle")}
             className="trim-handle source-trim-handle source-trim-handle-end"
             disabled={disabled || !selectedSegment}
             onPointerDown={(event) => beginSourceTrim(event, "trim-end")}
@@ -573,7 +571,7 @@ export function TrimTimeline({
           type="button"
         >
           <SkipBack className="h-4 w-4" />
-          Début = temps actuel
+          {t("timeline.setStartToCurrent")}
         </button>
         <button
           className="ghost-button"
@@ -582,13 +580,13 @@ export function TrimTimeline({
           type="button"
         >
           <SkipForward className="h-4 w-4" />
-          Fin = temps actuel
+          {t("timeline.setEndToCurrent")}
         </button>
         <button
           className="icon-button"
           disabled={disabled}
           onClick={onReset}
-          title="Reset"
+          title={t("timeline.reset")}
           type="button"
         >
           <RotateCcw className="h-4 w-4" />
@@ -601,7 +599,7 @@ export function TrimTimeline({
           onClick={onSplit}
           type="button"
         >
-          Couper à la position
+          {t("timeline.split")}
         </button>
         <button
           className="ghost-button destructive"
@@ -609,7 +607,7 @@ export function TrimTimeline({
           onClick={onDeleteSegment}
           type="button"
         >
-          Supprimer segment
+          {t("timeline.deleteSegment")}
         </button>
         <button
           className="ghost-button"
@@ -617,7 +615,7 @@ export function TrimTimeline({
           onClick={onRestoreSegment}
           type="button"
         >
-          Restaurer
+          {t("timeline.restore")}
         </button>
         <button
           className="ghost-button"
@@ -625,12 +623,12 @@ export function TrimTimeline({
           onClick={onSetThumbnail}
           type="button"
         >
-          Utiliser cette frame comme miniature
+          {t("timeline.setThumbnail")}
         </button>
       </div>
       {thumbnailTime != null && (
         <div className="timeline-thumbnail-note">
-          Miniature choisie à {formatTimelineTime(thumbnailTime)}
+          {t("timeline.thumbnailChosen", { time: formatTimelineTime(thumbnailTime) })}
         </div>
       )}
     </section>

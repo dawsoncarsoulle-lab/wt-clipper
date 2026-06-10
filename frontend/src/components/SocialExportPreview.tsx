@@ -1,5 +1,6 @@
 import { BadgeCheck, ImageIcon, Smartphone, Youtube } from "lucide-react";
 import type { ClipEditorMode, SocialLayout } from "../types";
+import { useI18n } from "../i18n/I18nProvider";
 
 type SocialExportPreviewProps = {
   mode: ClipEditorMode;
@@ -18,16 +19,17 @@ export function SocialExportPreview({
   subtitle,
   watermark,
 }: SocialExportPreviewProps) {
+  const { t } = useI18n();
   if (mode !== "social_vertical") {
     return (
       <section className="editor-panel export-preview-panel">
         <div className="editor-panel-heading">
           <div>
-            <div className="editor-kicker">Preview</div>
+            <div className="editor-kicker">{t("editor.preview")}</div>
             <h3>
               {mode === "youtube_horizontal"
-                ? "YouTube horizontal"
-                : "Original coupé"}
+                ? t("editor.mode.youtubeHorizontal")
+                : t("editor.mode.trimOriginal")}
             </h3>
           </div>
           <Youtube className="h-5 w-5 text-ember" />
@@ -47,8 +49,8 @@ export function SocialExportPreview({
     <section className="editor-panel export-preview-panel">
       <div className="editor-panel-heading">
         <div>
-          <div className="editor-kicker">Preview</div>
-          <h3>TikTok / Reels / Shorts</h3>
+          <div className="editor-kicker">{t("editor.preview")}</div>
+          <h3>{t("editor.mode.socialVertical")}</h3>
         </div>
         <Smartphone className="h-5 w-5 text-ember" />
       </div>
@@ -87,10 +89,11 @@ export function SocialExportPreview({
 }
 
 function StaticPreviewFallback() {
+  const { t } = useI18n();
   return (
     <div className="static-preview-fallback">
       <ImageIcon className="h-7 w-7" />
-      <span>Aperçu statique</span>
+      <span>{t("editor.preview.static")}</span>
     </div>
   );
 }

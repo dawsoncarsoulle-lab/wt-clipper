@@ -30,6 +30,7 @@ import type {
 import { EditorExportProgressModal } from "./EditorExportProgressModal";
 import { SocialExportPreview } from "./SocialExportPreview";
 import { TrimTimeline } from "./TrimTimeline";
+import { useI18n } from "../i18n/I18nProvider";
 import {
   activeTimelineSegments,
   deleteTimelineSegment,
@@ -58,14 +59,14 @@ type EditorQualityPreset = "standard" | "high";
 
 const modeOptions: Array<{
   mode: ClipEditorMode;
-  label: string;
+  labelKey: string;
   icon: LucideIcon;
 }> = [
-  { mode: "trim_original", label: "Original coupé", icon: Scissors },
-  { mode: "youtube_horizontal", label: "YouTube", icon: Monitor },
+  { mode: "trim_original", labelKey: "editor.mode.trimOriginal", icon: Scissors },
+  { mode: "youtube_horizontal", labelKey: "editor.mode.youtubeHorizontal", icon: Monitor },
   {
     mode: "social_vertical",
-    label: "TikTok / Reels / Shorts",
+    labelKey: "editor.mode.socialVertical",
     icon: Smartphone,
   },
 ];
@@ -76,6 +77,7 @@ export function ClipEditorModal({
   onClose,
   onExportComplete,
 }: ClipEditorModalProps) {
+  const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const resumeAfterScrubRef = useRef(false);
   const segmentIdRef = useRef(0);
@@ -318,9 +320,9 @@ export function ClipEditorModal({
       return `${formatClipDuration(durationSeconds)} · ${videoMimeType.replace("video/", "").toUpperCase()}`;
     }
     const fps =
-      mediaInfo.fps > 0 ? `${Math.round(mediaInfo.fps)} FPS` : "FPS inconnu";
+      mediaInfo.fps > 0 ? `${Math.round(mediaInfo.fps)} FPS` : t("editor.loadingFps");
     return `${mediaInfo.width}x${mediaInfo.height} · ${fps} · ${mediaInfo.codec}`;
-  }, [durationSeconds, mediaInfo, videoMimeType]);
+  }, [durationSeconds, mediaInfo, videoMimeType, t]);
 
   function close() {
     if (exporting) {
@@ -518,8 +520,8 @@ export function ClipEditorModal({
     const video = videoRef.current;
     const error = video?.error;
     const message = error
-      ? `Erreur vidéo (${error.code}) pour ${activeSourcePath}`
-      : `Erreur vidéo pour ${activeSourcePath}`;
+      ? t("editor.videoError", { code: error.code, path: activeSourcePath })
+      : t("editor.videoErrorGeneric", { path: activeSourcePath });
     console.info("[EDITOR_VIDEO] error=", message);
     setMediaError(message);
   }
@@ -640,7 +642,7 @@ export function ClipEditorModal({
       active: true,
       step: "preparing",
       progress: 5,
-      message: "Préparation de l'export...",
+      message: t("editor.progress.preparing"),
     });
     const request = buildEditRequest({
       clip,
@@ -667,8 +669,8 @@ export function ClipEditorModal({
         step: "done",
         progress: 100,
         message: nextResult.replacedOriginal
-          ? "Clip original remplacé"
-          : "Export terminé",
+          ? t("editor.progress.replaced")
+          : t("editor.progress.done"),
         outputPath: nextResult.outputPath,
       });
       await onExportComplete();
@@ -680,7 +682,7 @@ export function ClipEditorModal({
         active: false,
         step: "failed",
         progress: 100,
-        message: "Erreur pendant l'export",
+        message: t("editor.progress.failed"),
         error: String(error),
       });
     } finally {
@@ -704,7 +706,7 @@ export function ClipEditorModal({
         >
           <header className="editor-header">
             <div className="min-w-0">
-              <div className="editor-kicker">Éditeur vidéo</div>
+              <div className="editor-kicker">{t("editor.kicker")}</div>
               <h2 className="truncate">{clip.fileName}</h2>
               <div className="mt-1 truncate text-sm text-zinc-500">
                 {mediaSummary}
@@ -714,7 +716,7 @@ export function ClipEditorModal({
               className="icon-button"
               disabled={exporting}
               onClick={close}
-              title="Fermer"
+              title={t("editor.close")}
             >
               <XCircle className="h-4 w-4" />
             </button>
@@ -747,7 +749,7 @@ export function ClipEditorModal({
                     ) : (
                       <Play className="h-4 w-4" />
                     )}
-                    {playing ? "Pause" : "Lecture"}
+                    {playing ? t("editor.pause") : t("editor.play")}
                   </button>
                   <div className="editor-timecode">
                     {formatClipDuration(currentSeconds)} /{" "}
@@ -812,8 +814,8 @@ export function ClipEditorModal({
               <section className="editor-panel">
                 <div className="editor-panel-heading">
                   <div>
-                    <div className="editor-kicker">Export</div>
-                    <h3>Preset</h3>
+                    <div className="editor-kicker">{t("editor.export.section")}</div>
+                    <h3>{t("editor.export.preset")}</h3>
                   </div>
                   <Film className="h-5 w-5 text-ember" />
                 </div>
@@ -828,7 +830,7 @@ export function ClipEditorModal({
                         onClick={() => setMode(option.mode)}
                       >
                         <Icon className="h-4 w-4" />
-                        {option.label}
+                        {t(option.labelKey)}
                       </button>
                     );
                   })}
@@ -856,8 +858,8 @@ export function ClipEditorModal({
               <section className="editor-panel">
                 <div className="editor-panel-heading">
                   <div>
-                    <div className="editor-kicker">Options</div>
-                    <h3>Social vertical</h3>
+                    <div className="editor-kicker">{t("editor.options.section")}</div>
+                    <h3>{t("editor.options.socialVertical")}</h3>
                   </div>
                   <Sparkles className="h-5 w-5 text-ember" />
                 </div>
@@ -871,7 +873,7 @@ export function ClipEditorModal({
                       }
                       type="checkbox"
                     />
-                    <span>Fond flou</span>
+                    <span>{t("editor.options.blurBackground")}</span>
                   </label>
                   <label>
                     <input
@@ -880,7 +882,7 @@ export function ClipEditorModal({
                       onChange={(event) => setWatermark(event.target.checked)}
                       type="checkbox"
                     />
-                    <span>Watermark WT Clip</span>
+                    <span>{t("editor.options.watermark")}</span>
                   </label>
                   <label>
                     <input
@@ -889,12 +891,12 @@ export function ClipEditorModal({
                       onChange={(event) => setAutoTitle(event.target.checked)}
                       type="checkbox"
                     />
-                    <span>Titre automatique</span>
+                    <span>{t("editor.options.autoTitle")}</span>
                   </label>
                 </div>
                 <div className="editor-field-stack">
                   <label className="field compact-field">
-                    <span>Titre</span>
+                    <span>{t("editor.options.title")}</span>
                     <input
                       disabled={
                         exporting || autoTitle || mode !== "social_vertical"
@@ -904,7 +906,7 @@ export function ClipEditorModal({
                     />
                   </label>
                   <label className="field compact-field">
-                    <span>Sous-titre</span>
+                    <span>{t("editor.options.subtitle")}</span>
                     <input
                       disabled={exporting || mode !== "social_vertical"}
                       onChange={(event) => setSubtitle(event.target.value)}
@@ -917,14 +919,14 @@ export function ClipEditorModal({
                       disabled={exporting}
                       onClick={() => setQuality("standard")}
                     >
-                      Standard
+                      {t("editor.quality.standard")}
                     </button>
                     <button
                       className={quality === "high" ? "active" : ""}
                       disabled={exporting}
                       onClick={() => setQuality("high")}
                     >
-                      Haute
+                      {t("editor.quality.high")}
                     </button>
                   </div>
                 </div>
@@ -933,8 +935,8 @@ export function ClipEditorModal({
               <section className="editor-panel">
                 <div className="editor-panel-heading">
                   <div>
-                    <div className="editor-kicker">Sauvegarde</div>
-                    <h3>Mode de sortie</h3>
+                    <div className="editor-kicker">{t("editor.save.section")}</div>
+                    <h3>{t("editor.save.outputMode")}</h3>
                   </div>
                   <FolderOpen className="h-5 w-5 text-ember" />
                 </div>
@@ -948,11 +950,8 @@ export function ClipEditorModal({
                       type="radio"
                     />
                     <span>
-                      <strong>Créer une copie</strong>
-                      <small>
-                        Le clip original reste intact. La nouvelle vidéo sera
-                        créée dans Edited/ ou Social/.
-                      </small>
+                      <strong>{t("editor.save.createCopy")}</strong>
+                      <small>{t("editor.save.createCopyDescription")}</small>
                     </span>
                   </label>
                   <label
@@ -970,21 +969,15 @@ export function ClipEditorModal({
                       type="radio"
                     />
                     <span>
-                      <strong>Remplacer l’original</strong>
-                      <small>
-                        Disponible uniquement pour une timeline à un seul
-                        segment.
-                      </small>
+                      <strong>{t("editor.save.replaceOriginal")}</strong>
+                      <small>{t("editor.save.replaceOriginalDescription")}</small>
                     </span>
                   </label>
                 </div>
                 {saveMode === "replace_original" && (
                   <div className="editor-warning">
                     <AlertTriangle className="h-4 w-4" />
-                    <span>
-                      Attention : cette action remplacera le clip original. Une
-                      sauvegarde sera créée dans Backups/.
-                    </span>
+                    <span>{t("editor.save.replaceWarning")}</span>
                   </div>
                 )}
               </section>
@@ -1013,7 +1006,7 @@ export function ClipEditorModal({
                 type="checkbox"
               />
               <FolderOpen className="h-4 w-4" />
-              Ouvrir dossier après export
+              {t("editor.openFolderAfterExport")}
             </label>
             <div className="flex gap-2">
               <button
@@ -1021,7 +1014,7 @@ export function ClipEditorModal({
                 disabled={exporting}
                 onClick={close}
               >
-                Annuler
+                {t("editor.cancel")}
               </button>
               <button
                 className="primary-action w-fit px-5"
@@ -1030,10 +1023,10 @@ export function ClipEditorModal({
               >
                 <Download className="h-4 w-4" />
                 {exporting
-                  ? "Export en cours..."
+                  ? t("editor.exporting")
                   : saveMode === "replace_original"
-                    ? `Remplacer ${formatClipDuration(exportDuration)}`
-                    : `Exporter ${formatClipDuration(exportDuration)}`}
+                    ? t("editor.replaceButton", { duration: formatClipDuration(exportDuration) })
+                    : t("editor.exportButton", { duration: formatClipDuration(exportDuration) })}
               </button>
             </div>
           </footer>
@@ -1055,12 +1048,9 @@ export function ClipEditorModal({
                 <AlertTriangle className="h-5 w-5" />
               </div>
               <div>
-                <div className="editor-kicker">Confirmation</div>
-                <h3>Remplacer l’original ?</h3>
-                <p>
-                  Voulez-vous vraiment remplacer ce clip ? Le fichier original
-                  sera sauvegardé avant modification.
-                </p>
+                <div className="editor-kicker">{t("editor.confirm.kicker")}</div>
+                <h3>{t("editor.confirm.title")}</h3>
+                <p>{t("editor.confirm.description")}</p>
               </div>
               <div className="editor-confirm-actions">
                 <button
@@ -1068,14 +1058,14 @@ export function ClipEditorModal({
                   disabled={exporting}
                   onClick={() => setConfirmReplaceOpen(false)}
                 >
-                  Annuler
+                  {t("editor.cancel")}
                 </button>
                 <button
                   className="primary-action w-fit px-5"
                   disabled={exporting}
                   onClick={() => void exportClip()}
                 >
-                  Remplacer l’original
+                  {t("editor.confirm.replace")}
                 </button>
               </div>
             </motion.section>
