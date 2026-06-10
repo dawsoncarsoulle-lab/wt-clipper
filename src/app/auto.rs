@@ -231,7 +231,11 @@ pub async fn run_auto_clip(
 ) -> anyhow::Result<()> {
     let mut command_rx = auto_config.command_rx.take();
     let gsr = GpuScreenRecorderHandle::new(auto_config.capture.clone());
-    if auto_config.capture.capture_strategy.should_wait_for_war_thunder() {
+    if auto_config
+        .capture
+        .capture_strategy
+        .should_wait_for_war_thunder()
+    {
         gsr.mark_waiting_for_war_thunder().await;
         println!(
             "[CAPTURE] strategy={:?}: waiting for War Thunder localhost before resolving capture target",
@@ -495,18 +499,18 @@ pub async fn run_auto_clip(
     result
 }
 
-
 async fn ensure_gsr_started_after_war_thunder_connected(
     gsr: &GpuScreenRecorderHandle,
     auto_config: &AutoClipConfig,
 ) {
     let status = gsr.status().await;
-    if matches!(status.health, GsrHealth::Running | GsrHealth::SavingReplay | GsrHealth::Starting) {
+    if matches!(
+        status.health,
+        GsrHealth::Running | GsrHealth::SavingReplay | GsrHealth::Starting
+    ) {
         return;
     }
-    println!(
-        "[CAPTURE] War Thunder localhost detected; resolving capture target and starting GSR"
-    );
+    println!("[CAPTURE] War Thunder localhost detected; resolving capture target and starting GSR");
     if let Err(error) = gsr.start().await {
         let message = format!("GPU Screen Recorder: {error}");
         error!(%message, "failed to start GSR after War Thunder localhost connection");

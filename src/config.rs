@@ -74,7 +74,6 @@ pub struct CaptureConfig {
     pub audio_input: String,
 }
 
-
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureStrategy {

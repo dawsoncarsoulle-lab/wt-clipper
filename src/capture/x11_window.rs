@@ -44,7 +44,11 @@ pub fn detect_war_thunder_window_x11() -> Option<X11WindowInfo> {
 }
 
 pub fn list_x11_windows() -> anyhow::Result<Vec<X11WindowInfo>> {
-    if std::env::var("DISPLAY").ok().filter(|value| !value.trim().is_empty()).is_none() {
+    if std::env::var("DISPLAY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+    {
         return Ok(Vec::new());
     }
 
@@ -60,11 +64,8 @@ pub fn list_x11_windows() -> anyhow::Result<Vec<X11WindowInfo>> {
         let class_name = get_wm_class(&connection, window).ok().flatten();
         let pid = get_window_pid(&connection, window).ok().flatten();
         let process_cmdline = pid.and_then(read_process_cmdline);
-        let score = score_war_thunder_window(
-            &title,
-            class_name.as_deref(),
-            process_cmdline.as_deref(),
-        );
+        let score =
+            score_war_thunder_window(&title, class_name.as_deref(), process_cmdline.as_deref());
         infos.push(X11WindowInfo {
             id: window,
             id_hex: format!("0x{window:x}"),
@@ -90,7 +91,10 @@ fn get_window_list(
     let reply = connection
         .get_property(false, root, client_list, AtomEnum::WINDOW, 0, u32::MAX)?
         .reply()?;
-    Ok(reply.value32().map(|values| values.collect()).unwrap_or_default())
+    Ok(reply
+        .value32()
+        .map(|values| values.collect())
+        .unwrap_or_default())
 }
 
 fn get_window_title(connection: &RustConnection, window: Window) -> anyhow::Result<String> {
@@ -99,8 +103,13 @@ fn get_window_title(connection: &RustConnection, window: Window) -> anyhow::Resu
     if let Some(title) = get_string_property(connection, window, net_wm_name, utf8)? {
         return Ok(title);
     }
-    Ok(get_string_property(connection, window, AtomEnum::WM_NAME.into(), AtomEnum::STRING.into())?
-        .unwrap_or_default())
+    Ok(get_string_property(
+        connection,
+        window,
+        AtomEnum::WM_NAME.into(),
+        AtomEnum::STRING.into(),
+    )?
+    .unwrap_or_default())
 }
 
 fn get_wm_class(connection: &RustConnection, window: Window) -> anyhow::Result<Option<String>> {
@@ -109,7 +118,8 @@ fn get_wm_class(connection: &RustConnection, window: Window) -> anyhow::Result<O
         window,
         AtomEnum::WM_CLASS.into(),
         AtomEnum::STRING.into(),
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     let class = raw
@@ -134,7 +144,9 @@ fn get_string_property(
     property: u32,
     ty: u32,
 ) -> anyhow::Result<Option<String>> {
-    let reply = connection.get_property(false, window, property, ty, 0, u32::MAX)?.reply()?;
+    let reply = connection
+        .get_property(false, window, property, ty, 0, u32::MAX)?
+        .reply()?;
     if reply.value.is_empty() {
         return Ok(None);
     }
@@ -194,7 +206,10 @@ fn score_war_thunder_window(
     }
 
     for pattern in WAR_THUNDER_PATTERNS {
-        if title.contains(pattern) || class_name.contains(pattern) || process_cmdline.contains(pattern) {
+        if title.contains(pattern)
+            || class_name.contains(pattern)
+            || process_cmdline.contains(pattern)
+        {
             score += 10;
         }
     }
@@ -223,6 +238,9 @@ mod tests {
 
     #[test]
     fn ignores_unrelated_window() {
-        assert_eq!(score_war_thunder_window("Firefox", Some("firefox"), None), 0);
+        assert_eq!(
+            score_war_thunder_window("Firefox", Some("firefox"), None),
+            0
+        );
     }
 }
