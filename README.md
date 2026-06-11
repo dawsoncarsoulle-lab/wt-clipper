@@ -44,6 +44,10 @@ Recommended path: docs/images/dashboard.png -->
   <img src="docs/images/dashboard.png" alt="WT Clipper dashboard" width="90%" />
 </p>
 
+<p align="center">
+  <img src="docs/images/dashboard_bottom.png" alt="WT Clipper dashboard" width="90%" />
+</p>
+
 ### Automatic capture on X11 / Wayland
 
 ### Clip gallery

@@ -232,6 +232,55 @@ export type DoctorReport = {
   }>;
 };
 
+export type RequirementStatus = "ok" | "warning" | "error" | "missing" | "unknown";
+
+export type RequirementCheck = {
+  id: string;
+  label: string;
+  status: RequirementStatus;
+  summary: string;
+  summary_key?: string | null;
+  details?: string | null;
+  command?: string | null;
+  version?: string | null;
+  path?: string | null;
+};
+
+export type InstallCommands = {
+  install_gsr_flatpak: string;
+  install_ffmpeg_apt: string;
+  install_ffmpeg_pacman: string;
+  install_ffmpeg_dnf: string;
+  install_flatpak_apt: string;
+};
+
+export type DiagnosticLogsSummary = {
+  recent_logs: string[];
+  logs_path?: string | null;
+  can_copy_logs: boolean;
+};
+
+export type SystemRequirementsReport = {
+  app_version: string;
+  os?: string | null;
+  session_type?: string | null;
+  war_thunder_api: RequirementCheck;
+  flatpak: RequirementCheck;
+  gsr_flatpak: RequirementCheck;
+  gsr_native: RequirementCheck;
+  ffmpeg: RequirementCheck;
+  ffprobe: RequirementCheck;
+  capture_mode: string;
+  capture_strategy: string;
+  configured_target: string;
+  effective_target?: string | null;
+  target_reason?: string | null;
+  output_dir: RequirementCheck;
+  config_dir: RequirementCheck;
+  install_commands: InstallCommands;
+  logs: DiagnosticLogsSummary;
+};
+
 export type RuntimeStatus = {
   wtConnected: boolean;
   gsrAvailable: boolean;
