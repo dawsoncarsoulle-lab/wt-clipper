@@ -5,7 +5,9 @@ import { listen } from "@tauri-apps/api/event";
 import {
   Activity,
   CheckCircle2,
+  Clipboard,
   Cpu,
+  FileText,
   FolderOpen,
   Gauge,
   HardDrive,
@@ -45,7 +47,10 @@ import type {
   DoctorReport,
   GalleryClipItem,
   GsrHealth,
+  RequirementCheck,
+  RequirementStatus,
   RuntimeStatus,
+  SystemRequirementsReport,
 } from "./types";
 
 const nav = [
@@ -1129,19 +1134,65 @@ function Diagnostics() {
   const { diagnostics, runtimeStatus, setDiagnostics, setDiagnosticsRunning, setRuntimeStatus, diagnosticsRunning, showToast } =
     useAppStore();
   const [gsrTestRunning, setGsrTestRunning] = useState(false);
+  const [requirements, setRequirements] = useState<SystemRequirementsReport | null>(null);
 
-  async function run() {
-    setDiagnosticsRunning(true);
+  useEffect(() => {
+    void refreshDiagnostics({ showSpinner: true, includeDoctor: true });
+    const interval = window.setInterval(() => {
+      void refreshDiagnostics({ showSpinner: false, includeDoctor: false });
+    }, 4000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  async function refreshDiagnostics({ showSpinner, includeDoctor }: { showSpinner: boolean; includeDoctor: boolean }) {
+    if (showSpinner) {
+      setDiagnosticsRunning(true);
+    }
     try {
-      const [report, status] = await Promise.all([
-        invoke<DoctorReport>("run_diagnostics"),
+      const [status, systemRequirements, report] = await Promise.all([
         invoke<RuntimeStatus>("get_runtime_status"),
+        invoke<SystemRequirementsReport>("get_system_requirements"),
+        includeDoctor ? invoke<DoctorReport>("run_diagnostics") : Promise.resolve(null),
       ]);
-      setDiagnostics(report);
       setRuntimeStatus(status);
+      setRequirements(systemRequirements);
+      if (report) {
+        setDiagnostics(report);
+      } else if (showSpinner) {
+        setDiagnosticsRunning(false);
+      }
     } catch (error) {
       showToast(String(error));
-      setDiagnosticsRunning(false);
+      if (showSpinner) {
+        setDiagnosticsRunning(false);
+      }
+    }
+  }
+
+  async function copyTextFromCommand(command: "get_diagnostics_report" | "get_recent_logs", successKey: string) {
+    try {
+      const text = await invoke<string>(command);
+      await navigator.clipboard.writeText(text);
+      showToast(t(successKey));
+    } catch (error) {
+      showToast(t("diagnostics.messages.copyError", { message: String(error) }));
+    }
+  }
+
+  async function copyInstallCommand(command: string) {
+    try {
+      await navigator.clipboard.writeText(command);
+      showToast(t("diagnostics.messages.copySuccess"));
+    } catch (error) {
+      showToast(t("diagnostics.messages.copyError", { message: String(error) }));
+    }
+  }
+
+  async function openDiagnosticsFolder(command: "open_config_folder" | "open_output_folder") {
+    try {
+      await invoke(command);
+    } catch (error) {
+      showToast(String(error));
     }
   }
 
@@ -1170,10 +1221,10 @@ function Diagnostics() {
     }
   }
 
-  const checks = diagnostics?.checks ?? [];
-  const counts = checks.reduce(
+  const requirementChecks = requirements ? requirementsList(requirements) : [];
+  const counts = requirementChecks.reduce(
     (acc, check) => ({ ...acc, [check.status]: acc[check.status] + 1 }),
-    { ok: 0, warn: 0, error: 0 },
+    { ok: 0, warning: 0, error: 0, missing: 0, unknown: 0 },
   );
 
   return (
@@ -1182,32 +1233,83 @@ function Diagnostics() {
         <div className="panel-heading">
           <div>
             <span className="eyebrow">{t("diagnostics.eyebrow")}</span>
-            <h2>{t("diagnostics.title")}</h2>
+            <h2>{t("diagnostics.requirements.title")}</h2>
+            <p>{t("diagnostics.requirements.subtitle")}</p>
           </div>
           <div className="button-row">
-            <button type="button" className="secondary" onClick={run} disabled={diagnosticsRunning}>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => void refreshDiagnostics({ showSpinner: true, includeDoctor: true })}
+              disabled={diagnosticsRunning}
+            >
               <RefreshCcw size={17} />
-              {diagnosticsRunning ? t("actions.analyzing") : t("actions.rerun")}
+              {diagnosticsRunning ? t("actions.analyzing") : t("diagnostics.actions.refresh")}
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => void copyTextFromCommand("get_diagnostics_report", "diagnostics.messages.copySuccess")}
+            >
+              <FileText size={17} />
+              {t("diagnostics.actions.copyReport")}
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => void copyTextFromCommand("get_recent_logs", "diagnostics.messages.copySuccess")}
+            >
+              <Clipboard size={17} />
+              {t("diagnostics.actions.copyLogs")}
             </button>
             <button type="button" className="secondary" onClick={restartGpuRecorder}>
               <Cpu size={17} />
-              {t("actions.restartGpuRecorder")}
+              {t("diagnostics.actions.restartGpuRecorder")}
             </button>
             <button type="button" className="primary" onClick={testGsrSaveReplay} disabled={gsrTestRunning}>
               <Play size={17} />
-              {t("actions.testGsrSave")}
+              {t("diagnostics.actions.testGsrSave")}
             </button>
           </div>
         </div>
         <div className="status-summary">
-          <span className="status-chip ok">{counts.ok} OK</span>
-          <span className="status-chip warn">{counts.warn} {counts.warn === 1 ? t("status.warning_one") : t("status.warning_other")}</span>
-          <span className="status-chip error">{counts.error} {counts.error === 1 ? t("status.error_one") : t("status.error_other")}</span>
+          <span className="status-chip ok">{counts.ok} {t("diagnostics.status.ok")}</span>
+          <span className="status-chip warn">{counts.warning} {t("diagnostics.status.warning")}</span>
+          <span className="status-chip error">{counts.error} {t("diagnostics.status.error")}</span>
+          <span className="status-chip error">{counts.missing} {t("diagnostics.status.missing")}</span>
+          <span className="status-chip">{counts.unknown} {t("diagnostics.status.unknown")}</span>
         </div>
-        <div className="diagnostic-list">
-          {checks.map((check) => (
-            <DiagnosticRow key={check.name} check={check} />
-          ))}
+        {requirements && (
+          <div className="kv-grid diagnostics-context">
+            <KeyValue label={t("diagnostics.key.appVersion")} value={requirements.app_version} />
+            <KeyValue label={t("diagnostics.key.sessionType")} value={requirements.session_type ?? "-"} />
+            <KeyValue label={t("diagnostics.key.mode")} value={requirements.capture_mode} />
+            <KeyValue label={t("diagnostics.key.captureStrategy")} value={requirements.capture_strategy} />
+            <KeyValue label={t("diagnostics.key.configuredTarget")} value={requirements.configured_target || "-"} />
+            <KeyValue label={t("diagnostics.key.effectiveTarget")} value={requirements.effective_target ?? "-"} />
+            <KeyValue label={t("diagnostics.key.targetReason")} value={requirements.target_reason ?? "-"} />
+          </div>
+        )}
+        <div className="requirements-grid">
+          {requirements ? (
+            requirementChecks.map((check) => (
+              <RequirementCard
+                key={check.id}
+                check={check}
+                label={requirementLabel(check, t)}
+                onCopyCommand={check.command ? () => void copyInstallCommand(check.command ?? "") : undefined}
+                onOpenFolder={
+                  check.id === "output_dir"
+                    ? () => void openDiagnosticsFolder("open_output_folder")
+                    : check.id === "config_dir"
+                      ? () => void openDiagnosticsFolder("open_config_folder")
+                      : undefined
+                }
+              />
+            ))
+          ) : (
+            <Empty label={diagnostics?.summary ?? t("config.loading")} />
+          )}
         </div>
       </div>
 
@@ -1258,6 +1360,106 @@ function Diagnostics() {
       </div>
     </section>
   );
+}
+
+function requirementsList(report: SystemRequirementsReport): RequirementCheck[] {
+  return [
+    report.war_thunder_api,
+    report.flatpak,
+    report.gsr_flatpak,
+    report.gsr_native,
+    report.ffmpeg,
+    report.ffprobe,
+    report.output_dir,
+    report.config_dir,
+  ];
+}
+
+function requirementLabel(check: RequirementCheck, t: Translate) {
+  const labels: Record<string, string> = {
+    war_thunder_api: t("diagnostics.tools.warThunderApi"),
+    flatpak: t("diagnostics.tools.flatpak"),
+    gsr_flatpak: t("diagnostics.tools.gsrFlatpak"),
+    gsr_native: t("diagnostics.tools.gsrNative"),
+    ffmpeg: t("diagnostics.tools.ffmpeg"),
+    ffprobe: t("diagnostics.tools.ffprobe"),
+    output_dir: t("diagnostics.tools.outputDir"),
+    config_dir: t("diagnostics.tools.configDir"),
+  };
+  return labels[check.id] ?? check.label;
+}
+
+function RequirementCard({
+  check,
+  label,
+  onCopyCommand,
+  onOpenFolder,
+}: {
+  check: RequirementCheck;
+  label: string;
+  onCopyCommand?: () => void;
+  onOpenFolder?: () => void;
+}) {
+  const { t } = useI18n();
+  const Icon = requirementIcon(check.status);
+  return (
+    <article className={`requirement-card ${requirementClass(check.status)}`}>
+      <div className="requirement-card-heading">
+        <Icon size={19} />
+        <div>
+          <strong>{label}</strong>
+          <span className={`status-chip ${requirementClass(check.status)}`}>{requirementStatusLabel(check.status, t)}</span>
+        </div>
+      </div>
+      <p>{requirementSummary(check, t)}</p>
+      {check.details && <small>{check.details}</small>}
+      {(check.version || check.path) && (
+        <div className="requirement-meta">
+          {check.version && <code>{check.version}</code>}
+          {check.path && <code>{check.path}</code>}
+        </div>
+      )}
+      <div className="button-row">
+        {onCopyCommand && (
+          <button type="button" className="secondary" onClick={onCopyCommand}>
+            <Clipboard size={15} />
+            {t("diagnostics.actions.copyCommand")}
+          </button>
+        )}
+        {onOpenFolder && (
+          <button type="button" className="secondary" onClick={onOpenFolder}>
+            <FolderOpen size={15} />
+            {check.id === "config_dir" ? t("diagnostics.actions.openConfigFolder") : t("diagnostics.actions.openOutputFolder")}
+          </button>
+        )}
+      </div>
+    </article>
+  );
+}
+
+function requirementIcon(status: RequirementStatus) {
+  if (status === "ok") return CheckCircle2;
+  if (status === "warning" || status === "unknown") return ShieldAlert;
+  return XCircle;
+}
+
+function requirementClass(status: RequirementStatus) {
+  if (status === "ok") return "ok";
+  if (status === "warning" || status === "unknown") return "warn";
+  return "error";
+}
+
+function requirementStatusLabel(status: RequirementStatus, t: Translate) {
+  return t(`diagnostics.status.${status}`);
+}
+
+function requirementSummary(check: RequirementCheck, t: Translate) {
+  if (check.summary_key) {
+    return t(check.summary_key);
+  }
+  const fallbackKey = `diagnostics.summary.${check.id}.${check.status}`;
+  const translated = t(fallbackKey);
+  return translated === fallbackKey ? check.summary : translated;
 }
 
 function ConfigSection({ title, children }: { title: string; children: ReactNode }) {

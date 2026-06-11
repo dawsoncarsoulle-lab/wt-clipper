@@ -195,6 +195,88 @@ select {
   border-bottom: 0;
 }
 
+.requirements-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.diagnostics-context {
+  margin-top: 14px;
+}
+
+.requirement-card {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-height: 188px;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 8px;
+  background: rgba(255,255,255,.04);
+  padding: 14px;
+}
+
+.requirement-card.ok {
+  border-color: rgba(74, 222, 128, .2);
+}
+
+.requirement-card.warn {
+  border-color: rgba(251, 191, 36, .24);
+}
+
+.requirement-card.error {
+  border-color: rgba(251, 113, 133, .26);
+}
+
+.requirement-card-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.requirement-card-heading > div {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.requirement-card-heading svg {
+  margin-top: 3px;
+}
+
+.requirement-card p {
+  margin: 0;
+  color: #c8d0dd;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.requirement-card small {
+  color: #8d97aa;
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.requirement-meta {
+  display: grid;
+  gap: 6px;
+}
+
+.requirement-meta code {
+  overflow-wrap: anywhere;
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 6px;
+  background: rgba(0,0,0,.2);
+  padding: 7px 8px;
+  color: #dbe4f2;
+  font-size: 11px;
+}
+
 .badge,
 .reason {
   border-radius: 999px;
@@ -1903,7 +1985,8 @@ select {
   .config-layout,
   .clip-grid,
   .form-grid,
-  .kv-grid {
+  .kv-grid,
+  .requirements-grid {
     grid-template-columns: 1fr;
   }
 
