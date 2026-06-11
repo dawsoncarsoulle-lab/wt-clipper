@@ -41,11 +41,7 @@ Recommended screenshot:
 Recommended path: docs/images/dashboard.png -->
 
 <p align="center">
-  <img src="docs/images/dashboard.png" alt="WT Clipper dashboard" width="90%" />
-</p>
-
-<p align="center">
-  <img src="docs/images/dashboard_bottom.png" alt="WT Clipper dashboard" width="90%" />
+  <img src="docs/images/dash.png" alt="WT Clipper dashboard" width="90%" />
 </p>
 
 ### Automatic capture on X11 / Wayland
@@ -92,7 +88,11 @@ Recommended screenshot:
 Recommended path: docs/images/diagnostics.png -->
 
 <p align="center">
-  <img src="docs/images/diagnostics.png" alt="WT Clipper diagnostics" width="90%" />
+  <img src="docs/images/diag.png" alt="WT Clipper diagnostics" width="90%" />
+</p>
+
+<p align="center">
+  <img src="docs/images/diag_bottom.png" alt="WT Clipper dashboard" width="90%" />
 </p>
 
 ---
