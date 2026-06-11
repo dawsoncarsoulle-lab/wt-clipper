@@ -5439,7 +5439,7 @@ dependencies = [
 
 [[package]]
 name = "wt-clipper"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5460,7 +5460,7 @@ dependencies = [
 
 [[package]]
 name = "wt-clipper-tauri"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "chrono",
