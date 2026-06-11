@@ -30,7 +30,7 @@ use wt_clipper::{
         gpu_screen_recorder::{GsrHealth, GsrStatus},
     },
     config::{default_config_path, AppConfig},
-    doctor::{self, DoctorReport},
+    doctor::{self, DiagnosticRuntimeContext, DoctorReport, SystemRequirementsReport},
     warthunder::client::WarThunderClient,
 };
 
@@ -438,6 +438,25 @@ async fn run_diagnostics(state: State<'_, BackendState>) -> Result<DoctorReport,
 }
 
 #[tauri::command]
+async fn get_system_requirements(
+    state: State<'_, BackendState>,
+) -> Result<SystemRequirementsReport, String> {
+    build_system_requirements_for_state(&state).await
+}
+
+#[tauri::command]
+async fn get_diagnostics_report(state: State<'_, BackendState>) -> Result<String, String> {
+    let report = build_system_requirements_for_state(&state).await?;
+    Ok(doctor::format_system_requirements_report(&report))
+}
+
+#[tauri::command]
+async fn get_recent_logs(state: State<'_, BackendState>) -> Result<String, String> {
+    let report = build_system_requirements_for_state(&state).await?;
+    Ok(doctor::format_recent_logs(&report))
+}
+
+#[tauri::command]
 fn save_manual_clip(state: State<'_, BackendState>) -> Result<(), String> {
     state
         .auto_cmd_tx
@@ -516,6 +535,56 @@ fn open_parent_folder(path: String) -> Result<(), String> {
     editor::open_parent_folder(path)
 }
 
+#[tauri::command]
+fn open_config_folder(state: State<'_, BackendState>) -> Result<(), String> {
+    let folder = state
+        .config_path
+        .parent()
+        .ok_or_else(|| "Config folder not found.".to_owned())?;
+    editor::open_path(folder.display().to_string())
+}
+
+async fn build_system_requirements_for_state(
+    state: &BackendState,
+) -> Result<SystemRequirementsReport, String> {
+    let config = AppConfig::load(Some(&state.config_path)).map_err(|error| error.to_string())?;
+    let runtime = diagnostics_runtime_context(state)?;
+    Ok(doctor::build_system_requirements_report(&config, Some(runtime)).await)
+}
+
+fn diagnostics_runtime_context(state: &BackendState) -> Result<DiagnosticRuntimeContext, String> {
+    state
+        .runtime_status
+        .lock()
+        .map(|status| {
+            let mut logs: Vec<String> = status
+                .recent_events
+                .iter()
+                .rev()
+                .take(100)
+                .map(|event| format!("[{}] {:?}: {}", event.at, event.kind, event.description))
+                .collect();
+            logs.reverse();
+            if let Some(error) = &status.last_error {
+                logs.push(format!("[APP] {error}"));
+            }
+            if let Some(error) = &status.gsr_last_error {
+                logs.push(format!("[GPU_RECORDER] {error}"));
+            }
+            if logs.is_empty() {
+                logs.push("No persistent log file configured yet.".to_owned());
+            }
+            DiagnosticRuntimeContext {
+                war_thunder_connected: Some(status.wt_connected),
+                effective_target: Some(status.gsr_target.clone()).filter(|target| !target.is_empty()),
+                target_reason: Some(status.gsr_target_reason.clone()).filter(|reason| !reason.is_empty()),
+                gsr_command_line: status.gsr_command_line.clone(),
+                recent_logs: logs,
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -553,6 +622,9 @@ fn main() {
             delete_clip,
             open_output_folder,
             run_diagnostics,
+            get_system_requirements,
+            get_diagnostics_report,
+            get_recent_logs,
             save_manual_clip,
             test_gsr_save_replay,
             restart_gpu_recorder,
@@ -562,7 +634,8 @@ fn main() {
             get_clip_media_info,
             get_timeline_thumbnails,
             open_path,
-            open_parent_folder
+            open_parent_folder,
+            open_config_folder
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
