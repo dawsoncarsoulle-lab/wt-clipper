@@ -1562,7 +1562,7 @@ mod tests {
             )
         };
         SystemRequirementsReport {
-            app_version: "0.2.3".to_owned(),
+            app_version: "0.2.4".to_owned(),
             os: Some("linux".to_owned()),
             session_type: Some("wayland".to_owned()),
             war_thunder_api: RequirementCheck::warning(
