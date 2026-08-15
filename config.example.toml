@@ -1,0 +1,50 @@
+# Example configuration for WT Clipper.
+#
+# The real runtime config lives at:
+#   ~/.config/wt-clipper/config.toml
+#
+# You can generate a default config with:
+#   cargo run --release -- config init
+#
+# This file is only a reference; do not put real player names here.
+
+[clip]
+post_event_seconds = 5
+multi_kill_window_seconds = 8
+
+[library]
+output_dir = "~/Videos/WarThunder Clips"
+
+[capture]
+capture_strategy = "auto"
+target = ""
+mode = "flatpak"
+fps = 60
+replay_seconds = 25
+container = "mp4"
+codec = "h264"
+encoder = "gpu"
+quality = "very_high"
+bitrate_mode = "cbr"
+frame_rate_mode = "cfr"
+keyframe_interval_seconds = 1.0
+restart_replay_on_save = false
+video_bitrate_kbps = 20000
+output_dir = "~/Videos/WarThunder Clips/GSR"
+audio_enabled = true
+audio_input = "default_output"
+
+[war_thunder]
+base_url = "http://127.0.0.1:8111"
+player_name = ""
+poll_interval_ms = 300
+request_timeout_ms = 500
+
+[triggers]
+target_destroyed = true
+base_destroyed = true
+player_destroyed = false
+
+[storage]
+max_clips = 100
+max_storage_gb = 20
