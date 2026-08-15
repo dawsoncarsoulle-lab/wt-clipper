@@ -72,6 +72,7 @@ const frontendConfig: AppConfig = {
     output_dir: "~/Videos/WarThunder Clips",
   },
   capture: {
+    capture_strategy: "auto",
     target: "eDP",
     mode: "flatpak",
     fps: 60,
@@ -321,8 +322,8 @@ test("export_uses_timeline_trim_values", () => {
 
 test("existing_export_buttons_still_work", () => {
   const editor = source("src/components/ClipEditorModal.tsx");
-  assert(editor.includes("Exporter"), "export button missing");
-  assert(editor.includes("Remplacer"), "replace export button missing");
+  assert(editor.includes("editor.exportButton"), "export button missing");
+  assert(editor.includes("editor.save.replaceOriginal"), "replace export button missing");
 });
 
 const baseSegments = () => recalculateTimelineSegments([
@@ -395,7 +396,7 @@ test("multi_clip_selection_creates_segments", () => {
   const editor = source("src/components/ClipEditorModal.tsx");
   const app = source("src/App.tsx");
   assert(editor.includes("initialTimelineSegments(clips"), "editor should accept multiple clips");
-  assert(app.includes("Assembler"), "gallery should expose assemble action");
+  assert(app.includes("actions.assemble"), "gallery should expose assemble action");
 });
 
 test("set_current_frame_as_thumbnail", () => {
@@ -430,7 +431,7 @@ test("editor_does_not_create_multiple_video_elements", () => {
 test("video_uses_tauri_file_url_or_existing_preview_url", () => {
   const editor = source("src/components/ClipEditorModal.tsx");
   assert(editor.includes("sourcePreviewUrl") && editor.includes("convertFileSrc(sourcePath)"), "video should use preview URL or Tauri file URL");
-  assert(editor.includes("src={videoSrc}"), "video src prop missing");
+  assert(editor.includes('setAttribute("src", videoSrc)'), "video src prop missing");
 });
 
 test("clicking_segment_selects_it_without_scrubbing", () => {
@@ -441,8 +442,9 @@ test("clicking_segment_selects_it_without_scrubbing", () => {
 
 test("click_segment_selects_without_scrubbing", () => {
   const timeline = source("src/components/TrimTimeline.tsx");
-  assert(timeline.includes("beginSegmentPointerDrag"), "segment pointer selection should be isolated");
-  assert(timeline.includes("!drag.dragging"), "short segment click should not scrub");
+  assert(timeline.includes("function selectSegment"), "segment selection handler missing");
+  assert(timeline.includes("event.stopPropagation()"), "segment click should stop propagation");
+  assert(timeline.includes("onSegmentSelect(segmentId)"), "segment select callback missing");
 });
 
 test("clicking_timeline_background_moves_playhead", () => {
@@ -452,24 +454,25 @@ test("clicking_timeline_background_moves_playhead", () => {
 
 test("trim_start_handle_stops_event_propagation", () => {
   const timeline = source("src/components/TrimTimeline.tsx");
-  assert(timeline.includes('beginDrag(event, "start")'), "start handle drag missing");
+  assert(timeline.includes("beginSourceTrim"), "start handle drag missing");
+  assert(timeline.includes('"trim-start"'), "trim-start mode missing");
 });
 
 test("trim_start_does_not_move_playhead", () => {
   const timeline = source("src/components/TrimTimeline.tsx");
-  assert(timeline.includes('setInteractionMode(mode === "start" ? "trim-start"'), "trim start mode missing");
-  assert(timeline.includes('if (mode === "start")'), "trim start should have its own branch");
+  assert(timeline.includes("interactionMode !== \"drag-playhead\""), "trim should not use playhead mode");
+  assert(timeline.includes("continueSourceTrim"), "trim should have its own continue handler");
 });
 
 test("trim_end_handle_stops_event_propagation", () => {
   const timeline = source("src/components/TrimTimeline.tsx");
-  assert(timeline.includes('beginDrag(event, "end")'), "end handle drag missing");
+  assert(timeline.includes("beginSourceTrim"), "end handle drag missing");
+  assert(timeline.includes('"trim-end"'), "trim-end mode missing");
 });
 
 test("trim_end_does_not_move_playhead", () => {
   const timeline = source("src/components/TrimTimeline.tsx");
-  assert(timeline.includes('mode === "end" ? "trim-end"'), "trim end mode missing");
-  assert(timeline.includes('if (mode === "end")'), "trim end should have its own branch");
+  assert(timeline.includes("interactionMode !== \"trim-start\" && interactionMode !== \"trim-end\""), "trim continue should guard both modes");
 });
 
 test("trim_end_handle_can_be_dragged_multiple_times", () => {
@@ -479,14 +482,14 @@ test("trim_end_handle_can_be_dragged_multiple_times", () => {
 
 test("segment_drag_does_not_move_playhead", () => {
   const timeline = source("src/components/TrimTimeline.tsx");
-  assert(timeline.includes('setInteractionMode("drag-segment")'), "segment drag mode missing");
-  assert(timeline.includes("SEGMENT_DRAG_THRESHOLD_PX"), "segment drag should use a movement threshold");
+  assert(timeline.includes('setInteractionMode("drag-playhead")'), "playhead drag mode missing");
+  assert(timeline.includes("interactionMode !== \"drag-playhead\""), "non-playhead interactions should not scrub");
 });
 
 test("drag_segment_does_not_scrub", () => {
   const timeline = source("src/components/TrimTimeline.tsx");
   assert(timeline.includes("event.target !== event.currentTarget"), "background scrub should ignore segment targets");
-  assert(timeline.includes("beginSegmentPointerDrag"), "segment drag should use independent pointer handler");
+  assert(timeline.includes("function selectSegment"), "segment should use dedicated selection handler");
 });
 
 test("drag_segment_reorders_segments", () => {
@@ -497,7 +500,7 @@ test("drag_segment_reorders_segments", () => {
 
 test("playhead_drag_moves_playhead", () => {
   const timeline = source("src/components/TrimTimeline.tsx");
-  assert(timeline.includes('beginDrag(event, "playhead")'), "playhead drag should call playhead drag path");
+  assert(timeline.includes("beginPlayheadDrag"), "playhead drag should call playhead drag path");
 });
 
 test("active_segment_resolves_correct_source_time", () => {

@@ -1356,11 +1356,14 @@ fn select_effective_target(requested: &str, monitors: &[String]) -> String {
     if target_is_valid(requested, monitors) {
         return requested.to_owned();
     }
+    // Only fall back to a real monitor. A special target ("focused"/"portal")
+    // must never be silently substituted for a configured monitor target,
+    // otherwise an unconfigured/headless environment would override the user's
+    // capture target.
     monitors
         .iter()
         .find(|monitor| !is_special_capture_target(monitor))
         .cloned()
-        .or_else(|| monitors.first().cloned())
         .unwrap_or_else(|| requested.to_owned())
 }
 
