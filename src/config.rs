@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub triggers: TriggerConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub dota: crate::dota2::config::DotaConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -498,6 +500,10 @@ player_destroyed = false
 [storage]
 max_clips = 100
 max_storage_gb = 20
+
+[dota]
+port = 3838
+player_name = ""
 "#
 }
 

@@ -41,8 +41,11 @@ pub enum Command {
         #[arg(long)]
         include_history: bool,
     },
-    /// Run GPU Screen Recorder and save clips automatically on personal War Thunder events.
+    /// Run GPU Screen Recorder and save clips automatically on detected game events.
     Auto {
+        /// Which game to watch for events.
+        #[arg(long, default_value = "warthunder")]
+        game: String,
         /// Minimum delay between automatic clips.
         #[arg(long, default_value_t = 3)]
         cooldown_seconds: u64,
