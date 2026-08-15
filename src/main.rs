@@ -12,6 +12,7 @@ use wt_clipper::{
         client::{Endpoint, EndpointProbe, WarThunderClient},
         parser::{is_personal_kill, parse_gamechat_event},
         recent::RecentMessageCache,
+        source::WarThunderSource,
     },
 };
 
@@ -59,9 +60,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         } => {
             let config = AppConfig::load(cli.config.as_deref())?;
             let client = WarThunderClient::new(config.war_thunder.clone())?;
-            run_auto_clip(
+            let source = Box::new(WarThunderSource::new(
                 client,
                 config.war_thunder.clone(),
+                config.triggers.clone(),
+            ));
+            let poll_interval = config.war_thunder.poll_interval();
+            run_auto_clip(
+                source,
+                poll_interval,
                 AutoClipConfig {
                     cooldown: Duration::from_secs(cooldown_seconds),
                     post_event_delay: Duration::from_secs(

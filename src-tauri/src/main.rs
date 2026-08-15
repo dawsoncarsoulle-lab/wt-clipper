@@ -32,6 +32,7 @@ use wt_clipper::{
     config::{default_config_path, AppConfig},
     doctor::{self, DiagnosticRuntimeContext, DoctorReport, SystemRequirementsReport},
     warthunder::client::WarThunderClient,
+    warthunder::source::WarThunderSource,
 };
 
 static GALLERY_SCAN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -759,9 +760,15 @@ async fn run_auto_backend(
     auto_cmd_rx: mpsc::UnboundedReceiver<AutoClipCommand>,
 ) -> anyhow::Result<()> {
     let client = WarThunderClient::new(config.war_thunder.clone())?;
-    run_auto_clip(
+    let source = Box::new(WarThunderSource::new(
         client,
         config.war_thunder.clone(),
+        config.triggers.clone(),
+    ));
+    let poll_interval = config.war_thunder.poll_interval();
+    run_auto_clip(
+        source,
+        poll_interval,
         AutoClipConfig {
             cooldown: Duration::from_secs(3),
             post_event_delay: Duration::from_secs(config.clip.post_event_seconds),

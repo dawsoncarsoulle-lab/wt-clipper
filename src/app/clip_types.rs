@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::warthunder::events::WarThunderEvent;
+use crate::games::event::GameEvent;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -31,8 +31,8 @@ impl ClipReason {
 #[derive(Debug, Clone)]
 pub struct ClipContext {
     pub reason: ClipReason,
-    pub event: Option<WarThunderEvent>,
-    pub events: Vec<WarThunderEvent>,
+    pub event: Option<GameEvent>,
+    pub events: Vec<GameEvent>,
     pub player_name: Option<String>,
     pub pending_clip_id: Option<String>,
     pub pending_dedupe_key: Option<String>,

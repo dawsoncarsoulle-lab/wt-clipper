@@ -17,16 +17,10 @@ use crate::{
         events::{AppEvent, ClipStatus, ClipStatusPayload},
     },
     capture::gpu_screen_recorder::{GpuScreenRecorderHandle, GsrHealth, SavedGsrReplay},
-    config::{AppConfig, CaptureConfig, TriggerConfig, WarThunderConfig},
-    warthunder::{
-        client::{ChatMessage, WarThunderClient},
-        events::WarThunderEvent,
-        parser::parse_gamechat_event,
-        recent::{RecentEventCache, RecentMessageCache},
-    },
+    config::{AppConfig, CaptureConfig, TriggerConfig},
+    games::event::{GameEvent, GameEventKind},
+    games::source::GameSource,
 };
-
-const EVENT_DEDUPE_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct AutoClipConfig {
@@ -60,29 +54,6 @@ pub struct RuntimeConfigUpdateResult {
     pub applied_live: bool,
     pub restart_required: bool,
     pub message: String,
-}
-
-#[derive(Debug)]
-struct AutoWatchState {
-    last_chat_id: u64,
-    last_evt_msg_id: u64,
-    last_dmg_msg_id: u64,
-    seen_messages: RecentMessageCache,
-    seen_events: RecentEventCache,
-}
-
-impl AutoWatchState {
-    fn new() -> Self {
-        Self {
-            last_chat_id: 0,
-            last_evt_msg_id: 0,
-            last_dmg_msg_id: 0,
-            seen_messages: RecentMessageCache::new(1000),
-            // War Thunder can expose the same kill through multiple localhost endpoints.
-            // Keep this short so repeated identical kills are not suppressed for minutes.
-            seen_events: RecentEventCache::new(EVENT_DEDUPE_TTL),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -122,24 +93,22 @@ struct ScheduledClip {
     last_event_wall_time: SystemTime,
     save_at: Instant,
     event_keys: HashSet<String>,
-    events: Vec<WarThunderEvent>,
+    events: Vec<GameEvent>,
     descriptions: Vec<String>,
     retry_count: u8,
 }
 
 impl ScheduledClip {
     fn new(
-        event: WarThunderEvent,
-        event_key: String,
+        event: GameEvent,
         reason: ClipReason,
         event_time: Instant,
         event_game_time: Option<Duration>,
         event_wall_time: SystemTime,
         delay: Duration,
-        description: String,
     ) -> Self {
         let mut event_keys = HashSet::new();
-        event_keys.insert(event_key);
+        event_keys.insert(event.canonical_key.clone());
         Self {
             clip_id: format!("clip_{}", Uuid::new_v4()),
             created_at: Utc::now().to_rfc3339(),
@@ -150,32 +119,31 @@ impl ScheduledClip {
             last_event_wall_time: event_wall_time,
             save_at: event_time + delay,
             event_keys,
-            events: vec![event],
-            descriptions: vec![description],
+            events: vec![event.clone()],
+            descriptions: vec![event.summary],
             retry_count: 0,
         }
     }
 
     fn add_event(
         &mut self,
-        event: WarThunderEvent,
-        event_key: String,
+        event: GameEvent,
         event_time: Instant,
         event_game_time: Option<Duration>,
         event_wall_time: SystemTime,
         delay: Duration,
-        description: String,
     ) -> bool {
-        if !self.event_keys.insert(event_key) {
+        if !self.event_keys.insert(event.canonical_key.clone()) {
             return false;
         }
         self.last_event_time = event_time;
         self.last_event_game_time = event_game_time.or(self.last_event_game_time);
         self.last_event_wall_time = event_wall_time;
         self.save_at = event_time + delay;
+        let description = event.summary.clone();
         self.events.push(event);
         self.descriptions.push(description);
-        if self.events.len() > 1 && self.events.iter().all(is_target_destroyed_clip_event) {
+        if self.events.len() > 1 && self.events.iter().all(|e| e.kind == GameEventKind::Kill) {
             self.reason = ClipReason::MultiKill;
         }
         true
@@ -188,16 +156,15 @@ impl ScheduledClip {
     fn kill_count(&self) -> usize {
         self.events
             .iter()
-            .filter(|event| is_target_destroyed_clip_event(event))
+            .filter(|event| event.kind == GameEventKind::Kill)
             .count()
     }
 }
 
 #[derive(Debug, Clone)]
 struct DetectedEvent {
-    event: WarThunderEvent,
+    event: GameEvent,
     reason: ClipReason,
-    canonical_key: String,
     detected_at: Instant,
     game_time: Option<Duration>,
     detected_wall_time: SystemTime,
@@ -225,8 +192,8 @@ fn apply_runtime_config(
 }
 
 pub async fn run_auto_clip(
-    client: WarThunderClient,
-    warthunder_config: WarThunderConfig,
+    source: Box<dyn GameSource>,
+    poll_interval: Duration,
     mut auto_config: AutoClipConfig,
 ) -> anyhow::Result<()> {
     let mut command_rx = auto_config.command_rx.take();
@@ -257,24 +224,23 @@ pub async fn run_auto_clip(
     println!("Auto-clip armed for personal War Thunder kills.");
     println!("Press Ctrl+C to stop.");
 
-    let player_name = warthunder_config.player_name.as_deref();
+    let player_name = source.player_name().map(str::to_owned);
+    let player_name_ref = player_name.as_deref();
     let mut configured_post_event_delay = auto_config.post_event_delay;
     let mut effective_save_delay = configured_post_event_delay;
-    let mut state = AutoWatchState::new();
     if auto_config.include_history {
-        println!("[WT] include-history enabled: processing existing events");
-    } else {
-        bootstrap(&client, &mut state).await;
         println!(
-            "[WT] initialized cursors: chat={}, hud_evt={}, hud_dmg={}",
-            state.last_chat_id, state.last_evt_msg_id, state.last_dmg_msg_id
+            "[{}] include-history enabled: processing existing events",
+            source.name()
         );
-        println!("[WT] watching for new events only");
+    } else {
+        source.bootstrap(false).await;
+        println!("[{}] watching for new events only", source.name());
     }
 
     let mut cooldown = Cooldown::new(auto_config.cooldown);
     let mut pending_clips = Vec::<ScheduledClip>::new();
-    let mut wt_tick = interval(warthunder_config.poll_interval());
+    let mut wt_tick = interval(poll_interval);
     wt_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut cleanup_tick = interval(Duration::from_secs(1));
     cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -296,7 +262,7 @@ pub async fn run_auto_clip(
                     &mut pending_clips,
                     &mut cooldown,
                     Instant::now(),
-                    player_name,
+                    player_name_ref,
                     &auto_config,
                     configured_post_event_delay,
                 ).await;
@@ -312,11 +278,11 @@ pub async fn run_auto_clip(
                         break Ok(());
                     }
                     AutoClipCommand::SaveManualClip => {
-                        handle_manual_clip_command_gsr(&gsr, player_name, &auto_config).await;
+                        handle_manual_clip_command_gsr(&gsr, player_name_ref, &auto_config).await;
                     }
                     AutoClipCommand::TestGsrSaveReplay { respond_to } => {
                         let result =
-                            handle_test_gsr_save_replay_command(&gsr, player_name, &auto_config)
+                            handle_test_gsr_save_replay_command(&gsr, player_name_ref, &auto_config)
                                 .await
                                 .map(|replay| replay.final_video_path);
                         let _ = respond_to.send(result.map_err(|error| error.to_string()));
@@ -376,7 +342,20 @@ pub async fn run_auto_clip(
                 }
             }
             _ = wt_tick.tick() => {
-                let (events, wt_connected) = poll_personal_events(&client, &mut state, player_name, &auto_config.triggers).await;
+                let poll_result = source.poll().await;
+                let wt_connected = poll_result.connected;
+                let now_instant = std::time::Instant::now();
+                let now_wall = std::time::SystemTime::now();
+                let events: Vec<DetectedEvent> = poll_result.events.into_iter().map(|event| {
+                    let reason = game_event_kind_to_clip_reason(event.kind);
+                    DetectedEvent {
+                        detected_at: now_instant,
+                        detected_wall_time: now_wall,
+                        event,
+                        reason,
+                        game_time: None,
+                    }
+                }).collect();
                 if last_wt_connected != Some(wt_connected) {
                     send_ui_event(
                         &auto_config,
@@ -392,11 +371,11 @@ pub async fn run_auto_clip(
                     }
                 }
                 for detected in events {
-                    let event = detected.event;
-                    let summary = event_summary(&event);
+                    let summary = detected.event.summary.clone();
+                    let (vehicle, target) = (detected.event.context.clone(), detected.event.subject.clone());
                     let reason = detected.reason;
-                    println!("[WT] event detected ({reason:?}): {summary}");
-                    let (vehicle, target) = event_vehicle_target(&event);
+                    let canonical_key = detected.event.canonical_key.clone();
+                    println!("[{}] event detected ({reason:?}): {summary}", source.name());
                     send_ui_event(&auto_config, AppEvent::KillDetected {
                         reason,
                         vehicle,
@@ -406,14 +385,15 @@ pub async fn run_auto_clip(
                     let now = detected.detected_at;
                     if pending_clips
                         .iter()
-                        .any(|pending| pending.event_keys.contains(&detected.canonical_key))
+                        .any(|pending| pending.event_keys.contains(&canonical_key))
                     {
                         debug!(
-                            canonical_key = %detected.canonical_key,
+                            canonical_key = %canonical_key,
                             "duplicate event already exists in pending GSR clip"
                         );
                         continue;
                     }
+                    let event = detected.event;
                     if let Some(pending_index) = pending_index_for_multi_kill(
                         &pending_clips,
                         reason,
@@ -424,12 +404,10 @@ pub async fn run_auto_clip(
                         let pending = &mut pending_clips[pending_index];
                         if pending.add_event(
                             event,
-                            detected.canonical_key,
                             now,
                             detected.game_time,
                             detected.detected_wall_time,
                             effective_save_delay,
-                            summary,
                         ) {
                             send_ui_event(
                                 &auto_config,
@@ -456,9 +434,7 @@ pub async fn run_auto_clip(
                     }
                     let pending = schedule_pending_clip(
                         event,
-                        detected.canonical_key,
                         reason,
-                        summary.clone(),
                         now,
                         detected.game_time,
                         detected.detected_wall_time,
@@ -520,10 +496,8 @@ async fn ensure_gsr_started_after_war_thunder_connected(
 }
 
 fn schedule_pending_clip(
-    event: WarThunderEvent,
-    event_key: String,
+    event: GameEvent,
     reason: ClipReason,
-    description: String,
     event_time: Instant,
     event_game_time: Option<Duration>,
     event_wall_time: SystemTime,
@@ -531,13 +505,11 @@ fn schedule_pending_clip(
 ) -> ScheduledClip {
     ScheduledClip::new(
         event,
-        event_key,
         reason,
         event_time,
         event_game_time,
         event_wall_time,
         delay,
-        description,
     )
 }
 
@@ -916,379 +888,13 @@ fn emit_gsr_replay_saved(
     );
 }
 
-async fn bootstrap(client: &WarThunderClient, state: &mut AutoWatchState) {
-    if let Ok(chat) = client.fetch_gamechat(0).await {
-        state.last_chat_id = chat.next_last_id;
-        remember_messages("gamechat", chat.messages, &mut state.seen_messages);
-    }
-
-    if let Ok(hud) = client.fetch_hudmsg(0, 0).await {
-        state.last_evt_msg_id = hud.next_last_evt_id;
-        state.last_dmg_msg_id = hud.next_last_dmg_id;
-        remember_messages("hud:event", hud.events, &mut state.seen_messages);
-        remember_messages("hud:damage", hud.damage, &mut state.seen_messages);
-    }
-}
-
-async fn poll_personal_events(
-    client: &WarThunderClient,
-    state: &mut AutoWatchState,
-    player_name: Option<&str>,
-    triggers: &TriggerConfig,
-) -> (Vec<DetectedEvent>, bool) {
-    let mut events = Vec::new();
-    let mut successful_polls = 0usize;
-
-    match client.fetch_gamechat(state.last_chat_id).await {
-        Ok(chat) => {
-            successful_polls += 1;
-            state.last_chat_id = chat.next_last_id;
-            collect_personal_events(
-                "gamechat",
-                chat.messages,
-                &mut state.seen_messages,
-                &mut state.seen_events,
-                player_name,
-                triggers,
-                &mut events,
-            );
-        }
-        Err(error) => debug!(%error, "failed to poll gamechat for auto-clip"),
-    }
-
-    match client
-        .fetch_hudmsg(state.last_evt_msg_id, state.last_dmg_msg_id)
-        .await
-    {
-        Ok(hud) => {
-            successful_polls += 1;
-            state.last_evt_msg_id = hud.next_last_evt_id;
-            state.last_dmg_msg_id = hud.next_last_dmg_id;
-            collect_personal_events(
-                "hud:event",
-                hud.events,
-                &mut state.seen_messages,
-                &mut state.seen_events,
-                player_name,
-                triggers,
-                &mut events,
-            );
-            collect_personal_events(
-                "hud:damage",
-                hud.damage,
-                &mut state.seen_messages,
-                &mut state.seen_events,
-                player_name,
-                triggers,
-                &mut events,
-            );
-        }
-        Err(error) => debug!(%error, "failed to poll hudmsg for auto-clip"),
-    }
-
-    (events, successful_polls > 0)
-}
-
-fn collect_personal_events(
-    source: &str,
-    messages: Vec<ChatMessage>,
-    seen_messages: &mut RecentMessageCache,
-    seen_events: &mut RecentEventCache,
-    player_name: Option<&str>,
-    triggers: &TriggerConfig,
-    events: &mut Vec<DetectedEvent>,
-) {
-    for message in messages {
-        let key = raw_message_dedupe_key(source, &message);
-        if let Some(key) = key {
-            if seen_messages.contains(&key) {
-                debug!(source, raw_key = %key, ignored_duplicate = true, "duplicate raw message ignored");
-                continue;
-            }
-            seen_messages.insert(key);
-        }
-
-        let event = parse_gamechat_event(&message.text);
-        let canonical_key = canonical_event_key(&event);
-        let event_key = canonical_key
-            .as_deref()
-            .map(|canonical_key| event_dedupe_key(canonical_key, &message));
-        if let Some(reason) = should_clip_event(&event, player_name, triggers) {
-            let Some(event_key) = event_key else {
-                debug!(source, ?event, "clip event has no canonical key");
-                continue;
-            };
-            let now = Instant::now();
-            if !seen_events.insert_new(event_key.clone(), now) {
-                debug!(
-                    source,
-                    event_key = %event_key,
-                    ignored_duplicate = true,
-                    "duplicate canonical event ignored"
-                );
-                continue;
-            }
-            events.push(DetectedEvent {
-                event,
-                reason,
-                canonical_key: event_key,
-                detected_at: now,
-                game_time: parse_wt_message_time(message.time.as_deref()),
-                detected_wall_time: SystemTime::now(),
-            });
-        } else {
-            debug!(source, message = %message.text, ?event, "ignoring disabled or non-matching auto-clip event");
-        }
-    }
-}
-
-fn raw_message_dedupe_key(source: &str, message: &ChatMessage) -> Option<String> {
-    Some(match message.id {
-        Some(id) => format!("{source}:{id}"),
-        None => message.stable_key_with_prefix(source),
-    })
-}
-
-fn parse_wt_message_time(value: Option<&str>) -> Option<Duration> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    let parts = value.split(':').collect::<Vec<_>>();
-    let seconds = match parts.as_slice() {
-        [seconds] => seconds.parse::<u64>().ok()?,
-        [minutes, seconds] => minutes
-            .parse::<u64>()
-            .ok()?
-            .saturating_mul(60)
-            .saturating_add(seconds.parse::<u64>().ok()?),
-        [hours, minutes, seconds] => hours
-            .parse::<u64>()
-            .ok()?
-            .saturating_mul(60 * 60)
-            .saturating_add(minutes.parse::<u64>().ok()?.saturating_mul(60))
-            .saturating_add(seconds.parse::<u64>().ok()?),
-        _ => return None,
-    };
-
-    Some(Duration::from_secs(seconds))
-}
-
-fn event_dedupe_key(canonical_key: &str, message: &ChatMessage) -> String {
-    match message
-        .time
-        .as_deref()
-        .map(str::trim)
-        .filter(|time| !time.is_empty())
-    {
-        Some(time) => format!("{canonical_key}|time:{}", normalize_key_part(time)),
-        None => canonical_key.to_owned(),
-    }
-}
-
-fn remember_messages(
-    source: &str,
-    messages: Vec<ChatMessage>,
-    seen_messages: &mut RecentMessageCache,
-) {
-    for message in messages {
-        if let Some(key) = raw_message_dedupe_key(source, &message) {
-            seen_messages.insert(key);
-        }
-    }
-}
-
-pub(crate) fn should_clip_event(
-    event: &WarThunderEvent,
-    player_name: Option<&str>,
-    triggers: &TriggerConfig,
-) -> Option<ClipReason> {
-    let player_name = player_name.map(str::trim).filter(|name| !name.is_empty());
-
-    if triggers.player_destroyed && is_player_destroyed_event(event, player_name) {
-        return Some(ClipReason::PlayerDestroyed);
-    }
-
-    if triggers.base_destroyed && is_base_destroyed_event(event) {
-        return Some(ClipReason::BaseDestroyed);
-    }
-
-    if triggers.target_destroyed && is_target_destroyed_event(event, player_name) {
-        return Some(ClipReason::TargetDestroyed);
-    }
-
-    None
-}
-
-fn canonical_event_key(event: &WarThunderEvent) -> Option<String> {
-    match event {
-        WarThunderEvent::TargetDestroyed {
-            attacker,
-            action,
-            vehicle,
-            target,
-            raw,
-        } => Some(format!(
-            "target_destroyed|{}|{}|{}|{}",
-            normalize_key_part(attacker.as_deref().unwrap_or("")),
-            normalize_key_part(vehicle.as_deref().unwrap_or("")),
-            normalize_key_part(action),
-            normalize_key_part(target.as_deref().unwrap_or(raw))
-        )),
-        WarThunderEvent::PlayerDestroyed { raw } => {
-            Some(format!("player_destroyed|{}", normalize_key_part(raw)))
-        }
-        WarThunderEvent::CriticalHit { raw } => {
-            Some(format!("critical_hit|{}", normalize_key_part(raw)))
-        }
-        WarThunderEvent::SevereDamage { raw } => {
-            Some(format!("severe_damage|{}", normalize_key_part(raw)))
-        }
-        WarThunderEvent::BaseDestroyed { raw } => {
-            Some(format!("base_destroyed|{}", normalize_key_part(raw)))
-        }
-        WarThunderEvent::Unknown(raw) => {
-            let raw = normalize_key_part(raw);
-            (!raw.is_empty()).then(|| format!("unknown|{raw}"))
-        }
-    }
-}
-
-fn normalize_key_part(value: &str) -> String {
-    value
-        .trim()
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn is_clip_action(action: &str) -> bool {
-    matches!(action, "destroyed" | "shot down")
-}
-
-fn is_target_destroyed_clip_event(event: &WarThunderEvent) -> bool {
-    matches!(
-        event,
-        WarThunderEvent::TargetDestroyed { action, .. } if is_clip_action(action)
-    )
-}
-
-fn is_target_destroyed_event(event: &WarThunderEvent, player_name: Option<&str>) -> bool {
-    let Some(player_name) = player_name else {
-        return false;
-    };
-    match event {
-        WarThunderEvent::TargetDestroyed {
-            attacker: Some(attacker),
-            action,
-            target,
-            ..
-        } => {
-            is_clip_action(action)
-                && same_player(attacker, player_name)
-                && !target_contains_player(target.as_deref(), player_name)
-                && !target_is_base(target.as_deref())
-        }
-        _ => false,
-    }
-}
-
-fn is_base_destroyed_event(event: &WarThunderEvent) -> bool {
-    match event {
-        WarThunderEvent::BaseDestroyed { raw } => raw_mentions_base_destroyed(raw),
-        WarThunderEvent::TargetDestroyed {
-            action,
-            target,
-            raw,
-            ..
-        } => {
-            action == "destroyed"
-                && (target_is_base(target.as_deref()) || raw_mentions_base_destroyed(raw))
-        }
-        WarThunderEvent::Unknown(raw) => raw_mentions_base_destroyed(raw),
-        _ => false,
-    }
-}
-
-fn is_player_destroyed_event(event: &WarThunderEvent, player_name: Option<&str>) -> bool {
-    match event {
-        WarThunderEvent::PlayerDestroyed { raw } => raw_mentions_player_destroyed(raw),
-        WarThunderEvent::TargetDestroyed { action, target, .. } => {
-            is_clip_action(action)
-                && player_name.is_some_and(|player_name| {
-                    target_contains_player(target.as_deref(), player_name)
-                })
-        }
-        WarThunderEvent::Unknown(raw) => raw_mentions_player_destroyed(raw),
-        _ => false,
-    }
-}
-
-fn same_player(value: &str, player_name: &str) -> bool {
-    normalize_key_part(value) == normalize_key_part(player_name)
-}
-
-fn target_contains_player(target: Option<&str>, player_name: &str) -> bool {
-    let Some(target) = target else {
-        return false;
-    };
-    normalize_key_part(target).contains(&normalize_key_part(player_name))
-}
-
-fn target_is_base(target: Option<&str>) -> bool {
-    let Some(target) = target else {
-        return false;
-    };
-    let target = normalize_key_part(target);
-    target == "a base" || target.contains("base")
-}
-
-fn raw_mentions_base_destroyed(raw: &str) -> bool {
-    let raw = normalize_key_part(raw);
-    raw.contains("base destroyed")
-        || raw.contains("enemy base destroyed")
-        || raw.contains("destroyed a base")
-        || raw.contains("destroyed enemy base")
-}
-
-fn raw_mentions_player_destroyed(raw: &str) -> bool {
-    let raw = normalize_key_part(raw);
-    raw.contains("you have been destroyed")
-        || raw.contains("vehicle destroyed")
-        || raw.contains("player destroyed")
-}
-
-fn event_summary(event: &WarThunderEvent) -> String {
-    match event {
-        WarThunderEvent::TargetDestroyed {
-            attacker,
-            action,
-            vehicle,
-            target,
-            raw,
-        } => match (attacker, target, vehicle) {
-            (Some(attacker), Some(target), Some(vehicle)) => {
-                format!("{attacker} {action} {target} with {vehicle}")
-            }
-            (Some(attacker), Some(target), None) => format!("{attacker} {action} {target}"),
-            _ => raw.clone(),
-        },
-        WarThunderEvent::PlayerDestroyed { raw }
-        | WarThunderEvent::CriticalHit { raw }
-        | WarThunderEvent::SevereDamage { raw }
-        | WarThunderEvent::BaseDestroyed { raw } => raw.clone(),
-        WarThunderEvent::Unknown(raw) => raw.clone(),
-    }
-}
-
-fn event_vehicle_target(event: &WarThunderEvent) -> (Option<String>, Option<String>) {
-    match event {
-        WarThunderEvent::TargetDestroyed {
-            vehicle, target, ..
-        } => (vehicle.clone(), target.clone()),
-        _ => (None, None),
+fn game_event_kind_to_clip_reason(kind: GameEventKind) -> ClipReason {
+    match kind {
+        GameEventKind::Kill => ClipReason::TargetDestroyed,
+        GameEventKind::Death => ClipReason::PlayerDestroyed,
+        GameEventKind::Objective => ClipReason::BaseDestroyed,
+        GameEventKind::MultiKill => ClipReason::MultiKill,
+        GameEventKind::Other => ClipReason::Unknown,
     }
 }
 
@@ -1318,48 +924,24 @@ fn send_ui_event(auto_config: &AutoClipConfig, event: AppEvent) {
 mod tests {
     use super::*;
 
-    fn kill(attacker: &str) -> WarThunderEvent {
-        WarThunderEvent::TargetDestroyed {
-            attacker: Some(attacker.to_owned()),
-            action: "destroyed".to_owned(),
-            vehicle: Some("F/A-18C Early".to_owned()),
-            target: Some("[ai] MiG-15bis".to_owned()),
-            raw: format!("{attacker} (F/A-18C Early) destroyed [ai] MiG-15bis"),
-        }
+    fn kill_game_event(target: &str) -> GameEvent {
+        let mut event = GameEvent::new(
+            GameEventKind::Kill,
+            format!("dawson16800 destroyed {target}"),
+            format!("target_destroyed|dawson16800|f/a-18c early|destroyed|{target}"),
+        );
+        event.actor = Some("dawson16800".to_owned());
+        event.subject = Some(target.to_owned());
+        event.context = Some("F/A-18C Early".to_owned());
+        event
     }
 
-    fn kill_with_target(target: &str) -> WarThunderEvent {
-        WarThunderEvent::TargetDestroyed {
-            attacker: Some("dawson16800".to_owned()),
-            action: "destroyed".to_owned(),
-            vehicle: Some("F/A-18C Early".to_owned()),
-            target: Some(target.to_owned()),
-            raw: format!("dawson16800 (F/A-18C Early) destroyed {target}"),
-        }
-    }
-
-    fn base_destroyed() -> WarThunderEvent {
-        WarThunderEvent::TargetDestroyed {
-            attacker: Some("dawson16800".to_owned()),
-            action: "destroyed".to_owned(),
-            vehicle: Some("F/A-18C Early".to_owned()),
-            target: Some("a base".to_owned()),
-            raw: "dawson16800 (F/A-18C Early) destroyed a base".to_owned(),
-        }
-    }
-
-    fn player_destroyed_by_enemy() -> WarThunderEvent {
-        WarThunderEvent::TargetDestroyed {
-            attacker: Some("Enemy".to_owned()),
-            action: "shot down".to_owned(),
-            vehicle: Some("MiG-29".to_owned()),
-            target: Some("dawson16800 (F/A-18C Early)".to_owned()),
-            raw: "Enemy (MiG-29) shot down dawson16800 (F/A-18C Early)".to_owned(),
-        }
-    }
-
-    fn event_key(event: &WarThunderEvent) -> String {
-        canonical_event_key(event).unwrap()
+    fn objective_game_event() -> GameEvent {
+        GameEvent::new(
+            GameEventKind::Objective,
+            "dawson16800 destroyed a base".to_owned(),
+            "base_destroyed|dawson16800 destroyed a base".to_owned(),
+        )
     }
 
     fn test_auto_config(post_event_seconds: u64) -> AutoClipConfig {
@@ -1387,51 +969,12 @@ mod tests {
     }
 
     #[test]
-    fn should_clip_event_returns_target_destroyed_for_personal_kill() {
-        assert_eq!(
-            should_clip_event(
-                &kill("dawson16800"),
-                Some("dawson16800"),
-                &TriggerConfig::default()
-            ),
-            Some(ClipReason::TargetDestroyed)
-        );
-    }
-
-    #[test]
-    fn should_clip_event_returns_base_destroyed_for_destroyed_a_base() {
-        assert_eq!(
-            should_clip_event(
-                &base_destroyed(),
-                Some("dawson16800"),
-                &TriggerConfig::default()
-            ),
-            Some(ClipReason::BaseDestroyed)
-        );
-    }
-
-    #[test]
-    fn should_clip_event_returns_player_destroyed_when_player_is_target() {
-        let triggers = TriggerConfig {
-            player_destroyed: true,
-            ..TriggerConfig::default()
-        };
-
-        assert_eq!(
-            should_clip_event(&player_destroyed_by_enemy(), Some("dawson16800"), &triggers),
-            Some(ClipReason::PlayerDestroyed)
-        );
-    }
-
-    #[test]
     fn clip_context_uses_configured_post_event_delay() {
-        let event = kill_with_target("[ai] MiG-15bis");
+        let event = kill_game_event("[ai] MiG-15bis");
         let now = Instant::now();
         let pending = schedule_pending_clip(
             event.clone(),
-            event_key(&event),
             ClipReason::TargetDestroyed,
-            "kill".to_owned(),
             now,
             None,
             SystemTime::UNIX_EPOCH + Duration::from_secs(100),
@@ -1455,10 +998,8 @@ mod tests {
     fn pending_clip_is_ready_after_save_at() {
         let now = Instant::now();
         let pending = schedule_pending_clip(
-            kill_with_target("[ai] MiG-15bis"),
-            event_key(&kill_with_target("[ai] MiG-15bis")),
+            kill_game_event("[ai] MiG-15bis"),
             ClipReason::TargetDestroyed,
-            "kill".to_owned(),
             now,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1476,10 +1017,8 @@ mod tests {
     fn failed_save_retries_twice_then_drops() {
         let now = Instant::now();
         let mut pending = schedule_pending_clip(
-            kill_with_target("[ai] MiG-15bis"),
-            event_key(&kill_with_target("[ai] MiG-15bis")),
+            kill_game_event("[ai] MiG-15bis"),
             ClipReason::TargetDestroyed,
-            "kill".to_owned(),
             now,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1505,25 +1044,21 @@ mod tests {
     fn second_close_kill_is_added_to_pending_clip() {
         let now = Instant::now();
         let mut pending = schedule_pending_clip(
-            kill_with_target("[ai] MiG-15bis"),
-            event_key(&kill_with_target("[ai] MiG-15bis")),
+            kill_game_event("[ai] MiG-15bis"),
             ClipReason::TargetDestroyed,
-            "first".to_owned(),
             now,
-            Some(Duration::from_secs(30)),
+            None,
             SystemTime::UNIX_EPOCH,
             Duration::from_secs(5),
         );
 
-        let second = kill_with_target("IT-1");
+        let second = kill_game_event("IT-1");
         pending.add_event(
-            second.clone(),
-            event_key(&second),
+            second,
             now + Duration::from_secs(3),
-            Some(Duration::from_secs(34)),
+            None,
             SystemTime::UNIX_EPOCH + Duration::from_secs(3),
             Duration::from_secs(5),
-            "second".to_owned(),
         );
 
         assert_eq!(pending.events.len(), 2);
@@ -1535,12 +1070,10 @@ mod tests {
     #[test]
     fn duplicate_kill_is_not_added_to_pending_clip() {
         let now = Instant::now();
-        let event = kill_with_target("[ai] MiG-15bis");
+        let event = kill_game_event("[ai] MiG-15bis");
         let mut pending = schedule_pending_clip(
             event.clone(),
-            event_key(&event),
             ClipReason::TargetDestroyed,
-            "first".to_owned(),
             now,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1548,13 +1081,11 @@ mod tests {
         );
 
         let added = pending.add_event(
-            event.clone(),
-            event_key(&event),
+            event,
             now + Duration::from_secs(1),
             None,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1),
             Duration::from_secs(5),
-            "duplicate".to_owned(),
         );
 
         assert!(!added);
@@ -1565,12 +1096,9 @@ mod tests {
     #[test]
     fn multi_kill_requires_real_time_window() {
         let now = Instant::now();
-        let first = kill_with_target("[ai] MiG-15bis");
         let pending = schedule_pending_clip(
-            first.clone(),
-            event_key(&first),
+            kill_game_event("[ai] MiG-15bis"),
             ClipReason::TargetDestroyed,
-            "first".to_owned(),
             now,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1594,12 +1122,9 @@ mod tests {
     #[test]
     fn distinct_kill_inside_window_uses_existing_pending_clip() {
         let now = Instant::now();
-        let first = kill_with_target("[ai] MiG-15bis");
         let pending = schedule_pending_clip(
-            first.clone(),
-            event_key(&first),
+            kill_game_event("[ai] MiG-15bis"),
             ClipReason::TargetDestroyed,
-            "first".to_owned(),
             now,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1621,12 +1146,9 @@ mod tests {
     #[test]
     fn base_destroyed_inside_window_does_not_use_target_pending_clip() {
         let now = Instant::now();
-        let first = kill_with_target("[ai] MiG-15bis");
         let pending = schedule_pending_clip(
-            first.clone(),
-            event_key(&first),
+            kill_game_event("[ai] MiG-15bis"),
             ClipReason::TargetDestroyed,
-            "first".to_owned(),
             now,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1646,35 +1168,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_wt_message_time_accepts_common_formats() {
-        assert_eq!(
-            parse_wt_message_time(Some("0:30")),
-            Some(Duration::from_secs(30))
-        );
-        assert_eq!(
-            parse_wt_message_time(Some("1:03")),
-            Some(Duration::from_secs(63))
-        );
-        assert_eq!(
-            parse_wt_message_time(Some("1:02:03")),
-            Some(Duration::from_secs(3723))
-        );
-        assert_eq!(
-            parse_wt_message_time(Some("83")),
-            Some(Duration::from_secs(83))
-        );
-        assert_eq!(parse_wt_message_time(Some("")), None);
-    }
-
-    #[test]
-    fn multi_kill_window_uses_war_thunder_time_when_available() {
+    fn multi_kill_window_uses_game_time_when_available() {
         let now = Instant::now();
-        let first = kill_with_target("IT-1");
         let pending = schedule_pending_clip(
-            first.clone(),
-            event_key(&first),
+            kill_game_event("IT-1"),
             ClipReason::TargetDestroyed,
-            "first".to_owned(),
             now,
             Some(Duration::from_secs(44)),
             SystemTime::UNIX_EPOCH,
@@ -1694,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn rapid_backend_read_splits_multi_kill_by_war_thunder_time() {
+    fn rapid_backend_read_splits_multi_kill_by_game_time() {
         let now = Instant::now();
         let delay = Duration::from_secs(11);
         let window = Duration::from_secs(8);
@@ -1708,7 +1206,10 @@ mod tests {
         let mut pending_clips = Vec::new();
 
         for (target, game_seconds) in kills {
-            let event = kill_with_target(target);
+            let event = kill_game_event(target);
+            // Use a unique canonical key per kill so they are distinct
+            let mut event = event.clone();
+            event.canonical_key = format!("{}|time:{game_seconds}", event.canonical_key);
             let detected_at = now + Duration::from_millis(game_seconds);
             if let Some(index) = pending_index_for_multi_kill(
                 &pending_clips,
@@ -1718,20 +1219,16 @@ mod tests {
                 window,
             ) {
                 pending_clips[index].add_event(
-                    event.clone(),
-                    format!("{}|time:{game_seconds}", event_key(&event)),
+                    event,
                     detected_at,
                     Some(Duration::from_secs(game_seconds)),
                     SystemTime::UNIX_EPOCH + Duration::from_secs(game_seconds),
                     delay,
-                    target.to_owned(),
                 );
             } else {
                 pending_clips.push(schedule_pending_clip(
-                    event.clone(),
-                    format!("{}|time:{game_seconds}", event_key(&event)),
+                    event,
                     ClipReason::TargetDestroyed,
-                    target.to_owned(),
                     detected_at,
                     Some(Duration::from_secs(game_seconds)),
                     SystemTime::UNIX_EPOCH + Duration::from_secs(game_seconds),
@@ -1756,26 +1253,41 @@ mod tests {
     }
 
     #[test]
-    fn auto_collects_personal_target_destroyed() {
-        let mut seen = RecentMessageCache::new(100);
-        let mut seen_events = RecentEventCache::new(Duration::from_secs(120));
-        let mut events = Vec::new();
-        collect_personal_events(
-            "hud:damage",
-            vec![ChatMessage {
-                id: Some(1),
-                time: None,
-                sender: None,
-                text: "dawson16800 (F/A-18C Early) destroyed [ai] MiG-15bis".to_owned(),
-            }],
-            &mut seen,
-            &mut seen_events,
-            Some("dawson16800"),
-            &TriggerConfig::default(),
-            &mut events,
+    fn game_event_kind_to_clip_reason_mapping() {
+        assert_eq!(
+            game_event_kind_to_clip_reason(GameEventKind::Kill),
+            ClipReason::TargetDestroyed
         );
+        assert_eq!(
+            game_event_kind_to_clip_reason(GameEventKind::Death),
+            ClipReason::PlayerDestroyed
+        );
+        assert_eq!(
+            game_event_kind_to_clip_reason(GameEventKind::Objective),
+            ClipReason::BaseDestroyed
+        );
+        assert_eq!(
+            game_event_kind_to_clip_reason(GameEventKind::MultiKill),
+            ClipReason::MultiKill
+        );
+        assert_eq!(
+            game_event_kind_to_clip_reason(GameEventKind::Other),
+            ClipReason::Unknown
+        );
+    }
 
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].reason, ClipReason::TargetDestroyed);
+    #[test]
+    fn objective_event_creates_pending_clip() {
+        let now = Instant::now();
+        let pending = schedule_pending_clip(
+            objective_game_event(),
+            ClipReason::BaseDestroyed,
+            now,
+            None,
+            SystemTime::UNIX_EPOCH,
+            Duration::from_secs(5),
+        );
+        assert_eq!(pending.reason, ClipReason::BaseDestroyed);
+        assert_eq!(pending.kill_count(), 0);
     }
 }
