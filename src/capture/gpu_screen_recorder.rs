@@ -18,7 +18,7 @@ use crate::{
     capture::output::slugify_filename_part,
     capture::x11_window::detect_war_thunder_window_x11,
     config::{CaptureConfig, CaptureStrategy, GpuScreenRecorderMode, GsrBitrateMode},
-    warthunder::events::WarThunderEvent,
+    games::event::GameEvent,
 };
 
 const FLATPAK_APP_ID: &str = "com.dec05eba.gpu_screen_recorder";
@@ -1566,46 +1566,21 @@ async fn generate_thumbnail(video_path: &Path) -> Option<PathBuf> {
     .flatten()
 }
 
-fn metadata_event_json(event: &WarThunderEvent) -> serde_json::Value {
-    match event {
-        WarThunderEvent::TargetDestroyed {
-            attacker,
-            action,
-            vehicle,
-            target,
-            raw,
-        } => serde_json::json!({
-            "type": "target_destroyed",
-            "attacker": attacker,
-            "vehicle": vehicle,
-            "action": action,
-            "target": target,
-            "raw": raw,
-        }),
-        WarThunderEvent::PlayerDestroyed { raw } => {
-            serde_json::json!({ "type": "player_destroyed", "raw": raw })
-        }
-        WarThunderEvent::CriticalHit { raw } => {
-            serde_json::json!({ "type": "critical_hit", "raw": raw })
-        }
-        WarThunderEvent::SevereDamage { raw } => {
-            serde_json::json!({ "type": "severe_damage", "raw": raw })
-        }
-        WarThunderEvent::BaseDestroyed { raw } => {
-            serde_json::json!({ "type": "base_destroyed", "raw": raw })
-        }
-        WarThunderEvent::Unknown(raw) => serde_json::json!({ "type": "unknown", "raw": raw }),
-    }
+fn metadata_event_json(event: &GameEvent) -> serde_json::Value {
+    serde_json::json!({
+        "type": format!("{:?}", event.kind).to_ascii_lowercase(),
+        "actor": event.actor,
+        "subject": event.subject,
+        "context": event.context,
+        "summary": event.summary,
+    })
 }
 
-fn raw_event_text(event: &WarThunderEvent) -> Option<String> {
-    match event {
-        WarThunderEvent::TargetDestroyed { raw, .. }
-        | WarThunderEvent::PlayerDestroyed { raw }
-        | WarThunderEvent::CriticalHit { raw }
-        | WarThunderEvent::SevereDamage { raw }
-        | WarThunderEvent::BaseDestroyed { raw } => Some(raw.clone()),
-        WarThunderEvent::Unknown(raw) => Some(raw.clone()),
+fn raw_event_text(event: &GameEvent) -> Option<String> {
+    if event.summary.is_empty() {
+        None
+    } else {
+        Some(event.summary.clone())
     }
 }
 
