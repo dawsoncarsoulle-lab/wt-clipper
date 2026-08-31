@@ -563,7 +563,36 @@ struct ResolvedCaptureTarget {
 
 fn resolve_capture_target(config: &CaptureConfig) -> ResolvedCaptureTarget {
     let session = session_type();
-    let fallback = select_effective_target(&config.target, &list_monitors(config));
+    // Refresh monitors list to ensure it's up-to-date
+    let monitors = list_monitors(config);
+    tracing::debug!(monitors = ?monitors, "Refreshed GSR monitors list for target resolution");
+    
+    let mut fallback = select_effective_target(&config.target, &monitors);
+    
+    // Force a valid fallback if the resolved target is still invalid
+    if !target_is_valid(&fallback, &monitors) {
+        fallback = if monitors.is_empty() {
+            tracing::warn!(
+                original_target = %config.target,
+                "No monitors available; forcing fallback to 'screen'"
+            );
+            "screen".to_owned()
+        } else {
+            let valid_fallback = monitors
+                .iter()
+                .find(|m| !is_special_capture_target(m))
+                .cloned()
+                .unwrap_or_else(|| monitors[0].clone());
+            tracing::warn!(
+                original_target = %config.target,
+                resolved_target = %fallback,
+                valid_fallback = %valid_fallback,
+                monitors = ?monitors,
+                "Target was invalid; forcing fallback to valid monitor"
+            );
+            valid_fallback
+        };
+    }
 
     match config.capture_strategy {
         CaptureStrategy::Monitor => ResolvedCaptureTarget {
@@ -655,7 +684,16 @@ pub fn build_gsr_command(config: &CaptureConfig) -> anyhow::Result<GsrCommandLin
     }
 
     let mode = resolve_mode(config.gpu_screen_recorder_mode)?;
+    // Log the monitors list for debugging
+    let monitors = list_monitors(config);
+    tracing::debug!(monitors = ?monitors, "Building GSR command with monitors");
+    
     let resolved_target = resolve_capture_target(config);
+    tracing::debug!(
+        target = %resolved_target.target,
+        reason = %resolved_target.reason,
+        "Resolved GSR capture target"
+    );
     let mut args = Vec::<String>::new();
     let program = match mode {
         GsrMode::Native => "gpu-screen-recorder".to_owned(),
@@ -1356,6 +1394,14 @@ fn select_effective_target(requested: &str, monitors: &[String]) -> String {
     if target_is_valid(requested, monitors) {
         return requested.to_owned();
     }
+    // If monitors list is empty, fall back to "screen" which is widely supported by GSR
+    if monitors.is_empty() {
+        tracing::warn!(
+            requested = %requested,
+            "No monitors available from GSR; falling back to 'screen'"
+        );
+        return "screen".to_owned();
+    }
     // Only fall back to a real monitor. A special target ("focused"/"portal")
     // must never be silently substituted for a configured monitor target,
     // otherwise an unconfigured/headless environment would override the user's
@@ -1364,7 +1410,15 @@ fn select_effective_target(requested: &str, monitors: &[String]) -> String {
         .iter()
         .find(|monitor| !is_special_capture_target(monitor))
         .cloned()
-        .unwrap_or_else(|| requested.to_owned())
+        .unwrap_or_else(|| {
+            // If no non-special monitor found, use the first available monitor
+            tracing::warn!(
+                requested = %requested,
+                monitors = ?monitors,
+                "No non-special monitor found; falling back to first monitor"
+            );
+            monitors[0].clone()
+        })
 }
 
 fn target_is_valid(target: &str, monitors: &[String]) -> bool {
