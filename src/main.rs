@@ -8,6 +8,8 @@ use wt_clipper::{
     cli::{Cli, Command, ConfigCommand, DumpEndpoint},
     config::{default_config_path, AppConfig},
     doctor,
+    dota2::source::DotaSource,
+    games::source::GameSource,
     warthunder::{
         client::{Endpoint, EndpointProbe, WarThunderClient},
         parser::{is_personal_kill, parse_gamechat_event},
@@ -54,18 +56,34 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             doctor::run_doctor(json, Some(config.capture.output_dir_path()?)).await
         }
         Command::Auto {
+            game,
             cooldown_seconds,
             post_event_seconds,
             include_history,
         } => {
             let config = AppConfig::load(cli.config.as_deref())?;
-            let client = WarThunderClient::new(config.war_thunder.clone())?;
-            let source = Box::new(WarThunderSource::new(
-                client,
-                config.war_thunder.clone(),
-                config.triggers.clone(),
-            ));
-            let poll_interval = config.war_thunder.poll_interval();
+            let (source, poll_interval) = match game.as_str() {
+                "dota" | "dota2" => {
+                    let mut dota = DotaSource::new(config.dota.clone());
+                    dota.start_server().await?;
+                    (
+                        Box::new(dota) as Box<dyn GameSource>,
+                        std::time::Duration::from_millis(500),
+                    )
+                }
+                _ => {
+                    let client = WarThunderClient::new(config.war_thunder.clone())?;
+                    let poll_interval = config.war_thunder.poll_interval();
+                    (
+                        Box::new(WarThunderSource::new(
+                            client,
+                            config.war_thunder.clone(),
+                            config.triggers.clone(),
+                        )) as Box<dyn GameSource>,
+                        poll_interval,
+                    )
+                }
+            };
             run_auto_clip(
                 source,
                 poll_interval,
